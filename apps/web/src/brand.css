@@ -123,6 +123,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .secondary-button:hover:not(:disabled), .icon-button:hover:not(:disabled) { background: #fff3f3; border-color: #dba8ae; color: var(--brand-red); }
 .icon-button { width: 36px; height: 36px; }
 .bulk-send-button { font-size: 11px; padding: 10px 12px; }
+.delete-product-button { color: #a42b3a; border-color: #e5b3ba; background: #fff5f5; }
 .empty-state { padding: 60px 24px 67px; }
 .empty-illustration { background: #fff0f1; color: var(--brand-red); width: 60px; height: 60px; border-radius: 17px; font-size: 31px; }
 .empty-state h3 { font-size: 17px; }
