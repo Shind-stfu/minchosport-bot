@@ -280,9 +280,13 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     });
   }
 
-  app.get<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/groups', async (request, reply) => {
+  app.get<{ Params: { sessionId: string }; Querystring: { cached?: string } }>('/api/sessions/:sessionId/groups', async (request, reply) => {
     const account = sessionRow(request.params.sessionId); const connector = account && connectorFor(account.id);
-    if (!account || !connector) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
+    if (!account) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
+    const storedGroups = () => db.prepare('SELECT jid as id,subject as name FROM whatsapp_groups WHERE session_id=? ORDER BY subject COLLATE NOCASE').all(account.id);
+    const cachedGroups = storedGroups();
+    if (request.query.cached === 'true' && cachedGroups.length) return cachedGroups;
+    if (!connector) return cachedGroups;
     try {
       if (connector.status().status === 'connected') {
         const groups = await connector.listGroups(); const now = new Date().toISOString();
@@ -296,7 +300,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
           db.prepare('UPDATE whatsapp_session_settings SET target_group_ids=?,updated_at=? WHERE session_id=?').run(JSON.stringify(targets), now, account.id);
         })();
       }
-      return db.prepare('SELECT jid as id,subject as name FROM whatsapp_groups WHERE session_id=? ORDER BY subject COLLATE NOCASE').all(account.id);
+      return storedGroups();
     } catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : 'No se pudieron consultar los grupos.' }); }
   });
 

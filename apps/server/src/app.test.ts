@@ -477,6 +477,49 @@ describe('local simulation API', () => {
     await app.close();
   });
 
+  it('creates more than nine providers and reads their stored groups without querying WhatsApp again', async () => {
+    let groupQueries = 0;
+    const groups = Array.from({ length: 12 }, (_, index) => ({ id: `supplier-${index}@g.us`, name: `Bodega ${index + 1}` }));
+    const connector: WhatsAppConnector = {
+      status: () => ({ status: 'connected', qr: null, lastError: null }), connect: async () => {}, disconnect: async () => {}, resetSession: async () => {},
+      listGroups: async () => { groupQueries += 1; if (groupQueries > 1) throw new Error('rate-overlimit'); return groups; },
+      sendImage: async () => ({ messageId: 'x' }),
+    };
+    const { app } = setup(connector);
+    const headers = { host: '127.0.0.1:3210', 'content-type': 'application/json' };
+    const initial = await app.inject({ method: 'GET', url: '/api/sessions/main/groups?cached=true', headers });
+    expect(initial.json()).toHaveLength(12);
+    for (const group of groups) {
+      const created = await app.inject({ method: 'POST', url: '/api/sessions/main/providers', headers,
+        payload: { name: group.name, sourceGroupId: group.id, priceMarginCop: 10000, boxMarginCop: 5000, markerText: '🌎⭐', defaultPosition: 'bottom_right' } });
+      expect(created.statusCode, created.body).toBe(201);
+      const cached = await app.inject({ method: 'GET', url: '/api/sessions/main/groups?cached=true', headers });
+      expect(cached.statusCode).toBe(200);
+      expect(cached.json()).toHaveLength(12);
+    }
+    const providers = await app.inject({ method: 'GET', url: '/api/sessions/main/providers', headers });
+    expect(providers.json()).toHaveLength(12);
+    expect(groupQueries).toBe(1);
+    const explicitRefresh = await app.inject({ method: 'GET', url: '/api/sessions/main/groups', headers });
+    expect(explicitRefresh.statusCode).toBe(503);
+    expect(groupQueries).toBe(2);
+    const cachedAfterError = await app.inject({ method: 'GET', url: '/api/sessions/main/groups?cached=true', headers });
+    expect(cachedAfterError.json()).toHaveLength(12);
+    await app.close();
+  });
+
+  it('returns stored groups for an account without an active connector and rejects missing accounts', async () => {
+    const { app, db } = setup();
+    db.prepare("INSERT INTO whatsapp_groups(session_id,jid,subject,updated_at) VALUES ('main','stored@g.us','Bodega guardada',?)").run(new Date().toISOString());
+    const headers = { host: '127.0.0.1:3210' };
+    const stored = await app.inject({ method: 'GET', url: '/api/sessions/main/groups?cached=true', headers });
+    expect(stored.statusCode).toBe(200);
+    expect(stored.json()).toEqual([{ id: 'stored@g.us', name: 'Bodega guardada' }]);
+    const missing = await app.inject({ method: 'GET', url: '/api/sessions/missing/groups?cached=true', headers });
+    expect(missing.statusCode).toBe(404);
+    await app.close();
+  });
+
   it('serves a marked image preview per source photo and preserves original bytes after code/position edits', async () => {
     const { app, db } = setup();
     const directory = temporaryDirectories.at(-1)!;
