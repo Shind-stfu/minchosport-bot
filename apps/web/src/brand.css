@@ -124,6 +124,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .icon-button { width: 36px; height: 36px; }
 .bulk-send-button { font-size: 11px; padding: 10px 12px; }
 .delete-product-button { color: #a42b3a; border-color: #e5b3ba; background: #fff5f5; }
+.photo-selection { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; background: #fff7f7; }
+.photo-selection label { display: flex; align-items: center; gap: 7px; font-size: 12px; cursor: pointer; }
+.photo-selection input { width: 17px; height: 17px; accent-color: var(--brand-red); }
+.photo-selection .secondary-button { margin: 0; font-size: 11px; padding: 6px 9px; }
 .empty-state { padding: 60px 24px 67px; }
 .empty-illustration { background: #fff0f1; color: var(--brand-red); width: 60px; height: 60px; border-radius: 17px; font-size: 31px; }
 .empty-state h3 { font-size: 17px; }

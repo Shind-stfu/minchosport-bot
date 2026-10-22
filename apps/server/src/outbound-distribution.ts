@@ -11,6 +11,7 @@ import { writeApplicationLog } from './application-log.js';
 import { markOptions, readMarkDecision } from './image-marking-decision.js';
 
 const ASSEMBLY_IDLE_MS = 3_000;
+type ProductSend = { controller: AbortController; operations: Set<Promise<void>> };
 
 function interruptible<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -30,6 +31,7 @@ export class OutboundDistributionService {
   private sendOperation: Promise<void> = Promise.resolve();
   private sendCancellation = new AbortController();
   private clearingCatalog = false;
+  private productSends = new Map<string, ProductSend>();
 
   constructor(
     private readonly db: AppDatabase,
@@ -74,6 +76,30 @@ export class OutboundDistributionService {
     }
   }
 
+  /** Cancels only references affected by selected-photo deletion. Other references keep sending. */
+  async cancelProductsAndRun<T>(productIds: string[], cleanup: () => T): Promise<T> {
+    if (this.clearingCatalog || productIds.some((id) => this.productSends.get(id)?.controller.signal.aborted)) {
+      throw new Error('Ya se están eliminando fotos de esta selección.');
+    }
+    const sends = productIds.map((id) => ({ id, send: this.productSend(id) }));
+    for (const { send } of sends) send.controller.abort(new Error('Envío detenido al eliminar fotos de esta referencia.'));
+    try {
+      await Promise.all(sends.flatMap(({ send }) => [...send.operations]));
+      return cleanup();
+    } finally {
+      for (const { id, send } of sends) if (this.productSends.get(id) === send) this.productSends.delete(id);
+    }
+  }
+
+  private productSend(id: string): ProductSend {
+    let send = this.productSends.get(id);
+    if (!send) {
+      send = { controller: new AbortController(), operations: new Set() };
+      this.productSends.set(id, send);
+    }
+    return send;
+  }
+
   async processNow() {
     await this.tick();
   }
@@ -84,15 +110,20 @@ export class OutboundDistributionService {
 
   /** Sends one product only after an explicit request from the catalog. */
   async sendApprovedProduct(productId: string): Promise<{ groupCount: number; imageCount: number }> {
-    const signal = this.sendCancellation.signal;
-    signal.throwIfAborted();
+    this.sendCancellation.signal.throwIfAborted();
     if (!this.enabled) throw new Error('El envío real está deshabilitado. Revisa APP_MODE, WHATSAPP_ENABLED y WHATSAPP_SEND_ENABLED en .env.');
     if (this.whatsapp.status().status !== 'connected') throw new Error('Conecta WhatsApp antes de enviar.');
+    const send = this.productSend(productId);
+    const signal = AbortSignal.any([this.sendCancellation.signal, send.controller.signal]);
+    signal.throwIfAborted();
     let release!: () => void;
     const previous = this.sendOperation;
-    this.sendOperation = new Promise<void>((resolve) => { release = resolve; });
-    await previous;
+    const operation = new Promise<void>((resolve) => { release = resolve; });
+    // A canceled queued reference must not let later requests bypass an earlier active send.
+    this.sendOperation = previous.then(() => operation);
+    send.operations.add(operation);
     try {
+      await interruptible(previous, signal);
       signal.throwIfAborted();
       const product = this.db.prepare('SELECT status,output_text,session_id,supplier_id FROM products WHERE id=?').get(productId) as { status: string; output_text: string | null; session_id: string; supplier_id: string | null } | undefined;
       if (!product) throw new Error('Producto no encontrado.');
@@ -122,6 +153,8 @@ export class OutboundDistributionService {
       return { groupCount: queued.groups, imageCount: queued.images };
     } finally {
       release();
+      send.operations.delete(operation);
+      if (!send.operations.size && !send.controller.signal.aborted && this.productSends.get(productId) === send) this.productSends.delete(productId);
     }
   }
 

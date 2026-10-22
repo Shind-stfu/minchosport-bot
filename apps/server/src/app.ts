@@ -17,7 +17,7 @@ import { LocalImageInspector, type ImageInspection } from './image-inspection.js
 import { ImageInspectionCoordinator } from './image-inspection-coordinator.js';
 import { markOptions, readMarkDecision, type MarkMode } from './image-marking-decision.js';
 import { writeApplicationLog } from './application-log.js';
-import { removeProducts } from './product-cleanup.js';
+import { removeProductImages, removeProducts } from './product-cleanup.js';
 import type { SupplierReceptionService } from './supplier-reception.js';
 import QRCode from 'qrcode';
 
@@ -460,6 +460,29 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     if (!canDelete) return reply.code(409).send({ error: 'Solo puedes eliminar productos enviados y sin publicaciones pendientes o inciertas.' });
     const result = removeProducts(db, dataDirectory, [product], 'products.deleted.manually', 'Se eliminó un producto enviado del catálogo');
     return { ok: true, ...result };
+  });
+
+  app.delete<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/photos', async (request, reply) => {
+    const account = sessionRow(request.params.sessionId);
+    if (!account) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
+    const input = z.object({ imageIds: z.array(z.string().min(1).max(128)).min(1).max(5000)
+      .refine((ids) => new Set(ids).size === ids.length) }).strict().safeParse(request.body);
+    if (!input.success) return reply.code(400).send({ error: 'Selecciona una o más fotos distintas para eliminar.' });
+    const assets: Array<{ product_id: string }> = [];
+    for (let offset = 0; offset < input.data.imageIds.length; offset += 500) {
+      const ids = input.data.imageIds.slice(offset, offset + 500);
+      assets.push(...db.prepare(`SELECT m.product_id FROM media_assets m JOIN products p ON p.id=m.product_id
+        WHERE p.session_id=? AND m.id IN (${ids.map(() => '?').join(',')})`).all(account.id, ...ids) as Array<{ product_id: string }>);
+    }
+    if (assets.length !== input.data.imageIds.length) return reply.code(400).send({ error: 'Una o más fotos ya no existen o no pertenecen a esta cuenta. Actualiza la selección.' });
+    const cleanup = () => removeProductImages(db, dataDirectory, account.id, input.data.imageIds);
+    try {
+      const distribution = distributionFor(account.id);
+      const result = distribution ? await distribution.cancelProductsAndRun([...new Set(assets.map((asset) => asset.product_id))], cleanup) : cleanup();
+      return { ok: true, ...result };
+    } catch (error) {
+      return reply.code(409).send({ error: error instanceof Error ? error.message : 'No se pudieron eliminar las fotos seleccionadas.' });
+    }
   });
 
   app.delete<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/products', async (request, reply) => {
