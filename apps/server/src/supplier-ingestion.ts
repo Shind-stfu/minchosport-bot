@@ -18,6 +18,7 @@ export type IncomingSupplierMessage = {
   messageId: string;
   participantId?: string | null;
   timestampMs: number;
+  receptionMode?: 'live' | 'recovery';
   text: string;
   image?: { bytes: Buffer; mimeType: string; expectedAlbumImages?: number };
 };

@@ -29,7 +29,7 @@ describe('local simulation API', () => {
     db.prepare("INSERT INTO products(id,title,raw_text,analysis_json,status,created_at,updated_at,session_id) VALUES ('schedule-product','Tenis','COD 143','{}','needs_review',?,?,'main')").run(now, now);
     const headers = { host: '127.0.0.1:3210', 'content-type': 'application/json' };
     const initial = await app.inject({ method: 'GET', url: '/api/sessions/main', headers });
-    expect(initial.json().receptionSchedule).toEqual({ startTime: '09:00', endTime: '21:00', timeZone: 'America/Bogota' });
+    expect(initial.json().receptionSchedule).toEqual({ startTime: '16:00', endTime: '19:00', timeZone: 'America/Bogota' });
     expect(initial.json().receptionQueue).toMatchObject({ pendingCount: 0, failedCount: 0, recoveryStatus: 'idle' });
     const invalid = await app.inject({ method: 'PUT', url: '/api/sessions/main/reception-schedule', headers, payload: { startTime: '09:00', endTime: '09:00' } });
     expect(invalid.statusCode).toBe(400);

@@ -349,6 +349,13 @@ export const MIGRATIONS = [
   CREATE TRIGGER whatsapp_session_reception_state AFTER INSERT ON whatsapp_sessions BEGIN
     INSERT OR IGNORE INTO supplier_reception_state(session_id) VALUES (NEW.id);
   END;`,
+  `ALTER TABLE supplier_inbox_messages ADD COLUMN reception_mode TEXT NOT NULL DEFAULT 'recovery' CHECK(reception_mode IN ('live','recovery'));
+  UPDATE whatsapp_session_settings SET reception_start_time='16:00',reception_end_time='19:00'
+    WHERE reception_start_time='09:00' AND reception_end_time='21:00';
+  CREATE TRIGGER whatsapp_recovery_schedule_defaults AFTER INSERT ON whatsapp_session_settings
+    WHEN NEW.reception_start_time='09:00' AND NEW.reception_end_time='21:00' BEGIN
+    UPDATE whatsapp_session_settings SET reception_start_time='16:00',reception_end_time='19:00' WHERE session_id=NEW.session_id;
+  END;`,
 ];
 
 export type AppDatabase = InstanceType<typeof Database>;

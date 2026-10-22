@@ -85,7 +85,7 @@ function audit(db: AppDatabase, action: string, type: string, id: string, detail
     'distribution.started': 'Se inició la distribución', 'distribution.paused': 'Se pausó la distribución',
     'distribution.stopped': 'Se detuvo la distribución', 'settings.updated': 'Se actualizó la configuración',
     'distribution.send_interval.updated': 'Se actualizó la pausa entre envíos',
-    'supplier.reception.schedule.updated': 'Se actualizó el horario de recepción de esta cuenta',
+    'supplier.reception.schedule.updated': 'Se actualizó el rango de recuperación del historial de esta cuenta',
     'product.image_options.updated': 'Se actualizó el código o la posición de la marca',
     'product.image.inspected': 'Se analizaron localmente los códigos y marcas de la fotografía',
     'product.image.inspect.failed': 'No se pudo analizar una fotografía',

@@ -122,16 +122,24 @@ describe('Baileys QR pairing lifecycle', () => {
     db.close();
   });
 
-  it('accepts recent messages and applies the same 24-hour bound to live and recovered events', () => {
-    const now = Date.now();
-    expect(shouldIngestSupplierMessage('notify', now - 30 * 24 * 60 * 60 * 1000, now)).toBe(false);
-    expect(shouldIngestSupplierMessage('append', now - 5 * 60 * 1000, now)).toBe(true);
-    expect(shouldIngestSupplierMessage('history', now - 5 * 60 * 1000, now)).toBe(true);
-    expect(shouldIngestSupplierMessage('append', now - 24 * 60 * 60 * 1000 - 1, now)).toBe(false);
-    expect(shouldIngestSupplierMessage('append', now + 10 * 60 * 1000, now)).toBe(false);
+  it('filters recovery by send time and accepts live messages outside the range', () => {
+    const now = Date.parse('2026-10-22T19:05:00-05:00');
+    const liveSince = Date.parse('2026-10-22T19:00:00-05:00');
+    const range = { startTime: '16:00', endTime: '18:00', timeZone: 'America/Bogota' };
+    for (const type of ['notify', 'append', 'history'] as const) {
+      expect(shouldIngestSupplierMessage(type, Date.parse('2026-10-22T15:59:59-05:00'), now, range, liveSince)).toBe(false);
+      expect(shouldIngestSupplierMessage(type, Date.parse('2026-10-22T17:00:00-05:00'), now, range, liveSince)).toBe(true);
+      expect(shouldIngestSupplierMessage(type, Date.parse('2026-10-22T18:30:00-05:00'), now, range, liveSince)).toBe(false);
+      expect(shouldIngestSupplierMessage(type, now - 30 * 24 * 60 * 60 * 1000, now, range, liveSince)).toBe(false);
+      expect(shouldIngestSupplierMessage(type, now + 10 * 60 * 1000, now, range, liveSince)).toBe(false);
+    }
+    expect(shouldIngestSupplierMessage('notify', now, now, range, liveSince)).toBe(true);
+    expect(shouldIngestSupplierMessage('append', now, now, range, liveSince)).toBe(true);
+    expect(shouldIngestSupplierMessage('history', now, now, range, liveSince)).toBe(false);
   });
 
   it('processes recent history events only from active supplier groups and rejects a full-history request', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-22T17:00:00-05:00'));
     const directory = mkdtempSync(join(tmpdir(), 'tenis-history-sync-'));
     directories.push(directory);
     const db = openDatabase(join(directory, 'business.sqlite'));
@@ -166,14 +174,14 @@ describe('Baileys QR pairing lifecycle', () => {
     db.close();
   });
 
-  it.each(['initial', 'recent', 'on-demand', 'append'] as const)('buffers three 11:09 photos delivered by %s at 11:10 and shows all three at 11:12', async (kind) => {
-    let clock = Date.parse('2026-10-21T16:10:00.000Z');
+  it.each(['initial', 'recent', 'on-demand', 'append', 'notify'] as const)('recovers only 4–6 p.m. photos delivered by %s at 7 p.m. and continues receiving live photos', async (kind) => {
+    let clock = Date.parse('2026-10-22T19:00:00-05:00');
     vi.spyOn(Date, 'now').mockImplementation(() => clock);
-    const directory = mkdtempSync(join(tmpdir(), 'tenis-1109-recovery-')); directories.push(directory);
+    const directory = mkdtempSync(join(tmpdir(), 'tenis-recovery-range-')); directories.push(directory);
     const db = openDatabase(join(directory, 'business.sqlite'));
     const now = new Date(clock).toISOString();
     db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,marker_text,default_position,created_at,updated_at) VALUES ('provider','main','provider@g.us','Proveedor',10000,'🌎','bottom_right',?,?)").run(now, now);
-    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='11:12',reception_end_time='21:00' WHERE session_id='main'").run();
+    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='16:00',reception_end_time='18:00' WHERE session_id='main'").run();
     const logger = pino({ level: 'silent' }) as unknown as FastifyBaseLogger;
     const ingestion = new SupplierIngestionService(db, directory, logger);
     const reception = new SupplierReceptionService(db, directory, ingestion, logger, () => clock);
@@ -185,26 +193,30 @@ describe('Baileys QR pairing lifecycle', () => {
     const options = mocks.makeWASocket.mock.calls.at(-1)?.[0];
     expect(options.syncFullHistory).toBe(false);
     expect(options.shouldSyncHistoryMessage({ syncType })).toBe(true);
-    const messages = [3, 2, 1].map((index) => ({ key: { remoteJid: 'provider@g.us', id: `photo-1109-${index}`, participant: 'vendor@s.whatsapp.net', fromMe: false }, messageTimestamp: Date.parse(`2026-10-21T16:09:0${index}.000Z`) / 1000, message: { imageMessage: { mimetype: 'image/jpeg', caption: `COD ${index} PRECIO $60.000` } } }));
-    const deliver = () => kind === 'append' ? socket.ev.emit('messages.upsert', { type: 'append', messages }) : socket.ev.emit('messaging-history.set', { syncType, messages });
-    // The history queue may run before the connection-open handler.
+    const photo = (id: string, date: string) => ({ key: { remoteJid: 'provider@g.us', id, participant: 'vendor@s.whatsapp.net', fromMe: false }, messageTimestamp: Date.parse(date) / 1000, message: { imageMessage: { mimetype: 'image/jpeg', caption: 'COD 143 PRECIO $60.000' } } });
+    const messages = [
+      photo('before-start', '2026-10-22T15:59:59-05:00'), photo('at-start', '2026-10-22T16:00:00-05:00'),
+      photo('within-range', '2026-10-22T17:59:59-05:00'), photo('at-end', '2026-10-22T18:00:00-05:00'),
+      photo('yesterday', '2026-10-21T17:30:00-05:00'),
+    ].reverse();
+    const deliver = () => kind === 'append' || kind === 'notify' ? socket.ev.emit('messages.upsert', { type: kind, messages }) : socket.ev.emit('messaging-history.set', { syncType, messages });
     deliver();
-    await vi.waitFor(() => expect(reception.snapshot('main').pendingCount).toBe(3));
+    await vi.waitFor(() => expect(db.prepare('SELECT COUNT(*) as count FROM products').get()).toEqual({ count: 2 }));
     socket.ev.emit('connection.update', { connection: 'open' });
     await vi.waitFor(() => expect(connector.status().status).toBe('connected'));
-    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'received', recoveryMessageCount: 3, pendingCount: 3 });
-    expect(db.prepare('SELECT COUNT(*) as count FROM products').get()).toEqual({ count: 0 });
-    // A full-history event is still ignored, even if emitted directly.
-    socket.ev.emit('messaging-history.set', { syncType: proto.HistorySync.HistorySyncType.FULL, messages: [{ ...messages[0], key: { ...messages[0]!.key, id: 'must-ignore-full' } }] });
-    clock = Date.parse('2026-10-21T16:12:00.000Z');
-    await reception.scheduleChanged('main');
-    expect(db.prepare('SELECT COUNT(*) as count FROM products').get()).toEqual({ count: 3 });
-    expect(db.prepare('SELECT COUNT(*) as count FROM media_assets').get()).toEqual({ count: 3 });
-    expect(reception.snapshot('main').pendingCount).toBe(0);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'received', recoveryMessageCount: 2, pendingCount: 0 });
+    expect(mocks.downloadMediaMessage).toHaveBeenCalledTimes(2);
+    expect(db.prepare('SELECT message_id FROM whatsapp_source_messages ORDER BY message_id').all()).toEqual([{ message_id: 'at-start' }, { message_id: 'within-range' }]);
+    socket.ev.emit('messaging-history.set', { syncType: proto.HistorySync.HistorySyncType.FULL, messages: [photo('ignore-full', '2026-10-22T17:00:00-05:00')] });
     deliver();
-    await vi.waitFor(() => expect(connector.status().reception?.lastSupplierResult).toBe('duplicate'));
-    expect(reception.snapshot('main').recoveryMessageCount).toBe(3);
-    expect(db.prepare('SELECT COUNT(*) as count FROM products').get()).toEqual({ count: 3 });
+    // A new append event at 7:05 p.m. must bypass the 4–6 p.m. recovery filter.
+    clock = Date.parse('2026-10-22T19:05:00-05:00');
+    socket.ev.emit('messages.upsert', { type: 'append', messages: [photo('live-append', new Date(clock).toISOString())] });
+    socket.ev.emit('messages.upsert', { type: 'notify', messages: [photo('live-notify', new Date(clock).toISOString())] });
+    await vi.waitFor(() => expect(db.prepare('SELECT COUNT(*) as count FROM products').get()).toEqual({ count: 4 }));
+    expect(reception.snapshot('main').recoveryMessageCount).toBe(2);
+    expect(db.prepare("SELECT reception_mode FROM supplier_inbox_messages WHERE message_id='live-append'").get()).toEqual({ reception_mode: 'live' });
+    expect(db.prepare("SELECT 1 FROM whatsapp_source_messages WHERE message_id='ignore-full'").get()).toBeUndefined();
     await connector.disconnect(); await reception.close(); db.close();
   });
 

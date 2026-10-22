@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node
 import { join } from 'node:path';
 import type { FastifyBaseLogger } from 'fastify';
 import type { AppDatabase } from './database.js';
-import { isReceptionOpen } from './reception-schedule.js';
+import { isInRecoveryWindow, readReceptionSchedule } from './reception-schedule.js';
 import type { IncomingSupplierMessage, SupplierIngestionService } from './supplier-ingestion.js';
 import { writeApplicationLog } from './application-log.js';
 
@@ -21,6 +21,7 @@ type InboxRow = {
   image_file_name: string | null;
   image_mime_type: string | null;
   expected_album_images: number | null;
+  reception_mode: 'live' | 'recovery';
 };
 
 export type ReceptionSnapshot = {
@@ -75,7 +76,7 @@ export class SupplierReceptionService {
   }
 
   async scheduleChanged(sessionId: string) {
-    if (isReceptionOpen(this.now(), this.schedule(sessionId))) await this.drainSession(sessionId);
+    await this.drainSession(sessionId);
   }
 
   archiveProvider(sessionId: string, groupId: string) {
@@ -86,9 +87,11 @@ export class SupplierReceptionService {
     for (const row of rows) if (row.imageFileName) rmSync(join(this.inboxDirectory, row.imageFileName), { force: true });
   }
 
-  async capture(message: IncomingSupplierMessage, deferUntilBatchEnd = false): Promise<'stored' | 'duplicate' | 'pending' | 'failed'> {
+  async capture(message: IncomingSupplierMessage, deferUntilBatchEnd = false): Promise<'stored' | 'duplicate' | 'pending' | 'failed' | 'outside_window'> {
     const sessionId = message.sessionId ?? 'main';
     if (!message.messageId || !this.ingestion.isSupplierGroup(message.groupId, sessionId)) return 'duplicate';
+    const mode = message.receptionMode ?? 'live';
+    if (mode === 'recovery' && !isInRecoveryWindow(message.timestampMs, readReceptionSchedule(this.db, sessionId), this.now())) return 'outside_window';
     const existingInbox = this.db.prepare('SELECT status,image_file_name as imageFileName FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(sessionId, message.groupId, message.messageId) as { status: string; imageFileName: string | null } | undefined;
     const alreadyProcessed = this.db.prepare('SELECT 1 FROM whatsapp_source_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(sessionId, message.groupId, message.messageId);
     if (alreadyProcessed || existingInbox && existingInbox.status !== 'failed') return 'duplicate';
@@ -111,12 +114,12 @@ export class SupplierReceptionService {
     const nowIso = new Date(this.now()).toISOString();
     const participantId = message.participantId ?? '';
     try {
-      this.db.prepare(`INSERT INTO supplier_inbox_messages(session_id,group_jid,message_id,participant_jid,message_timestamp_ms,text,image_file_name,image_mime_type,expected_album_images,status,error,received_at,processed_at)
-        VALUES (?,?,?,?,?,?,?,?,?,'pending',NULL,?,NULL)
+      this.db.prepare(`INSERT INTO supplier_inbox_messages(session_id,group_jid,message_id,participant_jid,message_timestamp_ms,text,image_file_name,image_mime_type,expected_album_images,status,error,received_at,processed_at,reception_mode)
+        VALUES (?,?,?,?,?,?,?,?,?,'pending',NULL,?,NULL,?)
         ON CONFLICT(session_id,group_jid,message_id) DO UPDATE SET participant_jid=excluded.participant_jid,message_timestamp_ms=excluded.message_timestamp_ms,
           text=excluded.text,image_file_name=excluded.image_file_name,image_mime_type=excluded.image_mime_type,expected_album_images=excluded.expected_album_images,
-          status='pending',error=NULL,received_at=excluded.received_at,processed_at=NULL`)
-        .run(sessionId, message.groupId, message.messageId, participantId, timestampMs, message.text, fileName, message.image?.mimeType ?? null, message.image?.expectedAlbumImages ?? null, nowIso);
+          status='pending',error=NULL,received_at=excluded.received_at,processed_at=NULL,reception_mode=excluded.reception_mode`)
+        .run(sessionId, message.groupId, message.messageId, participantId, timestampMs, message.text, fileName, message.image?.mimeType ?? null, message.image?.expectedAlbumImages ?? null, nowIso, mode);
     } catch (error) {
       if (fileName) rmSync(join(this.inboxDirectory, fileName), { force: true });
       if (temporaryPath) rmSync(temporaryPath, { force: true });
@@ -133,13 +136,9 @@ export class SupplierReceptionService {
     });
 
     if (deferUntilBatchEnd) return 'pending';
-    const schedule = this.schedule(sessionId);
-    if (isReceptionOpen(this.now(), schedule)) {
-      await this.drainSession(sessionId);
-      const result = this.db.prepare('SELECT status FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(sessionId, message.groupId, message.messageId) as { status: string } | undefined;
-      return result?.status === 'processed' ? 'stored' : result?.status === 'failed' ? 'failed' : 'pending';
-    }
-    return 'pending';
+    await this.drainSession(sessionId);
+    const result = this.db.prepare('SELECT status FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(sessionId, message.groupId, message.messageId) as { status: string } | undefined;
+    return result?.status === 'processed' ? 'stored' : result?.status === 'failed' ? 'failed' : result?.status === 'ignored' ? 'outside_window' : 'pending';
   }
 
   recordUnsupported(sessionId: string, groupId: string, messageId: string, timestampMs: number, error: string) {
@@ -189,20 +188,15 @@ export class SupplierReceptionService {
       lastSupplierResult: row?.lastSupplierResult ?? null };
   }
 
-  private schedule(sessionId: string) {
-    const row = this.db.prepare('SELECT reception_start_time as startTime,reception_end_time as endTime,reception_timezone as timeZone FROM whatsapp_session_settings WHERE session_id=?').get(sessionId) as { startTime: string; endTime: string; timeZone: string } | undefined;
-    return { startTime: row?.startTime ?? '09:00', endTime: row?.endTime ?? '21:00', timeZone: row?.timeZone ?? 'America/Bogota' };
-  }
-
   private async drainDueSessions() {
     const rows = this.db.prepare('SELECT session_id as sessionId FROM whatsapp_session_settings').all() as Array<{ sessionId: string }>;
     for (const row of rows) {
-      if (isReceptionOpen(this.now(), this.schedule(row.sessionId))) await this.drainSession(row.sessionId);
+      await this.drainSession(row.sessionId);
     }
   }
 
   private async drainSession(sessionId: string) {
-    if (this.draining.has(sessionId) || !isReceptionOpen(this.now(), this.schedule(sessionId))) return;
+    if (this.draining.has(sessionId)) return;
     this.draining.add(sessionId);
     try {
       const archived = this.db.prepare(`SELECT i.group_jid as groupId,i.message_id as messageId,i.image_file_name as imageFileName FROM supplier_inbox_messages i
@@ -213,11 +207,16 @@ export class SupplierReceptionService {
           .run(new Date(this.now()).toISOString(), sessionId, item.groupId, item.messageId);
         if (item.imageFileName) rmSync(join(this.inboxDirectory, item.imageFileName), { force: true });
       }
-      const pending = this.db.prepare(`SELECT i.session_id,i.group_jid,i.message_id,i.participant_jid,i.message_timestamp_ms,i.text,i.image_file_name,i.image_mime_type,i.expected_album_images
+      const pending = this.db.prepare(`SELECT i.session_id,i.group_jid,i.message_id,i.participant_jid,i.message_timestamp_ms,i.text,i.image_file_name,i.image_mime_type,i.expected_album_images,i.reception_mode
         FROM supplier_inbox_messages i JOIN supplier_profiles p ON p.session_id=i.session_id AND p.source_group_id=i.group_jid AND p.archived_at IS NULL
         WHERE i.session_id=? AND i.status='pending' ORDER BY i.message_timestamp_ms ASC,i.received_at ASC,i.message_id ASC`).all(sessionId) as InboxRow[];
       for (const row of pending) {
-        if (!isReceptionOpen(this.now(), this.schedule(sessionId))) break;
+        if (row.reception_mode === 'recovery' && !isInRecoveryWindow(row.message_timestamp_ms, readReceptionSchedule(this.db, sessionId), this.now())) {
+          this.db.prepare("UPDATE supplier_inbox_messages SET status='ignored',error='Fuera del rango de recuperación',processed_at=? WHERE session_id=? AND group_jid=? AND message_id=?")
+            .run(new Date(this.now()).toISOString(), sessionId, row.group_jid, row.message_id);
+          if (row.image_file_name) rmSync(join(this.inboxDirectory, row.image_file_name), { force: true });
+          continue;
+        }
         this.db.prepare("UPDATE supplier_inbox_messages SET status='processing',error=NULL WHERE session_id=? AND group_jid=? AND message_id=? AND status='pending'")
           .run(sessionId, row.group_jid, row.message_id);
         try {

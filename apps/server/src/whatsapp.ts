@@ -8,6 +8,7 @@ import { currentUserProtector, EncryptedWhatsAppAuth } from './encrypted-auth.js
 import type { IncomingSupplierMessage, SupplierIngestionService } from './supplier-ingestion.js';
 import { writeApplicationLog } from './application-log.js';
 import type { SupplierReceptionService } from './supplier-reception.js';
+import { DEFAULT_RECOVERY_SCHEDULE, isInRecoveryWindow, readReceptionSchedule, type ReceptionSchedule } from './reception-schedule.js';
 
 const baileysLogger = pino({ level: 'silent' });
 const DOCUMENT_IMAGE_EXTENSIONS: Record<string, string> = {
@@ -23,7 +24,7 @@ function documentImageMimeType(document: { mimetype?: string | null; fileName?: 
 
 export type WhatsAppStatus = 'disabled' | 'disconnected' | 'connecting' | 'qr' | 'connected' | 'logged_out';
 export type WhatsAppGroup = { id: string; name: string };
-export type WhatsAppReceptionResult = 'processing' | 'stored' | 'duplicate' | 'pending' | 'older_message_skipped' | 'unsupported_message' | 'error';
+export type WhatsAppReceptionResult = 'processing' | 'stored' | 'duplicate' | 'pending' | 'older_message_skipped' | 'outside_recovery_window' | 'unsupported_message' | 'error';
 export type WhatsAppReceptionDiagnostics = {
   lastUpsertAt: string | null;
   lastUpsertType: 'notify' | 'append' | null;
@@ -42,11 +43,16 @@ const ACCEPTED_HISTORY_TYPES = new Set<number>([
   proto.HistorySync.HistorySyncType.ON_DEMAND,
 ]);
 
-/** Baileys can append recent messages received while the linked phone was unavailable. */
-export function shouldIngestSupplierMessage(_upsertType: 'notify' | 'append' | 'history', messageTimestampMs: number, nowMs = Date.now()): boolean {
-  return Number.isFinite(messageTimestampMs)
+function isLiveMessage(upsertType: 'notify' | 'append' | 'history', timestampMs: number, liveSinceMs: number): boolean {
+  return upsertType !== 'history' && timestampMs >= liveSinceMs;
+}
+
+/** Old notify/append events are recovery too; only new messages bypass the time range. */
+export function shouldIngestSupplierMessage(upsertType: 'notify' | 'append' | 'history', messageTimestampMs: number, nowMs = Date.now(), schedule: ReceptionSchedule = DEFAULT_RECOVERY_SCHEDULE, liveSinceMs = nowMs): boolean {
+  const valid = Number.isFinite(messageTimestampMs)
     && messageTimestampMs <= nowMs + 5 * 60 * 1000
     && nowMs - messageTimestampMs <= MAX_APPENDED_SUPPLIER_MESSAGE_AGE_MS;
+  return valid && (isLiveMessage(upsertType, messageTimestampMs, liveSinceMs) || isInRecoveryWindow(messageTimestampMs, schedule, nowMs));
 }
 
 export interface WhatsAppConnector {
@@ -68,6 +74,7 @@ export class BaileysConnector implements WhatsAppConnector {
   private starting = false;
   private groupRefresh: { socket: ReturnType<typeof makeWASocket>; promise: Promise<void> } | undefined;
   private nextGroupRefreshAt = 0;
+  private liveSinceMs = 0;
   private reception: WhatsAppReceptionDiagnostics = this.emptyReceptionDiagnostics();
 
   constructor(private readonly db: AppDatabase, private readonly logger: FastifyBaseLogger, private readonly enabled: boolean, private readonly supplierIngestion?: SupplierIngestionService, readonly sessionId = 'main', private readonly supplierReception?: SupplierReceptionService) {}
@@ -85,6 +92,7 @@ export class BaileysConnector implements WhatsAppConnector {
     this.lastError = null;
     this.nextGroupRefreshAt = 0;
     this.reception = this.emptyReceptionDiagnostics();
+    this.liveSinceMs = Math.floor(Date.now() / 1000) * 1000;
     try {
       const auth = await EncryptedWhatsAppAuth.create(this.db, currentUserProtector(), this.sessionId);
       const { state, saveCreds } = await auth.state();
@@ -177,16 +185,17 @@ export class BaileysConnector implements WhatsAppConnector {
         messageQueue = messageQueue.then(async () => {
           if (this.socket !== socket || !this.supplierIngestion) return;
           const ordered = [...messages].sort((a, b) => Number(a.messageTimestamp ?? 0) - Number(b.messageTimestamp ?? 0));
-          if (type !== 'notify' && this.supplierReception) {
-            beginRecovery();
+          if (this.supplierReception) {
             const eligibleCount = ordered.filter((message) => {
               const groupId = message.key.remoteJid;
               const timestampMs = Number(message.messageTimestamp ?? 0) * 1000;
-              if (message.key.fromMe || !groupId?.endsWith('@g.us') || !message.key.id || !this.supplierIngestion?.isSupplierGroup(groupId, this.sessionId) || !shouldIngestSupplierMessage(type, timestampMs)) return false;
+              if (message.key.fromMe || !groupId?.endsWith('@g.us') || !message.key.id || !this.supplierIngestion?.isSupplierGroup(groupId, this.sessionId)
+                || isLiveMessage(type, timestampMs, this.liveSinceMs) || !this.acceptsMessage(type, timestampMs)) return false;
               const seen = this.db.prepare('SELECT 1 FROM whatsapp_source_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(this.sessionId, groupId, message.key.id)
                 ?? this.db.prepare("SELECT 1 FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=? AND status<>'failed'").get(this.sessionId, groupId, message.key.id);
               return !seen;
             }).length;
+            if (type !== 'notify' || eligibleCount > 0) beginRecovery();
             await this.supplierReception.recordHistoryBatch(this.sessionId, eligibleCount);
           }
           this.reception = { ...this.reception, lastUpsertAt: new Date().toISOString(), lastUpsertType: type === 'history' ? 'append' : type, lastUpsertMessageCount: messages.length };
@@ -267,7 +276,13 @@ export class BaileysConnector implements WhatsAppConnector {
     this.reception = { ...this.reception, lastGroupMessageAt: at, lastGroupName: groupName, lastSupplierMessageAt: at, lastSupplierName: supplierName, lastSupplierResult: 'processing' };
     const rawTimestamp = Number(message.messageTimestamp ?? (upsertType === 'notify' ? Date.now() / 1000 : Number.NaN));
     const messageTimestampMs = Number.isFinite(rawTimestamp) && rawTimestamp > 0 ? rawTimestamp * 1000 : Number.NaN;
-    if (!shouldIngestSupplierMessage(upsertType, messageTimestampMs)) {
+    if (!this.acceptsMessage(upsertType, messageTimestampMs)) {
+      if (Number.isFinite(messageTimestampMs) && Date.now() - messageTimestampMs <= MAX_APPENDED_SUPPLIER_MESSAGE_AGE_MS && messageTimestampMs <= Date.now()) {
+        this.reception = { ...this.reception, lastSupplierResult: 'outside_recovery_window' };
+        writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'products', action: 'product.received.outside_recovery_window', entityType: 'whatsapp_group', entityId: groupId,
+          message: 'Se omitió una publicación fuera del día o rango de recuperación', details: { supplierName, upsertType, ...readReceptionSchedule(this.db, this.sessionId) } });
+        return;
+      }
       this.reception = { ...this.reception, lastSupplierResult: 'older_message_skipped' };
       writeApplicationLog(this.db, { sessionId: this.sessionId, level: 'warning', category: 'products', action: 'product.received.too_old', entityType: 'whatsapp_group', entityId: groupId, message: 'Se omitió un mensaje del proveedor con más de 24 horas', details: { supplierName, upsertType } });
       return;
@@ -293,6 +308,7 @@ export class BaileysConnector implements WhatsAppConnector {
       return;
     }
     let payload: IncomingSupplierMessage = { sessionId: this.sessionId, groupId, messageId, timestampMs: messageTimestampMs, text,
+      receptionMode: isLiveMessage(upsertType, messageTimestampMs, this.liveSinceMs) ? 'live' : 'recovery',
       ...(message.key.participant === undefined ? {} : { participantId: message.key.participant }) };
     try {
       if (image) {
@@ -304,7 +320,7 @@ export class BaileysConnector implements WhatsAppConnector {
       }
       if (this.supplierReception) {
         const outcome = await this.supplierReception.capture(payload, upsertType === 'history');
-        this.reception = { ...this.reception, lastSupplierResult: outcome === 'stored' ? 'stored' : outcome === 'failed' ? 'error' : outcome === 'pending' ? 'pending' : 'duplicate' };
+        this.reception = { ...this.reception, lastSupplierResult: outcome === 'stored' ? 'stored' : outcome === 'failed' ? 'error' : outcome === 'pending' ? 'pending' : outcome === 'outside_window' ? 'outside_recovery_window' : 'duplicate' };
       } else {
         await this.supplierIngestion.receive(payload);
         this.reception = { ...this.reception, lastSupplierResult: 'stored' };
@@ -315,6 +331,10 @@ export class BaileysConnector implements WhatsAppConnector {
       writeApplicationLog(this.db, { sessionId: this.sessionId, level: 'error', category: 'products', action: 'product.received.failed', entityType: 'whatsapp_group', entityId: groupId, message: 'No se pudo descargar o guardar el mensaje del proveedor', details: { supplierName, errorType: error instanceof Error ? error.name : 'UnknownError' } });
       this.logger.error({ sessionId: this.sessionId, groupId, messageId, err: error }, 'Falló la recepción de un mensaje seleccionado de proveedor');
     }
+  }
+
+  private acceptsMessage(type: 'notify' | 'append' | 'history', timestampMs: number) {
+    return shouldIngestSupplierMessage(type, timestampMs, Date.now(), readReceptionSchedule(this.db, this.sessionId), this.liveSinceMs);
   }
 
   private async refreshGroups() {

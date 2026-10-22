@@ -10,6 +10,35 @@ const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
 describe('multi-account schema migration', () => {
+  it('upgrades the old reception queue without changing a custom recovery range or importing its old pending messages', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'tenis-recovery-migration-'));
+    directories.push(directory);
+    const path = join(directory, 'business.sqlite');
+    const legacy = new Database(path);
+    legacy.exec('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);');
+    for (const [index, sql] of MIGRATIONS.slice(0, 17).entries()) {
+      legacy.transaction(() => {
+        legacy.exec(sql);
+        legacy.prepare('INSERT INTO schema_migrations(version,checksum,applied_at) VALUES (?,?,?)')
+          .run(index + 1, createHash('sha256').update(sql).digest('hex'), new Date().toISOString());
+      })();
+    }
+    const now = new Date().toISOString();
+    legacy.prepare("UPDATE whatsapp_session_settings SET reception_start_time='16:00',reception_end_time='18:00' WHERE session_id='main'").run();
+    legacy.prepare("INSERT INTO whatsapp_sessions(id,name,created_at) VALUES ('secondary','Otra cuenta',?)").run(now);
+    legacy.prepare("INSERT INTO whatsapp_session_settings(session_id,updated_at) VALUES ('secondary',?)").run(now);
+    legacy.prepare("INSERT INTO supplier_inbox_messages(session_id,group_jid,message_id,message_timestamp_ms,status,received_at) VALUES ('main','provider@g.us','legacy-pending',1,'pending',?)").run(now);
+    legacy.close();
+    const upgraded = openDatabase(path);
+    expect(upgraded.prepare('SELECT session_id,reception_start_time,reception_end_time FROM whatsapp_session_settings ORDER BY session_id').all()).toEqual([
+      { session_id: 'main', reception_start_time: '16:00', reception_end_time: '18:00' },
+      { session_id: 'secondary', reception_start_time: '16:00', reception_end_time: '19:00' },
+    ]);
+    expect(upgraded.prepare("SELECT status,reception_mode FROM supplier_inbox_messages WHERE message_id='legacy-pending'").get()).toEqual({ status: 'pending', reception_mode: 'recovery' });
+    expect(upgraded.pragma('foreign_key_check')).toEqual([]);
+    upgraded.close();
+  });
+
   it('upgrades the released version 9 schema with OCR records and per-account pacing', () => {
     const directory = mkdtempSync(join(tmpdir(), 'tenis-migration-v9-'));
     directories.push(directory);
@@ -29,7 +58,7 @@ describe('multi-account schema migration', () => {
     legacy.close();
 
     const upgraded = openDatabase(path);
-    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 17 });
+    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 18 });
     expect(upgraded.prepare("SELECT send_interval_ms FROM whatsapp_session_settings WHERE session_id='main'").get()).toEqual({ send_interval_ms: 10000 });
     expect((upgraded.pragma('table_info(image_inspections)') as Array<{ name: string }>).map((column) => column.name)).toContain('ocr_confidence');
     expect(upgraded.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('image_brand_inspections','product_image_analysis')").all()).toEqual([]);
@@ -78,7 +107,7 @@ describe('multi-account schema migration', () => {
     legacy.close();
 
     const upgraded = openDatabase(path);
-    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 17 });
+    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 18 });
     expect(upgraded.prepare("SELECT id,raw_text FROM products WHERE id='existing-tenis'").get())
       .toEqual({ id: 'existing-tenis', raw_text: '*MUJER 096-215*' });
     expect(upgraded.prepare("SELECT name FROM whatsapp_sessions WHERE id='main'").get()).toEqual({ name: 'Cuenta principal' });
@@ -128,7 +157,7 @@ describe('multi-account schema migration', () => {
     expect(db.prepare('SELECT session_id,group_id,status FROM outbound_publications').get()).toEqual({ session_id: 'main', group_id: 'destination@g.us', status: 'submitted' });
     expect(db.prepare('SELECT session_id,record_type,record_id,ciphertext FROM whatsapp_auth_records').get()).toEqual({ session_id: 'main', record_type: 'creds', record_id: 'main', ciphertext: 'encrypted-creds' });
     expect(db.prepare('SELECT session_id,action,level,details_json FROM application_logs WHERE id=\'legacy-log-1\'').get()).toEqual({ session_id: 'main', action: 'product.approved', level: 'info', details_json: '{"finalPriceCop":70000}' });
-    expect(db.prepare("SELECT reception_start_time,reception_end_time,reception_timezone FROM whatsapp_session_settings WHERE session_id='main'").get()).toEqual({ reception_start_time: '09:00', reception_end_time: '21:00', reception_timezone: 'America/Bogota' });
+    expect(db.prepare("SELECT reception_start_time,reception_end_time,reception_timezone FROM whatsapp_session_settings WHERE session_id='main'").get()).toEqual({ reception_start_time: '16:00', reception_end_time: '19:00', reception_timezone: 'America/Bogota' });
     expect((db.pragma('foreign_key_list(whatsapp_source_messages)') as Array<{ table: string }>).some((foreignKey) => foreignKey.table === 'products')).toBe(false);
     expect(readFileSync(join(directory, 'media', 'hash-1.png'))).toEqual(Buffer.from('original'));
     expect(db.pragma('foreign_key_check')).toEqual([]);
@@ -145,7 +174,7 @@ describe('multi-account schema migration', () => {
     db.prepare("INSERT INTO supplier_inbox_messages(session_id,group_jid,message_id,message_timestamp_ms,text,status,received_at) VALUES ('main','provider@g.us','pending-message',1,'Tenis','pending',?)").run(now);
     db.prepare("INSERT INTO whatsapp_sessions(id,name,created_at) VALUES ('secondary','Secundaria',?)").run(now);
     db.prepare("INSERT INTO whatsapp_session_settings(session_id,target_group_ids,updated_at) VALUES ('secondary','[]',?)").run(now);
-    expect(db.prepare("SELECT reception_start_time,reception_end_time FROM whatsapp_session_settings WHERE session_id='secondary'").get()).toEqual({ reception_start_time: '09:00', reception_end_time: '21:00' });
+    expect(db.prepare("SELECT reception_start_time,reception_end_time FROM whatsapp_session_settings WHERE session_id='secondary'").get()).toEqual({ reception_start_time: '16:00', reception_end_time: '19:00' });
     expect(db.prepare("SELECT session_id FROM supplier_reception_state WHERE session_id='secondary'").get()).toEqual({ session_id: 'secondary' });
     db.prepare("DELETE FROM products WHERE id='dedup-product'").run();
     expect(db.prepare("SELECT product_id FROM whatsapp_source_messages WHERE message_id='message-kept'").get()).toEqual({ product_id: 'dedup-product' });
