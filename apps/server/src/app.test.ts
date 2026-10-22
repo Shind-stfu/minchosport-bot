@@ -508,6 +508,69 @@ describe('local simulation API', () => {
     await app.close();
   });
 
+  it('reactivates an archived supplier group after nine active providers and preserves its historical product rules', async () => {
+    const { app, db } = setup();
+    const now = new Date().toISOString();
+    const headers = { host: '127.0.0.1:3210', 'content-type': 'application/json' };
+    const payload = { name: 'mbr', sourceGroupId: 'mbr@g.us', priceMarginCop: 0, boxMarginCop: 0, markerText: '🌎', defaultPosition: 'top_left' };
+    for (let index = 0; index < 9; index++) {
+      db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES (?,'main',?,?,10000,?,?)")
+        .run(`active-${index}`, `active-${index}@g.us`, `Bodega ${index}`, now, now);
+    }
+    db.prepare("INSERT INTO whatsapp_groups(session_id,jid,subject,updated_at) VALUES ('main','mbr@g.us','BODEGA MBR PRECIOS',?)").run(now);
+    const first = await app.inject({ method: 'POST', url: '/api/sessions/main/providers', headers, payload: { ...payload, priceMarginCop: 10000, boxMarginCop: 5000 } });
+    expect(first.statusCode, first.body).toBe(201);
+    const supplierId = first.json().id as string;
+    const createdAt = (db.prepare('SELECT created_at FROM supplier_profiles WHERE id=?').get(supplierId) as { created_at: string }).created_at;
+    db.prepare("INSERT INTO products(id,title,raw_text,analysis_json,status,session_id,supplier_id,margin_cop_applied,box_margin_cop_applied,created_at,updated_at) VALUES ('historical-mbr','Tenis','PRECIO $60.000','{}','needs_review','main',?,10000,5000,?,?)")
+      .run(supplierId, now, now);
+    const archived = await app.inject({ method: 'DELETE', url: `/api/providers/${supplierId}`, headers: { host: headers.host } });
+    expect(archived.statusCode).toBe(200);
+    const before = await app.inject({ method: 'GET', url: '/api/sessions/main/providers', headers });
+    expect(before.json()).toHaveLength(9);
+    const secondary = await app.inject({ method: 'POST', url: '/api/sessions', headers, payload: { name: 'Otra cuenta' } });
+    const secondaryId = secondary.json().id as string;
+    db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at,archived_at) VALUES ('secondary-mbr',?,'mbr@g.us','Otro proveedor',5000,?,?,?)")
+      .run(secondaryId, now, now, now);
+
+    const restored = await app.inject({ method: 'POST', url: '/api/sessions/main/providers', headers, payload });
+    expect(restored.statusCode, restored.body).toBe(201);
+    expect(restored.json()).toMatchObject({ id: supplierId, sessionId: 'main', ...payload });
+    expect(db.prepare('SELECT archived_at,margin_cop,box_margin_cop,created_at FROM supplier_profiles WHERE id=?').get(supplierId))
+      .toEqual({ archived_at: null, margin_cop: 0, box_margin_cop: 0, created_at: createdAt });
+    expect(db.prepare("SELECT supplier_id,margin_cop_applied,box_margin_cop_applied FROM products WHERE id='historical-mbr'").get())
+      .toEqual({ supplier_id: supplierId, margin_cop_applied: 10000, box_margin_cop_applied: 5000 });
+    expect(db.prepare("SELECT name,margin_cop,archived_at FROM supplier_profiles WHERE id='secondary-mbr'").get())
+      .toEqual({ name: 'Otro proveedor', margin_cop: 5000, archived_at: now });
+    expect(db.prepare("SELECT action FROM audit_events WHERE entity_id=? ORDER BY rowid DESC LIMIT 1").get(supplierId))
+      .toEqual({ action: 'supplier.restored' });
+    const after = await app.inject({ method: 'GET', url: '/api/sessions/main/providers', headers });
+    expect(after.json()).toHaveLength(10);
+    const duplicate = await app.inject({ method: 'POST', url: '/api/sessions/main/providers', headers, payload: { ...payload, priceMarginCop: 5000 } });
+    expect(duplicate.statusCode).toBe(409);
+    expect(db.prepare('SELECT margin_cop FROM supplier_profiles WHERE id=?').get(supplierId)).toEqual({ margin_cop: 0 });
+    await app.close();
+  });
+
+  it.each(['create', 'restore', 'update'] as const)('does not misreport or partially save a supplier %s when the activity write fails', async (operation) => {
+    const { app, db } = setup();
+    const now = new Date().toISOString();
+    const headers = { host: '127.0.0.1:3210', 'content-type': 'application/json' };
+    const payload = { name: 'Proveedor nuevo', sourceGroupId: 'supplier@g.us', priceMarginCop: 0, boxMarginCop: 0, markerText: '🌎', defaultPosition: 'top_left' };
+    db.prepare("INSERT INTO whatsapp_groups(session_id,jid,subject,updated_at) VALUES ('main','supplier@g.us','Proveedor',?)").run(now);
+    if (operation !== 'create') {
+      db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at,archived_at) VALUES ('supplier-test','main','supplier@g.us','Proveedor anterior',10000,?,?,?)")
+        .run(now, now, operation === 'restore' ? now : null);
+    }
+    const before = db.prepare('SELECT * FROM supplier_profiles').all();
+    db.exec("CREATE TRIGGER fail_supplier_activity BEFORE INSERT ON audit_events WHEN NEW.entity_type='supplier' BEGIN SELECT RAISE(ABORT,'Activity write failed'); END;");
+    const response = await app.inject({ method: operation === 'update' ? 'PUT' : 'POST', url: operation === 'update' ? '/api/providers/supplier-test' : '/api/sessions/main/providers', headers, payload });
+    expect(response.statusCode, response.body).toBe(500);
+    expect(response.body).not.toContain('ya está registrado');
+    expect(db.prepare('SELECT * FROM supplier_profiles').all()).toEqual(before);
+    await app.close();
+  });
+
   it('returns stored groups for an account without an active connector and rejects missing accounts', async () => {
     const { app, db } = setup();
     db.prepare("INSERT INTO whatsapp_groups(session_id,jid,subject,updated_at) VALUES ('main','stored@g.us','Bodega guardada',?)").run(new Date().toISOString());

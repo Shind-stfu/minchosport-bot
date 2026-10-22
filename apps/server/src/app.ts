@@ -81,7 +81,7 @@ function audit(db: AppDatabase, action: string, type: string, id: string, detail
     'whatsapp.targets.selected': 'Se guardaron los grupos de destino',
     'whatsapp.groups.selected': 'Se guardó la selección de grupos',
     'supplier.created': 'Se agregó un proveedor', 'supplier.updated': 'Se actualizaron las reglas del proveedor',
-    'supplier.archived': 'Se archivó un proveedor',
+    'supplier.archived': 'Se archivó un proveedor', 'supplier.restored': 'Se reactivó un proveedor archivado',
     'distribution.started': 'Se inició la distribución', 'distribution.paused': 'Se pausó la distribución',
     'distribution.stopped': 'Se detuvo la distribución', 'settings.updated': 'Se actualizó la configuración',
     'distribution.send_interval.updated': 'Se actualizó la pausa entre envíos',
@@ -334,13 +334,21 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     const group = db.prepare('SELECT 1 FROM whatsapp_groups WHERE session_id=? AND jid=?').get(account.id, input.data.sourceGroupId);
     if (!group) return reply.code(400).send({ error: 'Actualiza los grupos y selecciona el grupo proveedor de esta cuenta.' });
     if ((JSON.parse((db.prepare('SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?').get(account.id) as { target_group_ids: string }).target_group_ids) as string[]).includes(input.data.sourceGroupId)) return reply.code(400).send({ error: 'Quita el grupo proveedor de los destinos de esta cuenta.' });
-    const id = randomUUID(); const now = new Date().toISOString();
-    try {
-      db.prepare('INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,box_margin_cop,marker_text,default_position,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
-        .run(id, account.id, input.data.sourceGroupId, input.data.name, input.data.priceMarginCop, input.data.boxMarginCop, input.data.markerText, input.data.defaultPosition, now, now);
-      audit(db, 'supplier.created', 'supplier', id, input.data);
-      return reply.code(201).send({ id, sessionId: account.id, ...input.data });
-    } catch { return reply.code(409).send({ error: 'Ese grupo ya está registrado como proveedor de esta cuenta.' }); }
+    const existing = db.prepare('SELECT id,archived_at FROM supplier_profiles WHERE session_id=? AND source_group_id=?')
+      .get(account.id, input.data.sourceGroupId) as { id: string; archived_at: string | null } | undefined;
+    if (existing && existing.archived_at === null) return reply.code(409).send({ error: 'Ese grupo ya está registrado como proveedor de esta cuenta. Puedes editar sus reglas en la lista de proveedores activos.', supplierId: existing.id });
+    const id = existing?.id ?? randomUUID(); const now = new Date().toISOString();
+    db.transaction(() => {
+      if (existing) {
+        db.prepare('UPDATE supplier_profiles SET name=?,margin_cop=?,box_margin_cop=?,marker_text=?,default_position=?,archived_at=NULL,updated_at=? WHERE id=?')
+          .run(input.data.name, input.data.priceMarginCop, input.data.boxMarginCop, input.data.markerText, input.data.defaultPosition, now, id);
+      } else {
+        db.prepare('INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,box_margin_cop,marker_text,default_position,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+          .run(id, account.id, input.data.sourceGroupId, input.data.name, input.data.priceMarginCop, input.data.boxMarginCop, input.data.markerText, input.data.defaultPosition, now, now);
+      }
+      audit(db, existing ? 'supplier.restored' : 'supplier.created', 'supplier', id, input.data);
+    })();
+    return reply.code(201).send({ id, sessionId: account.id, ...input.data, restored: Boolean(existing) });
   });
 
   app.put<{ Params: { supplierId: string } }>('/api/providers/:supplierId', async (request, reply) => {
@@ -351,13 +359,18 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     if (!db.prepare('SELECT 1 FROM whatsapp_groups WHERE session_id=? AND jid=?').get(provider.session_id, input.data.sourceGroupId)) return reply.code(400).send({ error: 'El grupo proveedor no pertenece a esta cuenta.' });
     const targets = JSON.parse((db.prepare('SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?').get(provider.session_id) as { target_group_ids: string }).target_group_ids) as string[];
     if (targets.includes(input.data.sourceGroupId)) return reply.code(400).send({ error: 'Quita el grupo proveedor de los destinos de esta cuenta.' });
+    const conflict = db.prepare('SELECT id,archived_at FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND id<>?')
+      .get(provider.session_id, input.data.sourceGroupId, provider.id) as { id: string; archived_at: string | null } | undefined;
+    if (conflict) return reply.code(409).send({ error: conflict.archived_at === null
+      ? 'Ese grupo ya está registrado como proveedor de esta cuenta. Puedes editar sus reglas en la lista de proveedores activos.'
+      : 'Ese grupo tiene un proveedor archivado. Usa Agregar proveedor para reactivarlo.', supplierId: conflict.id });
     const now = new Date().toISOString();
-    try {
+    db.transaction(() => {
       db.prepare('UPDATE supplier_profiles SET source_group_id=?,name=?,margin_cop=?,box_margin_cop=?,marker_text=?,default_position=?,updated_at=? WHERE id=?')
         .run(input.data.sourceGroupId,input.data.name,input.data.priceMarginCop,input.data.boxMarginCop,input.data.markerText,input.data.defaultPosition,now,provider.id);
       audit(db, 'supplier.updated', 'supplier', provider.id, input.data);
-      return { ok: true, id: provider.id, ...input.data };
-    } catch { return reply.code(409).send({ error: 'Ese grupo ya está registrado como proveedor de esta cuenta.' }); }
+    })();
+    return { ok: true, id: provider.id, ...input.data };
   });
 
   app.delete<{ Params: { supplierId: string } }>('/api/providers/:supplierId', async (request, reply) => {

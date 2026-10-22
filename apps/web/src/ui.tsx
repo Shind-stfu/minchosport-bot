@@ -166,10 +166,10 @@ export function App() {
   async function saveSupplier(supplier: Omit<Supplier, 'id'|'sessionId'|'sourceGroupName'>, id?: string) {
     setBusy(true); setMessage('');
     try {
-      const saved = await api<Supplier>(id ? `/providers/${id}` : `/sessions/${sessionId}/providers`, { method: id ? 'PUT' : 'POST', ...json(supplier) });
+      const saved = await api<Supplier & { restored?: boolean }>(id ? `/providers/${id}` : `/sessions/${sessionId}/providers`, { method: id ? 'PUT' : 'POST', ...json(supplier) });
       const provider = { ...saved, sessionId, sourceGroupName: groups.find((group) => group.id === saved.sourceGroupId)?.name ?? null };
       setSuppliers((current) => [...current.filter((item) => item.id !== saved.id), provider].sort((a, b) => a.name.localeCompare(b.name, 'es')));
-      setMessage(id ? 'Reglas del proveedor actualizadas. Los productos existentes conservan su margen.' : 'Proveedor agregado; las publicaciones nuevas aparecerán en el catálogo.');
+      setMessage(id ? 'Reglas del proveedor actualizadas. Los productos existentes conservan su margen.' : saved.restored ? 'Proveedor reactivado. Las reglas nuevas se aplicarán a publicaciones nuevas; los productos existentes conservan su margen.' : 'Proveedor agregado; las publicaciones nuevas aparecerán en el catálogo.');
       return true;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'No se pudo guardar el proveedor.');
@@ -617,7 +617,7 @@ function ActivityView({ logs, sessionName, onRefresh }: { logs: ApplicationLog[]
     'supplier.reception.schedule.updated': 'Se actualizó el horario diario de recepción',
     'whatsapp.session.created': 'Se creó una cuenta de WhatsApp',
     'supplier.created': 'Se agregó un proveedor', 'supplier.updated': 'Se actualizaron las reglas del proveedor',
-    'supplier.archived': 'Se archivó un proveedor', 'distribution.started': 'Se inició la distribución',
+    'supplier.archived': 'Se archivó un proveedor', 'supplier.restored': 'Se reactivó un proveedor archivado', 'distribution.started': 'Se inició la distribución',
     'distribution.paused': 'Se pausó la distribución', 'distribution.stopped': 'Se detuvo la distribución',
   };
   const filtered = logs.filter((log) => {
