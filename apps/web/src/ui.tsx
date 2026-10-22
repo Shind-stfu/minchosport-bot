@@ -62,6 +62,8 @@ export function App() {
   const [logs, setLogs] = useState<ApplicationLog[]>([]);
   const [distribution, setDistribution] = useState<Distribution>({ realSendsEnabled: false, connected: false, status: 'stopped', queue: {} });
   const [busy, setBusy] = useState(false);
+  const [deletingProducts, setDeletingProducts] = useState(false);
+  const catalogOperation = useRef(0);
   const [message, setMessage] = useState('');
   const [bulkSkipped, setBulkSkipped] = useState<string[]>([]);
   const [approvalProducts, setApprovalProducts] = useState<Product[] | null>(null);
@@ -155,10 +157,11 @@ export function App() {
   const progressTotal = sendingBatchIds.length ? sendingBatchIds.length * destinationNames.length : publicationProgress.done + publicationProgress.active;
 
   async function action(run: () => Promise<unknown>, success?: string) {
+    const operation = catalogOperation.current;
     setBusy(true); setMessage(''); setBulkSkipped([]);
-    try { await run(); await refresh(); if (success) setMessage(success); }
-    catch (error) { setMessage(error instanceof Error ? error.message : 'No se pudo completar la operación.'); }
-    finally { setBusy(false); }
+    try { await run(); if (operation !== catalogOperation.current) return; await refresh(); if (success) setMessage(success); }
+    catch (error) { if (operation === catalogOperation.current) setMessage(error instanceof Error ? error.message : 'No se pudo completar la operación.'); }
+    finally { if (operation === catalogOperation.current) setBusy(false); }
   }
   async function createSession() {
     const name = window.prompt('Nombre para la nueva cuenta de WhatsApp:');
@@ -190,6 +193,7 @@ export function App() {
     await action(() => api(`/products/${product.id}/send`, { method: 'POST' }));
   }
   async function sendAll() {
+    const operation = catalogOperation.current;
     const readyForBatch = scopedProducts.filter((product) => ['approved', 'simulated'].includes(product.status) && product.publications.length === 0);
     if (hasUnsavedChanges(readyForBatch)) return;
     const selected = readyForBatch.length;
@@ -205,6 +209,7 @@ export function App() {
     setSendingBatch(true);
     await action(async () => {
       const result = await api<{ message: string; skippedErrors: string[] }>('/products/send-all', { method: 'POST', ...json({ sessionId, supplierId: supplierFilter || null }) });
+      if (operation !== catalogOperation.current) return;
       setMessage(result.message);
       setBulkSkipped(result.skippedErrors);
     });
@@ -212,6 +217,7 @@ export function App() {
     setSendingBatchIds([]);
   }
   async function sendSelected() {
+    const operation = catalogOperation.current;
     if (hasUnsavedChanges(selectedProducts)) return;
     const ids = selectedProducts.map((product) => product.id);
     const imageMessages = selectedProducts.reduce((total, product) => total + product.images.length * destinationNames.length, 0);
@@ -222,10 +228,11 @@ export function App() {
     setSendingBatch(true); setSendingBatchIds(ids); setBusy(true); setMessage(''); setBulkSkipped([]);
     try {
       const result = await api<{ message: string; skippedErrors: string[] }>('/products/send-all', { method: 'POST', ...json({ sessionId, supplierId: supplierFilter || null, productIds: ids }) });
+      if (operation !== catalogOperation.current) return;
       setMessage(result.message); setBulkSkipped(result.skippedErrors); setSelectedProductIds([]);
       await refresh();
-    } catch (error) { setMessage(error instanceof Error ? error.message : 'No se pudo enviar la selección.'); }
-    finally { setBusy(false); setSendingBatch(false); setSendingBatchIds([]); }
+    } catch (error) { if (operation === catalogOperation.current) setMessage(error instanceof Error ? error.message : 'No se pudo enviar la selección.'); }
+    finally { if (operation === catalogOperation.current) { setBusy(false); setSendingBatch(false); setSendingBatchIds([]); } }
   }
   async function deleteSentProduct(product: Product) {
     if (!isProductSentAndSettled(product)) return;
@@ -247,13 +254,20 @@ export function App() {
     });
   }
   async function deleteAllProducts() {
-    if (busy || sendingBatch || !products.length) return;
-    await action(async () => {
+    if (deletingProducts || !products.length) return;
+    catalogOperation.current += 1;
+    setDeletingProducts(true); setBusy(true); setMessage('Deteniendo envíos y eliminando todos los productos…'); setBulkSkipped([]);
+    try {
       const result = await api<{ productCount: number; fileErrors: number }>(`/sessions/${encodeURIComponent(sessionId)}/products`, { method: 'DELETE' });
       setSelectedProductIds([]); setPendingEditIds([]); setSendingBatchIds([]);
       setSupplierFilter(''); setSearch(''); setStatusFilter('all');
-      setMessage(`Se eliminaron ${result.productCount} productos de la cuenta.${result.fileErrors ? ' Algunos archivos locales no se pudieron borrar.' : ''}`);
-    });
+      await refresh();
+      setMessage(`Envíos detenidos. Se eliminaron ${result.productCount} productos de la cuenta.${result.fileErrors ? ' Algunos archivos locales no se pudieron borrar.' : ''}`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'No se pudieron eliminar los productos.');
+    } finally {
+      setDeletingProducts(false); setBusy(false); setSendingBatch(false); setSendingBatchIds([]);
+    }
   }
   async function refreshGroups() {
     const [account, nextGroups] = await Promise.all([api<Session>(`/sessions/${encodeURIComponent(sessionId)}`), api<WhatsAppGroup[]>(`/sessions/${encodeURIComponent(sessionId)}/groups`)]);
@@ -277,7 +291,7 @@ export function App() {
     <main className="main" id="inicio">
       <div className="page-heading">
         <div><div className="eyebrow">OPERACIÓN LOCAL <span>·</span> {tab === 'connection' ? 'BAILEYS EXPERIMENTAL' : distribution.realSendsEnabled ? 'ENVÍO MANUAL' : 'CATÁLOGO LOCAL'}</div><h1>{tab === 'products' ? 'Catálogo de productos' : tab === 'activity' ? 'Historial de actividad' : tab === 'connection' ? 'Cuentas de WhatsApp' : tab === 'suppliers' ? 'Reglas por proveedor' : 'Configuración'}</h1><p>{tab === 'products' ? 'Las fotos y descripciones llegan desde los grupos proveedor seleccionados y se conservan al reiniciar.' : tab === 'activity' ? 'Sigue la recepción, preparación, conexión y estado de los envíos.' : tab === 'connection' ? 'Cada número conserva su sesión y sus grupos de forma independiente.' : tab === 'suppliers' ? 'Define margen, marca y posición para cada grupo proveedor.' : 'Opciones de ejecución local y seguridad.'}</p></div>
-        <div className="heading-controls"><label className="account-picker"><span>CUENTA ACTIVA</span><select value={sessionId} disabled={sendingBatch} onChange={(event) => { setSessionId(event.target.value); setSupplierFilter(''); setSelectedProductIds([]); }} aria-label="Cuenta activa">{sessions.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label><button className="secondary-button" disabled={busy} onClick={createSession}>＋ Nueva cuenta</button><div className={`mode-pill ${distribution.realSendsEnabled && distribution.connected ? 'mode-ready' : ''}`}><span className="mode-icon">◈</span><span>{distribution.realSendsEnabled ? `Envío real ${distribution.connected ? 'disponible' : '· conecta WhatsApp'}` : 'Envío real deshabilitado'}</span></div></div>
+        <div className="heading-controls"><label className="account-picker"><span>CUENTA ACTIVA</span><select value={sessionId} disabled={sendingBatch || deletingProducts} onChange={(event) => { setSessionId(event.target.value); setSupplierFilter(''); setSelectedProductIds([]); }} aria-label="Cuenta activa">{sessions.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label><button className="secondary-button" disabled={busy} onClick={createSession}>＋ Nueva cuenta</button><div className={`mode-pill ${distribution.realSendsEnabled && distribution.connected ? 'mode-ready' : ''}`}><span className="mode-icon">◈</span><span>{distribution.realSendsEnabled ? `Envío real ${distribution.connected ? 'disponible' : '· conecta WhatsApp'}` : 'Envío real deshabilitado'}</span></div></div>
       </div>
       <div className="policy-note"><span className="note-icon">i</span><span><strong>{tab === 'connection' ? 'Conector experimental.' : 'Revisión antes de enviar.'}</strong> {tab === 'connection' ? 'Baileys no es una API oficial y puede dejar de funcionar o ocasionar restricciones. Usa grupos propios o autorizados.' : distribution.realSendsEnabled ? 'Los precios dudosos requieren revisión. Cada envío usa una copia marcada y una configuración congelada al prepararlo; los envíos inciertos se detienen para conciliación.' : 'El envío real está deshabilitado. Configura APP_MODE=experimental, WHATSAPP_ENABLED=true y WHATSAPP_SEND_ENABLED=true en .env y reinicia.'}</span></div>
       {message && <div className="toast" role="status"><span>{message}</span><button onClick={() => setMessage('')} aria-label="Cerrar aviso">×</button></div>}
@@ -294,7 +308,7 @@ export function App() {
         {(sendingBatch || counts.queued > 0 || counts.inProgress > 0 || counts.uncertain > 0) && <div className={`send-progress ${counts.uncertain ? 'has-uncertain' : ''}`} role="status"><span className="progress-pulse" /><span><strong>{sendingBatch ? `Envío en curso · ${publicationProgress.done} de ${progressTotal} publicaciones aceptadas` : counts.inProgress ? `${counts.inProgress} referencias enviándose` : counts.queued ? `${counts.queued} referencias en cola` : `${counts.uncertain} referencias requieren conciliación`}</strong><small>{counts.uncertain ? 'Revisa esos grupos antes de volver a intentar.' : `Los estados se actualizan automáticamente. “Aceptado” indica que Baileys procesó el envío; no confirma entrega al destinatario.`}</small></span>{!sendingBatch && progressTotal > 0 && <span className="progress-count">{publicationProgress.done} / {progressTotal}</span>}</div>}
         <section className="stats" aria-label="Resumen del catálogo"><Stat label="Referencias" value={counts.all} detail="en esta cuenta y filtro" symbol="▦" /><Stat label="Por revisar" value={counts.review} detail="requieren tu decisión" symbol="◷" accent /><Stat label="Preparadas" value={counts.prepared} detail="listas para enviar" symbol="↗" /><Stat label="Enviadas" value={counts.sent} detail="confirmadas por Baileys" symbol="✓" /></section>
         <section className="catalog-panel supplier-catalog">
-          <div className="catalog-header"><div><span className="panel-kicker">FOTOS Y DESCRIPCIONES RECIBIDAS</span><h2>Productos recibidos <span className="count-badge">{counts.all}</span></h2></div><div className="catalog-actions"><button className="primary-button" disabled={busy || sendingBatch || !scopedProducts.length} onClick={openApproveAll}>Aprobar TODO</button><label className="filter-select"><span>Proveedor</span><select value={supplierFilter} onChange={(event) => { setSelectedProductIds([]); setSupplierFilter(event.target.value); }}><option value="">Todos ({products.length})</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.name} ({supplierCounts.get(supplier.id) ?? 0})</option>)}</select></label><button className="secondary-button bulk-send-button delete-product-button" disabled={busy || sendingBatch || !products.length} title="Eliminar todos los productos de la cuenta activa, sin aplicar filtros" onClick={() => void deleteAllProducts()}>Eliminar todos los productos</button>{counts.sentDeletable > 0 && <button className="secondary-button bulk-send-button" disabled={busy} onClick={() => void deleteSentProducts()}>Eliminar enviados ({counts.sentDeletable})</button>}{counts.approvedAll > 0 && <button className="secondary-button bulk-send-button" disabled={busy || sendingBatch || !distribution.realSendsEnabled || !distribution.connected || !(whatsApp?.targetGroupIds.length)} onClick={sendAll}><span>Enviar aprobados ({counts.approvedAll})</span><span>↗</span></button>}<button className="icon-button" onClick={() => refresh().catch((error) => setMessage(error.message))} title="Actualizar productos">↻</button></div></div>
+          <div className="catalog-header"><div><span className="panel-kicker">FOTOS Y DESCRIPCIONES RECIBIDAS</span><h2>Productos recibidos <span className="count-badge">{counts.all}</span></h2></div><div className="catalog-actions"><button className="primary-button" disabled={busy || sendingBatch || !scopedProducts.length} onClick={openApproveAll}>Aprobar TODO</button><label className="filter-select"><span>Proveedor</span><select value={supplierFilter} onChange={(event) => { setSelectedProductIds([]); setSupplierFilter(event.target.value); }}><option value="">Todos ({products.length})</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.name} ({supplierCounts.get(supplier.id) ?? 0})</option>)}</select></label><button className="secondary-button bulk-send-button delete-product-button" disabled={deletingProducts || !products.length} title="Detener los envíos y eliminar todos los productos de la cuenta activa, sin aplicar filtros" onClick={() => void deleteAllProducts()}>{deletingProducts ? 'Deteniendo y eliminando…' : 'Eliminar todos los productos'}</button>{counts.sentDeletable > 0 && <button className="secondary-button bulk-send-button" disabled={busy} onClick={() => void deleteSentProducts()}>Eliminar enviados ({counts.sentDeletable})</button>}{counts.approvedAll > 0 && <button className="secondary-button bulk-send-button" disabled={busy || sendingBatch || !distribution.realSendsEnabled || !distribution.connected || !(whatsApp?.targetGroupIds.length)} onClick={sendAll}><span>Enviar aprobados ({counts.approvedAll})</span><span>↗</span></button>}<button className="icon-button" onClick={() => refresh().catch((error) => setMessage(error.message))} title="Actualizar productos">↻</button></div></div>
           <div className="catalog-tools">
             <label className="catalog-search"><span aria-hidden="true">⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Buscar por código, nombre o descripción" aria-label="Buscar productos por código, nombre o descripción" /><button type="button" onClick={() => setSearch('')} aria-label="Limpiar búsqueda" disabled={!search}>×</button></label>
             <div className="catalog-filter-row"><div className="status-filters" role="group" aria-label="Filtrar productos por estado">{([['all','Todos',counts.all],['review','Por revisar',counts.review],['prepared','Listos',counts.prepared],['sending','En cola',counts.sending],['sent','Enviados',counts.sent]] as const).map(([id,label,count]) => <button key={id} type="button" className={`status-filter ${statusFilter === id ? 'active' : ''}`} aria-pressed={statusFilter === id} onClick={() => setStatusFilter(id)}>{label}<span>{count}</span></button>)}</div>

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { FastifyBaseLogger } from 'fastify';
 import { addMargin, analyzePrices, extractShoeCode, formatCop, prepareOutgoingDescription, replacePriceCandidates } from '@tenis/core';
 import type { AppDatabase } from './database.js';
@@ -11,10 +12,24 @@ import { markOptions, readMarkDecision } from './image-marking-decision.js';
 
 const ASSEMBLY_IDLE_MS = 3_000;
 
+function interruptible<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const cancel = () => { signal.removeEventListener('abort', cancel); reject(signal.reason); };
+    operation.then(
+      (value) => { signal.removeEventListener('abort', cancel); resolve(value); },
+      (error: unknown) => { signal.removeEventListener('abort', cancel); reject(error); },
+    );
+    if (signal.aborted) cancel();
+    else signal.addEventListener('abort', cancel, { once: true });
+  });
+}
+
 export class OutboundDistributionService {
   private timer: NodeJS.Timeout | undefined;
   private currentTick: Promise<void> | undefined;
   private sendOperation: Promise<void> = Promise.resolve();
+  private sendCancellation = new AbortController();
+  private clearingCatalog = false;
 
   constructor(
     private readonly db: AppDatabase,
@@ -23,7 +38,7 @@ export class OutboundDistributionService {
     private readonly logger: FastifyBaseLogger,
     private readonly enabled: boolean,
     readonly sessionId = 'main',
-    private readonly delay: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    private readonly delay: (ms: number, signal?: AbortSignal) => Promise<void> = (ms, signal) => sleep(ms, undefined, { signal }),
   ) {
     const now = new Date().toISOString();
     this.db.transaction(() => {
@@ -45,6 +60,20 @@ export class OutboundDistributionService {
     await Promise.all([this.currentTick, this.sendOperation]);
   }
 
+  /** Cancels active and queued sends before deleting their rows and files. */
+  async cancelSendsAndRun<T>(cleanup: () => T): Promise<T> {
+    if (this.clearingCatalog) throw new Error('Ya se están eliminando los productos de esta cuenta.');
+    this.clearingCatalog = true;
+    this.sendCancellation.abort(new Error('Envío detenido al eliminar todos los productos de la cuenta.'));
+    try {
+      await Promise.all([this.currentTick, this.sendOperation]);
+      return cleanup();
+    } finally {
+      this.sendCancellation = new AbortController();
+      this.clearingCatalog = false;
+    }
+  }
+
   async processNow() {
     await this.tick();
   }
@@ -55,6 +84,8 @@ export class OutboundDistributionService {
 
   /** Sends one product only after an explicit request from the catalog. */
   async sendApprovedProduct(productId: string): Promise<{ groupCount: number; imageCount: number }> {
+    const signal = this.sendCancellation.signal;
+    signal.throwIfAborted();
     if (!this.enabled) throw new Error('El envío real está deshabilitado. Revisa APP_MODE, WHATSAPP_ENABLED y WHATSAPP_SEND_ENABLED en .env.');
     if (this.whatsapp.status().status !== 'connected') throw new Error('Conecta WhatsApp antes de enviar.');
     let release!: () => void;
@@ -62,6 +93,7 @@ export class OutboundDistributionService {
     this.sendOperation = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
+      signal.throwIfAborted();
       const product = this.db.prepare('SELECT status,output_text,session_id,supplier_id FROM products WHERE id=?').get(productId) as { status: string; output_text: string | null; session_id: string; supplier_id: string | null } | undefined;
       if (!product) throw new Error('Producto no encontrado.');
       if (product.session_id !== this.sessionId || !product.supplier_id) throw new Error('El producto no pertenece a esta cuenta o proveedor.');
@@ -83,9 +115,10 @@ export class OutboundDistributionService {
         }
         await this.enqueueProduct(productId);
       }
+      signal.throwIfAborted();
       const queued = this.db.prepare("SELECT COUNT(DISTINCT p.group_id) as groups,COUNT(u.id) as images FROM outbound_publications p JOIN outbound_units u ON u.publication_id=p.id WHERE p.product_id=? AND p.session_id=? AND p.status IN ('queued','in_progress') AND u.status='pending'").get(productId, this.sessionId) as { groups: number; images: number };
       if (queued.groups === 0 || queued.images === 0) throw new Error('No hay destinos o fotografías válidas. Actualiza y guarda la selección de grupos.');
-      while (await this.sendNextUnit(productId)) { /* send photos sequentially */ }
+      while (await this.sendNextUnit(productId, signal)) { /* send photos sequentially */ }
       return { groupCount: queued.groups, imageCount: queued.images };
     } finally {
       release();
@@ -94,10 +127,13 @@ export class OutboundDistributionService {
 
   /** Bulk sends only supplier products with an already clear, prepared price. */
   async approveAndSendAll(supplierId?: string, productIds?: string[]): Promise<{ sentProducts: number; sentGroups: number; sentImages: number; reviewRequired: number; skipped: number; skippedErrors: string[]; error?: string }> {
+    const signal = this.sendCancellation.signal;
+    signal.throwIfAborted();
     if (!this.enabled) throw new Error('El envío real está deshabilitado. Revisa APP_MODE, WHATSAPP_ENABLED y WHATSAPP_SEND_ENABLED en .env.');
     if (this.whatsapp.status().status !== 'connected') throw new Error('Conecta WhatsApp antes de enviar.');
 
     await this.processNow();
+    signal.throwIfAborted();
     if (productIds) {
       if (new Set(productIds).size !== productIds.length) throw new Error('La selección contiene productos duplicados.');
       const idSlots = productIds.map(() => '?').join(',');
@@ -120,6 +156,7 @@ export class OutboundDistributionService {
     const skippedErrors: string[] = [];
 
     for (const product of ready) {
+      signal.throwIfAborted();
       const existing = this.db.prepare('SELECT status FROM outbound_publications WHERE product_id=? AND session_id=?').all(product.id, this.sessionId) as Array<{ status: string }>;
       if (existing.some((entry) => ['submitted', 'in_progress', 'needs_review'].includes(entry.status))) {
         skipped += 1;
@@ -127,10 +164,12 @@ export class OutboundDistributionService {
       }
       try {
         const result = await this.sendApprovedProduct(product.id);
+        signal.throwIfAborted();
         sentProducts += 1;
         sentGroups += result.groupCount;
         sentImages += result.imageCount;
       } catch (error) {
+        signal.throwIfAborted();
         skipped += 1;
         const detail = error instanceof Error ? error.message : 'No se pudo enviar una referencia.';
         skippedErrors.push(`${product.title || product.id}: ${detail}`);
@@ -246,7 +285,8 @@ export class OutboundDistributionService {
     return created;
   }
 
-  private async sendNextUnit(productId?: string): Promise<boolean> {
+  private async sendNextUnit(productId: string, signal: AbortSignal): Promise<boolean> {
+    signal.throwIfAborted();
     const unit = this.db.prepare(`SELECT u.id,u.position,u.publication_id,p.product_id,p.group_id,p.group_name,p.status as publication_status,
         COALESCE(u.caption_snapshot,pr.output_text) as output_text,COALESCE(u.rendered_file_name,m.file_name) as file_name,
         COALESCE(u.rendered_mime_type,m.mime_type) as mime_type
@@ -254,8 +294,8 @@ export class OutboundDistributionService {
       JOIN outbound_publications p ON p.id=u.publication_id
       JOIN products pr ON pr.id=p.product_id
       JOIN media_assets m ON m.id=u.media_asset_id
-      WHERE u.session_id=? AND p.session_id=? AND u.status='pending' AND p.status IN ('queued','in_progress') ${productId ? 'AND p.product_id=?' : ''}
-      ORDER BY p.created_at,p.group_id,u.position LIMIT 1`).get(...(productId ? [this.sessionId, this.sessionId, productId] : [this.sessionId, this.sessionId])) as {
+      WHERE u.session_id=? AND p.session_id=? AND u.status='pending' AND p.status IN ('queued','in_progress') AND p.product_id=?
+      ORDER BY p.created_at,p.group_id,u.position LIMIT 1`).get(this.sessionId, this.sessionId, productId) as {
         id: string; position: number; publication_id: string; product_id: string; group_id: string; group_name: string; publication_status: string;
         output_text: string; file_name: string; mime_type: string;
       } | undefined;
@@ -266,8 +306,9 @@ export class OutboundDistributionService {
     if (previousSend?.last_send_at) {
       const elapsedMs = Math.max(0, Date.now() - Date.parse(previousSend.last_send_at));
       const remainingMs = Math.max(0, intervalMs - elapsedMs);
-      if (remainingMs > 0) await this.delay(remainingMs);
+      if (remainingMs > 0) await interruptible(this.delay(remainingMs, signal), signal);
     }
+    signal.throwIfAborted();
     const now = new Date().toISOString();
     this.db.transaction(() => {
       this.db.prepare("UPDATE outbound_units SET status='transmitting',started_at=?,error=NULL WHERE id=? AND session_id=? AND status='pending'").run(now, unit.id, this.sessionId);
@@ -276,7 +317,8 @@ export class OutboundDistributionService {
     })();
     try {
       const caption = prepareOutgoingDescription(unit.output_text);
-      const result = await this.whatsapp.sendImage(unit.group_id, readFileSync(join(this.dataDirectory, 'media', unit.file_name)), unit.mime_type, caption);
+      const result = await interruptible(this.whatsapp.sendImage(unit.group_id, readFileSync(join(this.dataDirectory, 'media', unit.file_name)), unit.mime_type, caption), signal);
+      signal.throwIfAborted();
       const completedAt = new Date().toISOString();
       this.db.transaction(() => {
       this.db.prepare("UPDATE outbound_units SET status='submitted',remote_message_id=?,completed_at=? WHERE id=? AND session_id=? AND status='transmitting'").run(result.messageId, completedAt, unit.id, this.sessionId);
@@ -287,6 +329,7 @@ export class OutboundDistributionService {
       this.logger.info({ productId: unit.product_id, groupId: unit.group_id, unitPosition: unit.position }, 'Baileys devolvió el identificador de la unidad publicada');
       return true;
     } catch (error) {
+      signal.throwIfAborted();
       const completedAt = new Date().toISOString();
       const detail = error instanceof Error ? error.message.slice(0, 500) : 'Error desconocido durante el envío.';
       this.db.transaction(() => {

@@ -465,14 +465,18 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
   app.delete<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/products', async (request, reply) => {
     const account = sessionRow(request.params.sessionId);
     if (!account) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
-    const blocked = db.prepare(`SELECT 1 FROM products p WHERE p.session_id=? AND (
-      EXISTS (SELECT 1 FROM outbound_publications op WHERE op.product_id=p.id AND op.status IN ('queued','in_progress','needs_review'))
-      OR EXISTS (SELECT 1 FROM outbound_units u JOIN outbound_publications op ON op.id=u.publication_id
-        WHERE op.product_id=p.id AND u.status IN ('pending','transmitting','uncertain'))) LIMIT 1`).get(account.id);
-    if (blocked) return reply.code(409).send({ error: 'No se eliminó ningún producto. Hay envíos pendientes o inciertos; completa o cancela los pendientes y concilia los inciertos antes de eliminar todo.' });
-    const products = db.prepare('SELECT id,session_id,title FROM products WHERE session_id=?').all(account.id) as Array<{ id: string; session_id: string; title: string }>;
-    const result = removeProducts(db, dataDirectory, products, 'products.deleted.manually', 'Se eliminaron todos los productos del catálogo de la cuenta');
-    return { ok: true, ...result };
+    const distribution = distributionFor(account.id);
+    db.prepare("UPDATE session_distribution_control SET status='stopped',updated_at=? WHERE session_id=?").run(new Date().toISOString(), account.id);
+    const cleanup = () => {
+      const products = db.prepare('SELECT id,session_id,title FROM products WHERE session_id=?').all(account.id) as Array<{ id: string; session_id: string; title: string }>;
+      return removeProducts(db, dataDirectory, products, 'products.deleted.manually', 'Se detuvieron los envíos y se eliminaron todos los productos del catálogo de la cuenta');
+    };
+    try {
+      const result = distribution ? await distribution.cancelSendsAndRun(cleanup) : cleanup();
+      return { ok: true, ...result };
+    } catch (error) {
+      return reply.code(409).send({ error: error instanceof Error ? error.message : 'No se pudieron eliminar los productos.' });
+    }
   });
 
   app.delete<{ Params: { sessionId: string }; Body: { supplierId?: string | null } }>('/api/sessions/:sessionId/products/sent', async (request, reply) => {
