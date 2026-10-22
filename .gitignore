@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.pnpm-store/
+.env
+.env.*
+!.env.example
+data/
+**/ocr-cache/
+whatsapp-auth/
+auth_info_baileys/
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+coverage/
+.DS_Store
+Thumbs.db

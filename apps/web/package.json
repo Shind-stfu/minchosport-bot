@@ -1,0 +1,8 @@
+{
+  "name": "@tenis/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "vite --host 127.0.0.1", "build": "vite build", "typecheck": "tsc --noEmit -p tsconfig.json", "test": "vitest run" },
+  "dependencies": { "@tenis/core": "workspace:*", "@vitejs/plugin-react": "^5.0.4", "react": "^19.1.1", "react-dom": "^19.1.1" }
+}

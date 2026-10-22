@@ -1,0 +1,27 @@
+{
+  "name": "bot-distribuidor-tenis",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Herramienta local para revisar y preparar catálogos de tenis en simulación.",
+  "packageManager": "pnpm@11.25.0",
+  "engines": { "node": ">=24 <25" },
+  "scripts": {
+    "dev": "pnpm --filter @tenis/core build && pnpm --parallel --filter @tenis/server --filter @tenis/web dev",
+    "dev:server": "pnpm --filter @tenis/core build && pnpm --filter @tenis/server dev",
+    "dev:web": "pnpm --filter @tenis/core build && pnpm --filter @tenis/web dev",
+    "build": "pnpm --filter @tenis/core build && pnpm --filter @tenis/server build && pnpm --filter @tenis/web build",
+    "typecheck": "pnpm --recursive typecheck",
+    "test": "pnpm --filter @tenis/core build && pnpm --filter @tenis/core test && pnpm --filter @tenis/web test && pnpm --filter @tenis/server test",
+    "start": "pnpm --filter @tenis/server start"
+  },
+  "devDependencies": {
+    "@types/node": "^24.7.2",
+    "@types/react": "^19.1.16",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.4",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9",
+    "vitest": "^3.2.4"
+  }
+}
