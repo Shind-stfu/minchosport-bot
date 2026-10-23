@@ -10,6 +10,35 @@ const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
 describe('multi-account schema migration', () => {
+  it('builds history anchors from the latest original inbox timestamp while keeping a saved 5–8 p.m. range', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'tenis-history-anchors-migration-'));
+    directories.push(directory);
+    const path = join(directory, 'business.sqlite');
+    const legacy = new Database(path);
+    legacy.exec('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);');
+    for (const [index, sql] of MIGRATIONS.slice(0, 18).entries()) {
+      legacy.transaction(() => {
+        legacy.exec(sql);
+        legacy.prepare('INSERT INTO schema_migrations(version,checksum,applied_at) VALUES (?,?,?)')
+          .run(index + 1, createHash('sha256').update(sql).digest('hex'), new Date().toISOString());
+      })();
+    }
+    const now = new Date().toISOString();
+    legacy.prepare("UPDATE whatsapp_session_settings SET reception_start_time='17:00',reception_end_time='20:00' WHERE session_id='main'").run();
+    const insert = legacy.prepare("INSERT INTO supplier_inbox_messages(session_id,group_jid,message_id,participant_jid,message_timestamp_ms,status,received_at) VALUES ('main','provider@g.us',?,'vendor@s.whatsapp.net',?,'processed',?)");
+    insert.run('latest', Date.parse('2026-10-22T20:10:00-05:00'), now);
+    insert.run('older', Date.parse('2026-10-22T17:10:00-05:00'), now);
+    legacy.close();
+    const db = openDatabase(path);
+    expect(db.prepare('SELECT message_id,message_timestamp_ms,from_me,participant_jid FROM whatsapp_history_anchors').all()).toEqual([
+      { message_id: 'latest', message_timestamp_ms: Date.parse('2026-10-22T20:10:00-05:00'), from_me: 0, participant_jid: 'vendor@s.whatsapp.net' },
+    ]);
+    expect(db.prepare("SELECT reception_start_time,reception_end_time FROM whatsapp_session_settings WHERE session_id='main'").get()).toEqual({ reception_start_time: '17:00', reception_end_time: '20:00' });
+    expect(db.prepare('SELECT COUNT(*) as count FROM supplier_inbox_messages').get()).toEqual({ count: 2 });
+    expect(db.pragma('foreign_key_check')).toEqual([]);
+    db.close();
+  });
+
   it('upgrades the old reception queue without changing a custom recovery range or importing its old pending messages', () => {
     const directory = mkdtempSync(join(tmpdir(), 'tenis-recovery-migration-'));
     directories.push(directory);
@@ -58,7 +87,7 @@ describe('multi-account schema migration', () => {
     legacy.close();
 
     const upgraded = openDatabase(path);
-    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 18 });
+    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 19 });
     expect(upgraded.prepare("SELECT send_interval_ms FROM whatsapp_session_settings WHERE session_id='main'").get()).toEqual({ send_interval_ms: 10000 });
     expect((upgraded.pragma('table_info(image_inspections)') as Array<{ name: string }>).map((column) => column.name)).toContain('ocr_confidence');
     expect(upgraded.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('image_brand_inspections','product_image_analysis')").all()).toEqual([]);
@@ -107,7 +136,7 @@ describe('multi-account schema migration', () => {
     legacy.close();
 
     const upgraded = openDatabase(path);
-    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 18 });
+    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 19 });
     expect(upgraded.prepare("SELECT id,raw_text FROM products WHERE id='existing-tenis'").get())
       .toEqual({ id: 'existing-tenis', raw_text: '*MUJER 096-215*' });
     expect(upgraded.prepare("SELECT name FROM whatsapp_sessions WHERE id='main'").get()).toEqual({ name: 'Cuenta principal' });

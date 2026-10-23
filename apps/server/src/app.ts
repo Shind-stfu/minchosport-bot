@@ -180,9 +180,11 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
   const receptionFor = (sessionId: string) => supplierReception?.snapshot(sessionId) ?? (() => {
     const counts = db.prepare(`SELECT SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pendingCount,SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failedCount FROM supplier_inbox_messages WHERE session_id=?`).get(sessionId) as { pendingCount: number | null; failedCount: number | null };
     const state = db.prepare(`SELECT recovery_status as recoveryStatus,recovery_started_at as recoveryStartedAt,recovery_finished_at as recoveryFinishedAt,recovery_message_count as recoveryMessageCount,
-      recovery_warning as recoveryWarning,last_supplier_message_at as lastSupplierMessageAt,last_supplier_group_jid as lastSupplierGroupJid,last_supplier_result as lastSupplierResult FROM supplier_reception_state WHERE session_id=?`).get(sessionId) as Record<string, unknown> | undefined;
+      recovery_warning as recoveryWarning,last_supplier_message_at as lastSupplierMessageAt,last_supplier_group_jid as lastSupplierGroupJid,last_supplier_result as lastSupplierResult,
+      recovery_requested_groups as recoveryRequestedGroups,recovery_missing_anchors as recoveryMissingAnchors,recovery_failed_requests as recoveryFailedRequests FROM supplier_reception_state WHERE session_id=?`).get(sessionId) as Record<string, unknown> | undefined;
     return { pendingCount: counts.pendingCount ?? 0, failedCount: counts.failedCount ?? 0, recoveryStatus: state?.recoveryStatus ?? 'idle', recoveryStartedAt: state?.recoveryStartedAt ?? null,
       recoveryFinishedAt: state?.recoveryFinishedAt ?? null, recoveryMessageCount: state?.recoveryMessageCount ?? 0, recoveryWarning: state?.recoveryWarning ?? null,
+      recoveryRequestedGroups: state?.recoveryRequestedGroups ?? 0, recoveryMissingAnchors: state?.recoveryMissingAnchors ?? 0, recoveryFailedRequests: state?.recoveryFailedRequests ?? 0,
       lastSupplierMessageAt: state?.lastSupplierMessageAt ?? null, lastSupplierGroupJid: state?.lastSupplierGroupJid ?? null, lastSupplierResult: state?.lastSupplierResult ?? null };
   })();
 
@@ -233,7 +235,24 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       .run(input.data.startTime, input.data.endTime, 'America/Bogota', now, account.id);
     audit(db, 'supplier.reception.schedule.updated', 'whatsapp_session', account.id, { ...input.data, timeZone: 'America/Bogota' });
     await supplierReception?.scheduleChanged(account.id);
-    return { ok: true, receptionSchedule: { ...input.data, timeZone: 'America/Bogota' }, receptionQueue: receptionFor(account.id) };
+    const connector = connectorFor(account.id);
+    let recoveryRequested = false;
+    if (messagingEnabled && connector?.status().status === 'connected' && connector.requestHistory) {
+      await connector.requestHistory(); recoveryRequested = true;
+    }
+    return { ok: true, recoveryRequested, receptionSchedule: { ...input.data, timeZone: 'America/Bogota' }, receptionQueue: receptionFor(account.id) };
+  });
+
+  app.post<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/recover-history', async (request, reply) => {
+    const account = sessionRow(request.params.sessionId);
+    if (!account) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
+    const connector = connectorFor(account.id);
+    if (!messagingEnabled || connector?.status().status !== 'connected' || !connector.requestHistory) return reply.code(409).send({ error: 'Conecta WhatsApp antes de solicitar la recuperación del historial.' });
+    try {
+      await connector.requestHistory();
+      audit(db, 'supplier.history.recovery.requested', 'whatsapp_session', account.id, {});
+      return reply.code(202).send({ ok: true, receptionQueue: receptionFor(account.id) });
+    } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : 'No se pudo iniciar la recuperación.' }); }
   });
 
   app.get<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/reception', async (request, reply) => {

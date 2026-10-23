@@ -39,6 +39,20 @@ function localDayNumber(timestampMs: number, timeZone: string): number {
   return Date.UTC(part('year'), part('month') - 1, part('day')) / 86_400_000;
 }
 
+export function recoveryStartTimestampMs(schedule: ReceptionSchedule, nowMs = Date.now()): number {
+  const start = timeMinutes(schedule.startTime);
+  const currentDay = localDayNumber(nowMs, schedule.timeZone);
+  const currentMinute = localMinuteOfDay(nowMs, schedule.timeZone);
+  const referenceDay = currentDay - (start > timeMinutes(schedule.endTime) && currentMinute < start ? 1 : 0);
+  const offsetMs = currentDay * 86_400_000 + currentMinute * 60_000 - Math.floor(nowMs / 60_000) * 60_000;
+  return referenceDay * 86_400_000 + start * 60_000 - offsetMs;
+}
+
+export function recoveryEndTimestampMs(schedule: ReceptionSchedule, nowMs = Date.now()): number {
+  const durationMinutes = (timeMinutes(schedule.endTime) - timeMinutes(schedule.startTime) + 1440) % 1440;
+  return recoveryStartTimestampMs(schedule, nowMs) + durationMinutes * 60_000;
+}
+
 /** Match original send time against today's range, never yesterday's matching clock hours. */
 export function isInRecoveryWindow(timestampMs: number, schedule: ReceptionSchedule, nowMs = Date.now()): boolean {
   if (!Number.isFinite(timestampMs) || timestampMs > nowMs || !isReceptionOpen(timestampMs, schedule)) return false;

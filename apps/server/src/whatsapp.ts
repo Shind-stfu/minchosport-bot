@@ -9,6 +9,7 @@ import type { IncomingSupplierMessage, SupplierIngestionService } from './suppli
 import { writeApplicationLog } from './application-log.js';
 import type { SupplierReceptionService } from './supplier-reception.js';
 import { DEFAULT_RECOVERY_SCHEDULE, isInRecoveryWindow, readReceptionSchedule, type ReceptionSchedule } from './reception-schedule.js';
+import { HistoryRecovery } from './history-recovery.js';
 
 const baileysLogger = pino({ level: 'silent' });
 const DOCUMENT_IMAGE_EXTENSIONS: Record<string, string> = {
@@ -61,6 +62,7 @@ export interface WhatsAppConnector {
   disconnect(): Promise<void>;
   resetSession(): Promise<void>;
   listGroups(): Promise<WhatsAppGroup[]>;
+  requestHistory?(): Promise<void>;
   sendImage(groupId: string, bytes: Buffer, mimeType: string, caption?: string): Promise<{ messageId: string }>;
 }
 
@@ -75,6 +77,7 @@ export class BaileysConnector implements WhatsAppConnector {
   private groupRefresh: { socket: ReturnType<typeof makeWASocket>; promise: Promise<void> } | undefined;
   private nextGroupRefreshAt = 0;
   private liveSinceMs = 0;
+  private historyRecovery: HistoryRecovery | undefined;
   private reception: WhatsAppReceptionDiagnostics = this.emptyReceptionDiagnostics();
 
   constructor(private readonly db: AppDatabase, private readonly logger: FastifyBaseLogger, private readonly enabled: boolean, private readonly supplierIngestion?: SupplierIngestionService, readonly sessionId = 'main', private readonly supplierReception?: SupplierReceptionService) {}
@@ -110,6 +113,7 @@ export class BaileysConnector implements WhatsAppConnector {
           return accepted;
         } });
       this.socket = socket;
+      if (this.supplierIngestion) this.historyRecovery = new HistoryRecovery(this.db, this.sessionId, (count, key, timestampMs) => socket.fetchMessageHistory(count, key, timestampMs), this.supplierReception);
       let eventQueue = Promise.resolve();
       let messageQueue = Promise.resolve();
       let credentialSaveFailed = false;
@@ -150,6 +154,7 @@ export class BaileysConnector implements WhatsAppConnector {
           this.logger.info('Sesión experimental de WhatsApp conectada');
           writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'connection', action: 'whatsapp.session.connected', entityType: 'whatsapp_session', entityId: this.sessionId, message: 'La sesión de WhatsApp quedó conectada' });
           beginRecovery();
+          if (this.historyRecovery && hasSuppliers()) this.historyRecovery.start(false);
           void this.refreshGroups();
         }
         if (update.connection === 'close') {
@@ -157,6 +162,7 @@ export class BaileysConnector implements WhatsAppConnector {
           const status = (disconnectError as Boom | undefined)?.output?.statusCode;
           this.qr = null;
           this.socket = undefined;
+          this.historyRecovery?.stop(); this.historyRecovery = undefined;
           if (status === DisconnectReason.restartRequired && !credentialSaveFailed) {
             this.currentStatus = 'connecting';
             this.lastError = null;
@@ -181,9 +187,10 @@ export class BaileysConnector implements WhatsAppConnector {
       }));
       socket.ev.on('groups.update', () => { void this.refreshGroups(); });
       socket.ev.on('group-participants.update', () => { void this.refreshGroups(); });
-      const enqueueMessages = (messages: WAMessage[], type: 'notify' | 'append' | 'history') => {
+      const enqueueMessages = (messages: WAMessage[], type: 'notify' | 'append' | 'history', onDemand = false, requestId?: string | null) => {
         messageQueue = messageQueue.then(async () => {
           if (this.socket !== socket || !this.supplierIngestion) return;
+          this.historyRecovery?.observe(messages, onDemand, requestId);
           const ordered = [...messages].sort((a, b) => Number(a.messageTimestamp ?? 0) - Number(b.messageTimestamp ?? 0));
           if (this.supplierReception) {
             const eligibleCount = ordered.filter((message) => {
@@ -207,7 +214,7 @@ export class BaileysConnector implements WhatsAppConnector {
       socket.ev.on('messaging-history.set', (event) => {
         // Mirror the download filter for directly emitted / replayed history events.
         if (event.syncType != null && !ACCEPTED_HISTORY_TYPES.has(event.syncType)) return;
-        enqueueMessages(event.messages, 'history');
+        enqueueMessages(event.messages, 'history', event.syncType === proto.HistorySync.HistorySyncType.ON_DEMAND, event.peerDataRequestSessionId);
       });
     } catch (error) {
       this.currentStatus = 'disconnected';
@@ -222,6 +229,7 @@ export class BaileysConnector implements WhatsAppConnector {
   async disconnect() {
     const socket = this.socket;
     this.socket = undefined;
+    this.historyRecovery?.stop(); this.historyRecovery = undefined;
     this.qr = null;
     this.currentStatus = 'disconnected';
     this.groups = [];
@@ -246,6 +254,12 @@ export class BaileysConnector implements WhatsAppConnector {
     if (this.currentStatus !== 'connected' || !this.socket) return this.groups;
     await this.refreshGroups();
     return this.groups;
+  }
+
+  async requestHistory() {
+    if (!this.enabled || this.currentStatus !== 'connected' || !this.historyRecovery) throw new Error('Conecta WhatsApp antes de solicitar la recuperación del historial.');
+    if (!this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId)) throw new Error('Agrega un proveedor antes de solicitar su historial.');
+    this.historyRecovery.start();
   }
 
   async sendImage(groupId: string, bytes: Buffer, mimeType: string, caption?: string) {

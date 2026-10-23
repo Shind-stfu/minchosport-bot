@@ -38,6 +38,7 @@ type FakeSocket = {
   ev: { on: (event: string, handler: (payload: any) => void) => void; emit: (event: string, payload: any) => void };
   end: () => void;
   groupFetchAllParticipating: () => Promise<Record<string, never>>;
+  fetchMessageHistory: (count: number, key: unknown, timestampMs: number) => Promise<string>;
 };
 
 function fakeSocket(): FakeSocket {
@@ -49,6 +50,7 @@ function fakeSocket(): FakeSocket {
     },
     end: vi.fn(),
     groupFetchAllParticipating: async () => ({}),
+    fetchMessageHistory: vi.fn(async () => 'test-history-request'),
   };
 }
 
@@ -240,6 +242,55 @@ describe('Baileys QR pairing lifecycle', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(connector.status()).toMatchObject({ status: 'connected', lastError: null });
     await connector.disconnect(); db.close();
+  });
+
+  it('explicitly requests the 5–8 p.m. range when opened at 8:22 and processes the phone response without importing older photos', async () => {
+    let clock = Date.parse('2026-10-22T20:22:00-05:00');
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    const directory = mkdtempSync(join(tmpdir(), 'tenis-2022-history-')); directories.push(directory);
+    const db = openDatabase(join(directory, 'business.sqlite'));
+    const now = new Date(clock).toISOString();
+    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='17:00',reception_end_time='20:00' WHERE session_id='main'").run();
+    db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES ('supplier','main','provider@g.us','Proveedor',0,?,?)").run(now, now);
+    db.prepare("INSERT INTO whatsapp_history_anchors(session_id,group_jid,message_id,message_timestamp_ms) VALUES ('main','provider@g.us','known-message',?)").run(Date.parse('2026-10-22T20:10:00-05:00'));
+    const logger = pino({ level: 'silent' }) as unknown as FastifyBaseLogger;
+    const reception = new SupplierReceptionService(db, directory, new SupplierIngestionService(db, directory, logger), logger, () => clock);
+    const socket = fakeSocket(); mocks.makeWASocket.mockReturnValue(socket);
+    const requested = vi.fn(async () => 'phone-response'); socket.fetchMessageHistory = requested;
+    mocks.downloadMediaMessage.mockResolvedValue(Buffer.from([0xff, 0xd8, 0xff, 0x00]));
+    const connector = new BaileysConnector(db, logger, true, new SupplierIngestionService(db, directory, logger), 'main', reception);
+    await connector.connect(); socket.ev.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(requested).toHaveBeenCalledTimes(1));
+    const photo = (id: string, time: string) => ({ key: { id, remoteJid: 'provider@g.us', fromMe: false }, messageTimestamp: Date.parse(`2026-10-22T${time}-05:00`) / 1000, message: { imageMessage: { mimetype: 'image/jpeg', caption: 'COD 143 PRECIO $60.000' } } });
+    socket.ev.emit('messaging-history.set', { syncType: proto.HistorySync.HistorySyncType.ON_DEMAND, peerDataRequestSessionId: 'phone-response', messages: [photo('before-5', '16:59:59'), photo('at-5', '17:00:00'), photo('before-8', '19:59:59'), photo('at-8', '20:00:00')] });
+    await vi.waitFor(() => expect(db.prepare('SELECT COUNT(*) as count FROM media_assets').get()).toEqual({ count: 2 }));
+    expect(db.prepare('SELECT message_id FROM whatsapp_source_messages ORDER BY message_id').all()).toEqual([{ message_id: 'at-5' }, { message_id: 'before-8' }]);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryRequestedGroups: 1, recoveryMessageCount: 2, recoveryStatus: 'received' });
+    clock = Date.parse('2026-10-22T20:23:00-05:00');
+    socket.ev.emit('messages.upsert', { type: 'notify', messages: [photo('live-after-8', '20:23:00')] });
+    await vi.waitFor(() => expect(db.prepare('SELECT COUNT(*) as count FROM media_assets').get()).toEqual({ count: 3 }));
+    expect(mocks.downloadMediaMessage).toHaveBeenCalledTimes(3);
+    await connector.disconnect(); await reception.close(); db.close();
+  });
+
+  it('receives live photos while an explicit history request is still awaiting acknowledgement', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-22T20:22:00-05:00'));
+    const directory = mkdtempSync(join(tmpdir(), 'tenis-history-live-')); directories.push(directory);
+    const db = openDatabase(join(directory, 'business.sqlite'));
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES ('supplier','main','provider@g.us','Proveedor',0,?,?)").run(now, now);
+    db.prepare("INSERT INTO whatsapp_history_anchors(session_id,group_jid,message_id,message_timestamp_ms) VALUES ('main','provider@g.us','known-message',?)").run(Date.now() - 60_000);
+    const logger = pino({ level: 'silent' }) as unknown as FastifyBaseLogger;
+    const socket = fakeSocket(); mocks.makeWASocket.mockReturnValue(socket);
+    let acknowledge: (value: string) => void = () => {};
+    socket.fetchMessageHistory = vi.fn(() => new Promise<string>((resolve) => { acknowledge = resolve; }));
+    const connector = new BaileysConnector(db, logger, true, new SupplierIngestionService(db, directory, logger));
+    await connector.connect(); socket.ev.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(socket.fetchMessageHistory).toHaveBeenCalledTimes(1));
+    mocks.downloadMediaMessage.mockResolvedValue(Buffer.from([0xff, 0xd8, 0xff, 0x00]));
+    socket.ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { remoteJid: 'provider@g.us', id: 'live-photo', fromMe: false }, messageTimestamp: Date.now() / 1000, message: { imageMessage: { mimetype: 'image/jpeg', caption: 'COD 143 PRECIO $60.000' } } }] });
+    await vi.waitFor(() => expect(db.prepare('SELECT COUNT(*) as count FROM media_assets').get()).toEqual({ count: 1 }));
+    await connector.disconnect(); acknowledge('late-acknowledgement'); await Promise.resolve(); db.close();
   });
 
   it('stores a supplier photo delivered as a recent appended Baileys message', async () => {

@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { isInRecoveryWindow, isReceptionOpen } from './reception-schedule.js';
+import { isInRecoveryWindow, isReceptionOpen, recoveryStartTimestampMs, recoveryEndTimestampMs } from './reception-schedule.js';
 
 describe('per-account reception window', () => {
   const schedule = { startTime: '09:00', endTime: '21:00', timeZone: 'America/Bogota' };
+
+  it('computes a 5–8 p.m. recovery interval when the app opens at 8:22 p.m.', () => {
+    const range = { startTime: '17:00', endTime: '20:00', timeZone: 'America/Bogota' };
+    const now = Date.parse('2026-10-22T20:22:00-05:00');
+    expect(recoveryStartTimestampMs(range, now)).toBe(Date.parse('2026-10-22T17:00:00-05:00'));
+    expect(recoveryEndTimestampMs(range, now)).toBe(Date.parse('2026-10-22T20:00:00-05:00'));
+    expect(isInRecoveryWindow(Date.parse('2026-10-22T17:30:00-05:00'), range, now)).toBe(true);
+    expect(isInRecoveryWindow(Date.parse('2026-10-22T16:59:59-05:00'), range, now)).toBe(false);
+  });
 
   it('uses Colombia local time for the daily 9 a.m. to 9 p.m. window', () => {
     expect(isReceptionOpen(Date.parse('2026-10-20T04:59:00.000Z'), schedule)).toBe(false); // 11:59 p.m.

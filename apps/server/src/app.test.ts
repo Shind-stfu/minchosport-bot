@@ -23,6 +23,28 @@ function setup(whatsapp?: WhatsAppConnector, imageInspector?: { inspect: (source
 }
 
 describe('local simulation API', () => {
+  it('requests history when saving a connected account range and supports manual retries without disconnecting', async () => {
+    let requests = 0; let disconnects = 0; let connected = true;
+    const connector: WhatsAppConnector = {
+      status: () => ({ status: connected ? 'connected' : 'disconnected', qr: null, lastError: null }), connect: async () => {}, disconnect: async () => { disconnects += 1; }, resetSession: async () => {},
+      listGroups: async () => [], sendImage: async () => ({ messageId: 'x' }), requestHistory: async () => { requests += 1; },
+    };
+    const { app } = setup(connector);
+    const headers = { host: '127.0.0.1:3210' };
+    const saved = await app.inject({ method: 'PUT', url: '/api/sessions/main/reception-schedule', headers: { ...headers, 'content-type': 'application/json' }, payload: { startTime: '17:00', endTime: '20:00' } });
+    expect(saved.statusCode, saved.body).toBe(200);
+    expect(saved.json()).toMatchObject({ recoveryRequested: true, receptionSchedule: { startTime: '17:00', endTime: '20:00' } });
+    expect(requests).toBe(1);
+    const retried = await app.inject({ method: 'POST', url: '/api/sessions/main/recover-history', headers });
+    expect(retried.statusCode).toBe(202); expect(requests).toBe(2); expect(disconnects).toBe(0);
+    const missing = await app.inject({ method: 'POST', url: '/api/sessions/missing/recover-history', headers });
+    expect(missing.statusCode).toBe(404); expect(requests).toBe(2);
+    connected = false;
+    const offline = await app.inject({ method: 'POST', url: '/api/sessions/main/recover-history', headers });
+    expect(offline.statusCode).toBe(409); expect(requests).toBe(2);
+    await app.close();
+  });
+
   it('exposes per-account reception hours and keeps the catalog when the schedule changes', async () => {
     const { app, db } = setup();
     const now = new Date().toISOString();

@@ -32,6 +32,9 @@ export type ReceptionSnapshot = {
   recoveryFinishedAt: string | null;
   recoveryMessageCount: number;
   recoveryWarning: string | null;
+  recoveryRequestedGroups: number;
+  recoveryMissingAnchors: number;
+  recoveryFailedRequests: number;
   lastSupplierMessageAt: string | null;
   lastSupplierGroupJid: string | null;
   lastSupplierResult: string | null;
@@ -155,7 +158,21 @@ export class SupplierReceptionService {
     this.db.prepare(`INSERT INTO supplier_reception_state(session_id,recovery_status,recovery_started_at,recovery_finished_at,recovery_message_count,recovery_warning)
       VALUES (?,'waiting',?,NULL,0,NULL) ON CONFLICT(session_id) DO UPDATE SET recovery_status='waiting',recovery_started_at=excluded.recovery_started_at,
       recovery_finished_at=NULL,recovery_message_count=0,recovery_warning=NULL`).run(sessionId, now);
+    this.db.prepare('UPDATE supplier_reception_state SET recovery_requested_groups=0,recovery_missing_anchors=0,recovery_failed_requests=0 WHERE session_id=?').run(sessionId);
     this.armRecoveryTimeout(sessionId);
+  }
+
+  recordRecoveryRequests(sessionId: string, requested: number, missing: number, failed: number) {
+    const previous = this.db.prepare('SELECT recovery_requested_groups as requested,recovery_status as status FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { requested: number; status: string } | undefined;
+    const warnings: string[] = [];
+    if (missing) warnings.push(`${missing} grupo(s) sin una referencia de mensaje para pedir historial. Se intentará al recibir un mensaje nuevo de esos grupos.`);
+    if (failed) warnings.push(`Falló la solicitud de historial de ${failed} grupo(s). Puedes volver a intentar la recuperación.`);
+    this.db.prepare(`UPDATE supplier_reception_state SET recovery_requested_groups=?,recovery_missing_anchors=?,recovery_failed_requests=?,
+      recovery_warning=? WHERE session_id=?`).run(requested, missing, failed, warnings.length ? warnings.join(' ') : RECOVERY_WARNING, sessionId);
+    if (previous?.status === 'unavailable' && requested > previous.requested) {
+      this.db.prepare("UPDATE supplier_reception_state SET recovery_status='waiting',recovery_finished_at=NULL WHERE session_id=?").run(sessionId);
+      this.armRecoveryTimeout(sessionId);
+    }
   }
 
   async recordHistoryBatch(sessionId: string, supplierMessageCount: number) {
@@ -166,7 +183,7 @@ export class SupplierReceptionService {
       this.db.prepare(`INSERT INTO supplier_reception_state(session_id,recovery_status,recovery_started_at,recovery_finished_at,recovery_message_count,recovery_warning)
         VALUES (?,'received',?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET recovery_status='received',recovery_finished_at=excluded.recovery_finished_at,
           recovery_message_count=recovery_message_count+excluded.recovery_message_count,recovery_warning=excluded.recovery_warning`)
-        .run(sessionId, now, now, supplierMessageCount, RECOVERY_WARNING);
+        .run(sessionId, now, now, supplierMessageCount, this.recoveryWarning(sessionId, RECOVERY_WARNING));
       const timer = this.recoveryTimers.get(sessionId);
       if (timer) clearTimeout(timer);
       this.recoveryTimers.delete(sessionId);
@@ -180,10 +197,13 @@ export class SupplierReceptionService {
       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failedCount FROM supplier_inbox_messages WHERE session_id=?`).get(sessionId) as { pendingCount: number | null; failedCount: number | null };
     const row = this.db.prepare(`SELECT recovery_status as recoveryStatus,recovery_started_at as recoveryStartedAt,recovery_finished_at as recoveryFinishedAt,
       recovery_message_count as recoveryMessageCount,recovery_warning as recoveryWarning,last_supplier_message_at as lastSupplierMessageAt,
-      last_supplier_group_jid as lastSupplierGroupJid,last_supplier_result as lastSupplierResult FROM supplier_reception_state WHERE session_id=?`).get(sessionId) as Omit<ReceptionSnapshot, 'pendingCount'|'failedCount'> | undefined;
+      last_supplier_group_jid as lastSupplierGroupJid,last_supplier_result as lastSupplierResult,
+      recovery_requested_groups as recoveryRequestedGroups,recovery_missing_anchors as recoveryMissingAnchors,recovery_failed_requests as recoveryFailedRequests
+      FROM supplier_reception_state WHERE session_id=?`).get(sessionId) as Omit<ReceptionSnapshot, 'pendingCount'|'failedCount'> | undefined;
     return { pendingCount: counts.pendingCount ?? 0, failedCount: counts.failedCount ?? 0, recoveryStatus: row?.recoveryStatus ?? 'idle',
       recoveryStartedAt: row?.recoveryStartedAt ?? null, recoveryFinishedAt: row?.recoveryFinishedAt ?? null,
       recoveryMessageCount: row?.recoveryMessageCount ?? 0, recoveryWarning: row?.recoveryWarning ?? null,
+      recoveryRequestedGroups: row?.recoveryRequestedGroups ?? 0, recoveryMissingAnchors: row?.recoveryMissingAnchors ?? 0, recoveryFailedRequests: row?.recoveryFailedRequests ?? 0,
       lastSupplierMessageAt: row?.lastSupplierMessageAt ?? null, lastSupplierGroupJid: row?.lastSupplierGroupJid ?? null,
       lastSupplierResult: row?.lastSupplierResult ?? null };
   }
@@ -193,6 +213,12 @@ export class SupplierReceptionService {
     for (const row of rows) {
       await this.drainSession(row.sessionId);
     }
+  }
+
+  private recoveryWarning(sessionId: string, fallback: string) {
+    const counts = this.db.prepare('SELECT recovery_missing_anchors as missing,recovery_failed_requests as failed FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { missing: number; failed: number } | undefined;
+    return [counts?.missing ? `${counts.missing} grupo(s) sin referencia de mensaje para pedir historial; se intentará al recibir un mensaje nuevo.` : '',
+      counts?.failed ? `Falló la solicitud de historial de ${counts.failed} grupo(s). Puedes volver a intentar.` : '', fallback].filter(Boolean).join(' ');
   }
 
   private async drainSession(sessionId: string) {
@@ -252,7 +278,7 @@ export class SupplierReceptionService {
       const state = this.db.prepare('SELECT recovery_status as status,recovery_message_count as count FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { status: string; count: number } | undefined;
       if (state?.status !== 'waiting') return;
       const status = state.count > 0 ? 'received' : 'unavailable';
-      const warning = state.count > 0 ? RECOVERY_WARNING : 'No se recibieron mensajes nuevos de historial en este intento. Las publicaciones ya guardadas permanecen en el catálogo; WhatsApp no garantiza entregar el historial pendiente.';
+      const warning = this.recoveryWarning(sessionId, state.count > 0 ? RECOVERY_WARNING : 'El teléfono no entregó mensajes nuevos del rango en este intento. Revisa que WhatsApp en el teléfono tenga conexión a Internet y pulsa Recuperar historial. Las publicaciones ya guardadas se conservan.');
       const finishedAt = new Date(this.now()).toISOString();
       this.db.prepare('UPDATE supplier_reception_state SET recovery_status=?,recovery_finished_at=?,recovery_warning=? WHERE session_id=?')
         .run(status, finishedAt, warning, sessionId);

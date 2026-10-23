@@ -356,6 +356,23 @@ export const MIGRATIONS = [
     WHEN NEW.reception_start_time='09:00' AND NEW.reception_end_time='21:00' BEGIN
     UPDATE whatsapp_session_settings SET reception_start_time='16:00',reception_end_time='19:00' WHERE session_id=NEW.session_id;
   END;`,
+  `CREATE TABLE whatsapp_history_anchors (
+    session_id TEXT NOT NULL REFERENCES whatsapp_sessions(id) ON DELETE CASCADE,
+    group_jid TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    message_timestamp_ms INTEGER NOT NULL,
+    from_me INTEGER NOT NULL DEFAULT 0 CHECK(from_me IN (0,1)),
+    participant_jid TEXT,
+    PRIMARY KEY(session_id,group_jid)
+  );
+  INSERT INTO whatsapp_history_anchors(session_id,group_jid,message_id,message_timestamp_ms,participant_jid)
+    SELECT session_id,group_jid,message_id,message_timestamp_ms,participant_jid FROM (
+      SELECT *,ROW_NUMBER() OVER (PARTITION BY session_id,group_jid ORDER BY message_timestamp_ms DESC,message_id DESC) AS position
+      FROM supplier_inbox_messages
+    ) WHERE position=1;
+  ALTER TABLE supplier_reception_state ADD COLUMN recovery_requested_groups INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE supplier_reception_state ADD COLUMN recovery_missing_anchors INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE supplier_reception_state ADD COLUMN recovery_failed_requests INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export type AppDatabase = InstanceType<typeof Database>;
