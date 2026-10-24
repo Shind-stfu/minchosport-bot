@@ -30,6 +30,49 @@ function setup() {
 }
 
 describe('explicit supplier history requests', () => {
+  it('keeps real group references received before suppliers are configured without storing their message bodies', async () => {
+    const { db, history, fetchHistory, message } = setup();
+    db.prepare("DELETE FROM supplier_profiles WHERE id='provider'").run();
+    history.observe([{ ...message('pairing-reference', '20:10:00'), message: { conversation: 'No guardar este texto' } }]);
+    history.observe([{ ...message('private', '20:11:00'), key: { remoteJid: 'person@s.whatsapp.net', id: 'private' } }]);
+    expect(db.prepare('SELECT group_jid,message_id FROM whatsapp_history_anchors').all()).toEqual([{ group_jid: 'provider@g.us', message_id: 'pairing-reference' }]);
+    expect(db.prepare('SELECT COUNT(*) as count FROM products').get()).toEqual({ count: 0 });
+    expect(db.prepare('SELECT COUNT(*) as count FROM supplier_inbox_messages').get()).toEqual({ count: 0 });
+    history.start(); await vi.advanceTimersByTimeAsync(0);
+    expect(fetchHistory).not.toHaveBeenCalled();
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES ('provider','main','provider@g.us','Proveedor',0,?,?)").run(now, now);
+    history.start(); await vi.advanceTimersByTimeAsync(0);
+    expect(fetchHistory.mock.calls[0]?.[1]).toMatchObject({ id: 'pairing-reference', remoteJid: 'provider@g.us' });
+  });
+
+  it('at 10:52 a.m. requests all 11 supplier groups for a 7 a.m.–10 p.m. range when real recent references are available', async () => {
+    const { db, history, fetchHistory, reception } = setup();
+    vi.setSystemTime(new Date('2026-10-24T10:52:00-05:00'));
+    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='07:00',reception_end_time='22:00' WHERE session_id='main'").run();
+    const now = new Date().toISOString();
+    for (let index = 0; index < 11; index += 1) {
+      const groupId = index === 0 ? 'provider@g.us' : `provider-${index}@g.us`;
+      if (index) db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES (?,'main',?,'Proveedor',0,?,?)").run(`provider-${index}`, groupId, now, now);
+      history.observe([{ key: { remoteJid: groupId, id: `real-${index}`, fromMe: true }, messageTimestamp: Date.parse('2026-10-24T10:50:00-05:00') / 1000 }]);
+    }
+    history.start(); await vi.advanceTimersByTimeAsync(11_000);
+    expect(fetchHistory).toHaveBeenCalledTimes(11);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryRequestedGroups: 11, recoveryMissingAnchors: 0, recoveryMessageCount: 0 });
+  });
+
+  it('does not blame the phone for no response when no request could be made, and starts after a real reference arrives', async () => {
+    const { history, reception, fetchHistory, message } = setup();
+    history.start(); await vi.advanceTimersByTimeAsync(36_000);
+    expect(fetchHistory).not.toHaveBeenCalled();
+    expect(reception.snapshot('main').recoveryWarning).toContain('No se pudo solicitar historial');
+    expect(reception.snapshot('main').recoveryWarning).not.toContain('El teléfono no entregó');
+    history.observe([message('manual-test-from-phone', '20:22:00', true)]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchHistory.mock.calls[0]?.[1]).toMatchObject({ id: 'manual-test-from-phone', fromMe: true });
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'waiting', recoveryRequestedGroups: 1, recoveryMissingAnchors: 0 });
+  });
+
   it('at 8:22 p.m. requests pages from a known 8:10 message until reaching the 5 p.m. boundary, using milliseconds', async () => {
     const { history, reception, fetchHistory, message } = setup();
     history.observe([message('latest', '20:10:00')]);

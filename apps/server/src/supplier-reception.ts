@@ -165,7 +165,7 @@ export class SupplierReceptionService {
   recordRecoveryRequests(sessionId: string, requested: number, missing: number, failed: number) {
     const previous = this.db.prepare('SELECT recovery_requested_groups as requested,recovery_status as status FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { requested: number; status: string } | undefined;
     const warnings: string[] = [];
-    if (missing) warnings.push(`${missing} grupo(s) sin una referencia de mensaje para pedir historial. Se intentará al recibir un mensaje nuevo de esos grupos.`);
+    if (missing) warnings.push(`${missing} grupo(s) sin una referencia de mensaje dentro o después del rango de hoy. Se intentará al recibir una referencia reciente de WhatsApp o un mensaje nuevo de esos grupos.`);
     if (failed) warnings.push(`Falló la solicitud de historial de ${failed} grupo(s). Puedes volver a intentar la recuperación.`);
     this.db.prepare(`UPDATE supplier_reception_state SET recovery_requested_groups=?,recovery_missing_anchors=?,recovery_failed_requests=?,
       recovery_warning=? WHERE session_id=?`).run(requested, missing, failed, warnings.length ? warnings.join(' ') : RECOVERY_WARNING, sessionId);
@@ -217,7 +217,7 @@ export class SupplierReceptionService {
 
   private recoveryWarning(sessionId: string, fallback: string) {
     const counts = this.db.prepare('SELECT recovery_missing_anchors as missing,recovery_failed_requests as failed FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { missing: number; failed: number } | undefined;
-    return [counts?.missing ? `${counts.missing} grupo(s) sin referencia de mensaje para pedir historial; se intentará al recibir un mensaje nuevo.` : '',
+    return [counts?.missing ? `${counts.missing} grupo(s) sin referencia de mensaje dentro o después del rango de hoy; se intentará al recibir una referencia reciente o un mensaje nuevo.` : '',
       counts?.failed ? `Falló la solicitud de historial de ${counts.failed} grupo(s). Puedes volver a intentar.` : '', fallback].filter(Boolean).join(' ');
   }
 
@@ -275,15 +275,18 @@ export class SupplierReceptionService {
     const previous = this.recoveryTimers.get(sessionId);
     if (previous) clearTimeout(previous);
     const timer = setTimeout(() => {
-      const state = this.db.prepare('SELECT recovery_status as status,recovery_message_count as count FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { status: string; count: number } | undefined;
+      const state = this.db.prepare('SELECT recovery_status as status,recovery_message_count as count,recovery_requested_groups as requested,recovery_missing_anchors as missing,recovery_failed_requests as failed FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { status: string; count: number; requested: number; missing: number; failed: number } | undefined;
       if (state?.status !== 'waiting') return;
       const status = state.count > 0 ? 'received' : 'unavailable';
-      const warning = this.recoveryWarning(sessionId, state.count > 0 ? RECOVERY_WARNING : 'El teléfono no entregó mensajes nuevos del rango en este intento. Revisa que WhatsApp en el teléfono tenga conexión a Internet y pulsa Recuperar historial. Las publicaciones ya guardadas se conservan.');
+      const fallback = state.count > 0 ? RECOVERY_WARNING : state.requested === 0 && state.missing > 0 && state.failed === 0
+        ? 'No se pudo solicitar historial al teléfono: faltan referencias recientes de mensajes. Mantén la aplicación conectada; una referencia nueva permitirá iniciar la solicitud. Las publicaciones ya guardadas se conservan.'
+        : 'El teléfono no entregó mensajes nuevos del rango en este intento. Revisa que WhatsApp en el teléfono tenga conexión a Internet y pulsa Recuperar historial. Las publicaciones ya guardadas se conservan.';
+      const warning = this.recoveryWarning(sessionId, fallback);
       const finishedAt = new Date(this.now()).toISOString();
       this.db.prepare('UPDATE supplier_reception_state SET recovery_status=?,recovery_finished_at=?,recovery_warning=? WHERE session_id=?')
         .run(status, finishedAt, warning, sessionId);
       writeApplicationLog(this.db, { sessionId, level: 'warning', category: 'connection', action: 'supplier.history.attempt.finished', entityType: 'whatsapp_session', entityId: sessionId,
-        message: warning, details: { deliveredSupplierMessages: state.count }, createdAt: finishedAt });
+        message: warning, details: { deliveredSupplierMessages: state.count, requestedGroups: state.requested, missingReferences: state.missing, failedRequests: state.failed }, createdAt: finishedAt });
       this.recoveryTimers.delete(sessionId);
     }, 35_000);
     timer.unref();

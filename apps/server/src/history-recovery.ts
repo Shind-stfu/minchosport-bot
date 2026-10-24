@@ -58,13 +58,15 @@ export class HistoryRecovery {
       const groupId = message.key.remoteJid;
       const timestampMs = Number(message.messageTimestamp) * 1000;
       if (!groupId?.endsWith('@g.us') || !message.key.id || !Number.isFinite(timestampMs) || timestampMs <= 0 || timestampMs > Date.now() + 300_000) continue;
-      if (!this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL').get(this.sessionId, groupId)) continue;
+      // Pairing can deliver the last group messages before suppliers are configured.
+      // Retain only the real key/timestamp; catalog ingestion and requests still
+      // require an active supplier, and message bodies are never stored here.
       const cursor: Cursor = { groupId, messageId: message.key.id, timestampMs, fromMe: message.key.fromMe ? 1 : 0, participantId: message.key.participant ?? null };
       this.db.prepare(`INSERT INTO whatsapp_history_anchors(session_id,group_jid,message_id,message_timestamp_ms,from_me,participant_jid)
         VALUES (?,?,?,?,?,?) ON CONFLICT(session_id,group_jid) DO UPDATE SET message_id=excluded.message_id,message_timestamp_ms=excluded.message_timestamp_ms,
         from_me=excluded.from_me,participant_jid=excluded.participant_jid WHERE excluded.message_timestamp_ms>whatsapp_history_anchors.message_timestamp_ms`)
         .run(this.sessionId, groupId, cursor.messageId, timestampMs, cursor.fromMe, cursor.participantId);
-      grouped.set(groupId, [...(grouped.get(groupId) ?? []), cursor]);
+      if (this.groups.has(groupId)) grouped.set(groupId, [...(grouped.get(groupId) ?? []), cursor]);
     }
     if (!this.active) return;
     for (const [groupId, batch] of grouped) {

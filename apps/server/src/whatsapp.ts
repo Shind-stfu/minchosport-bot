@@ -1,5 +1,5 @@
 import makeWASocket, { DisconnectReason, downloadMediaMessage, normalizeMessageContent, proto } from '@whiskeysockets/baileys';
-import type { WAMessage } from '@whiskeysockets/baileys';
+import type { Chat, WAMessage } from '@whiskeysockets/baileys';
 import type { FastifyBaseLogger } from 'fastify';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -103,7 +103,7 @@ export class BaileysConnector implements WhatsAppConnector {
       const hasSuppliers = () => Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId));
       const socket = makeWASocket({ auth: state, logger: baileysLogger, printQRInTerminal: false, markOnlineOnConnect: false, syncFullHistory: false,
         shouldSyncHistoryMessage: (notification) => {
-          if (notification.syncType == null || !hasSuppliers()) return false;
+          if (notification.syncType == null || !this.supplierIngestion) return false;
           const accepted = ACCEPTED_HISTORY_TYPES.has(notification.syncType);
           if (!accepted && !skippedHistoryTypes.has(notification.syncType)) {
             skippedHistoryTypes.add(notification.syncType);
@@ -211,9 +211,22 @@ export class BaileysConnector implements WhatsAppConnector {
         }).catch((error: unknown) => this.fail(error));
       };
       socket.ev.on('messages.upsert', (event) => enqueueMessages(event.messages, event.type));
+      const observeChatReferences = (chats: Partial<Chat>[]) => {
+        if (this.socket !== socket || !this.historyRecovery) return;
+        const references = chats.flatMap((chat) => (chat.messages ?? []).flatMap((item) => {
+          const message = item.message;
+          // A conversation timestamp alone is not a message anchor. Do not
+          // manufacture a message ID, author or timestamp from chat metadata.
+          return message?.key && message.key.remoteJid === chat.id ? [message as WAMessage] : [];
+        }));
+        this.historyRecovery.observe(references);
+      };
+      socket.ev.on('chats.upsert', observeChatReferences);
+      socket.ev.on('chats.update', observeChatReferences);
       socket.ev.on('messaging-history.set', (event) => {
         // Mirror the download filter for directly emitted / replayed history events.
         if (event.syncType != null && !ACCEPTED_HISTORY_TYPES.has(event.syncType)) return;
+        observeChatReferences(event.chats ?? []);
         enqueueMessages(event.messages, 'history', event.syncType === proto.HistorySync.HistorySyncType.ON_DEMAND, event.peerDataRequestSessionId);
       });
     } catch (error) {
