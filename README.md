@@ -66,6 +66,24 @@ La descripción enviada quita los emojis decorativos y conserva el texto, los sa
 
 El OCR de [Tesseract.js](https://github.com/naptha/tesseract.js/) y la búsqueda visual empiezan automáticamente al guardar la fotografía y se ejecutan en este computador. Se revisan las cuatro esquinas para asociar código y mundo en una misma etiqueta; por ejemplo, `960 A 🌍` se conserva sin cambios cuando el código del producto es `960`. Si hay una etiqueta parcial clara, se añade únicamente lo que falta. Si la lectura falla, es incierta o muestra un código diferente, el envío queda bloqueado hasta que confirmes la foto original, corrijas el código o indiques qué marcar. **Volver a analizar las fotos** repite la lectura local. El original permanece intacto. En macOS la etiqueta usa San Francisco y Apple Color Emoji del sistema; en Windows usa Segoe UI y Segoe UI Emoji, y otros sistemas usan los recursos Noto/Twemoji incluidos. Las fuentes del sistema no se copian ni distribuyen. La etiqueta queda desplazada hacia el interior de la foto en cualquiera de las cuatro esquinas. La primera inspección necesita conexión para descargar y guardar los archivos de idioma del OCR en `ocr-cache/` dentro de la carpeta local de datos; las imágenes no se envían al servicio de descarga. Los importes incrustados no se alteran mediante OCR. Solo se aprueba automáticamente un precio textual con etiqueta inequívoca y sin conflicto. El estado `submitted` indica que Baileys devolvió el identificador de mensaje; no prueba entrega o lectura por los miembros.
 
+## Motor local de análisis de imágenes
+
+El motor `local-ocr-consensus-v2` mantiene el OCR español/inglés y la comparación visual en el computador. El análisis completo se ejecuta en workers de Node, fuera del proceso que atiende WhatsApp y el panel. Por defecto usa un worker, o dos si hay al menos cuatro CPU disponibles y 2 GiB de memoria libre al iniciar. `IMAGE_ANALYSIS_WORKERS=1` a `4` permite ajustar el límite; cada worker reutiliza su OCR. Un análisis que falle o supere 120 segundos queda para revisión y el worker se reemplaza si se cerró o quedó bloqueado. Al cerrar, las fotos que aún estaban esperando permanecen pendientes y se retoman al iniciar.
+
+Se comparan las lecturas de cada esquina y se envían a revisión los códigos contradictorios o con confianza insuficiente. Cuando hay un mundo localizado, se prepara un recorte de texto separado del emoji: así se evita leer el mundo como un dígito adicional. Los recortes se amplían para leer etiquetas pequeñas. La puntuación del OCR es una señal interna, no una probabilidad calibrada de acierto.
+
+El resultado visual se reutiliza para fotos con exactamente el mismo SHA-256 y versión de motor, incluso entre reinicios. Las decisiones manuales permanecen separadas por fotografía. **Volver a analizar las fotos** fuerza una lectura nueva; los errores no se guardan en caché. El resultado cacheado se elimina al borrar la última foto que lo utiliza. Una nueva versión del motor vuelve a analizar los resultados automáticos anteriores al arrancar y conserva las decisiones manuales.
+
+Los detalles del análisis de cada foto muestran su tiempo y si se reutilizó un resultado. La actividad guarda también la versión y las lecturas OCR realizadas. `GET /api/image-engine?sessionId=main` devuelve la versión, concurrencia y estados del análisis de esa cuenta.
+
+Para repetir la prueba funcional con diez imágenes **sintéticas**, sin utilizar fotos de clientes:
+
+```sh
+pnpm --filter @tenis/server benchmark:images --output /tmp/image-engine-report.json
+```
+
+En Windows utiliza una ruta de salida válida para ese equipo. `--cache-dir RUTA` permite reutilizar los idiomas OCR ya descargados; la primera ejecución necesita internet para descargarlos. La prueba cubre código/mundo en cuatro esquinas, compresión JPEG, código solo, mundo solo, foto idéntica repetida y un código que no corresponde al producto. Informa tiempos, decisión esperada/obtenida y uso de caché; termina con error si una decisión no coincide. Estos casos comprueban regresiones concretas y no miden la precisión del catálogo real. El arranque en frío y las fotos nuevas tienen costes diferentes de reutilizar un resultado: esta mejora no promete que toda foto nueva se analice más rápido.
+
 ## Datos y seguridad
 
 - Windows: `%LOCALAPPDATA%\BotDistribuidorTenis\simulation\business.sqlite`; macOS: `~/Library/Application Support/BotDistribuidorTenis/simulation/business.sqlite`. Incluye cuentas, proveedores, productos, grupos, publicaciones, auditoría, actividad local y registros cifrados de autenticación.

@@ -87,7 +87,7 @@ describe('multi-account schema migration', () => {
     legacy.close();
 
     const upgraded = openDatabase(path);
-    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 19 });
+    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: MIGRATIONS.length });
     expect(upgraded.prepare("SELECT send_interval_ms FROM whatsapp_session_settings WHERE session_id='main'").get()).toEqual({ send_interval_ms: 10000 });
     expect((upgraded.pragma('table_info(image_inspections)') as Array<{ name: string }>).map((column) => column.name)).toContain('ocr_confidence');
     expect(upgraded.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('image_brand_inspections','product_image_analysis')").all()).toEqual([]);
@@ -136,7 +136,7 @@ describe('multi-account schema migration', () => {
     legacy.close();
 
     const upgraded = openDatabase(path);
-    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: 19 });
+    expect(upgraded.prepare('SELECT MAX(version) as version FROM schema_migrations').get()).toEqual({ version: MIGRATIONS.length });
     expect(upgraded.prepare("SELECT id,raw_text FROM products WHERE id='existing-tenis'").get())
       .toEqual({ id: 'existing-tenis', raw_text: '*MUJER 096-215*' });
     expect(upgraded.prepare("SELECT name FROM whatsapp_sessions WHERE id='main'").get()).toEqual({ name: 'Cuenta principal' });

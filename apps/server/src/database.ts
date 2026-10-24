@@ -373,6 +373,23 @@ export const MIGRATIONS = [
   ALTER TABLE supplier_reception_state ADD COLUMN recovery_requested_groups INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE supplier_reception_state ADD COLUMN recovery_missing_anchors INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE supplier_reception_state ADD COLUMN recovery_failed_requests INTEGER NOT NULL DEFAULT 0;`,
+  `ALTER TABLE image_inspections ADD COLUMN engine_version TEXT;
+  ALTER TABLE image_inspections ADD COLUMN duration_ms INTEGER;
+  ALTER TABLE image_inspections ADD COLUMN ocr_passes INTEGER;
+  ALTER TABLE image_inspections ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE image_inspections ADD COLUMN world_detected INTEGER NOT NULL DEFAULT 0;
+  UPDATE image_inspections SET world_detected=1 WHERE world_variant IS NOT NULL;
+  CREATE TABLE image_analysis_cache (
+    sha256 TEXT NOT NULL,
+    engine_version TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(sha256,engine_version)
+  );
+  CREATE TRIGGER image_analysis_cache_cleanup AFTER DELETE ON media_assets BEGIN
+    DELETE FROM image_analysis_cache WHERE sha256=OLD.sha256
+      AND NOT EXISTS (SELECT 1 FROM media_assets WHERE sha256=OLD.sha256);
+  END;`,
 ];
 
 export type AppDatabase = InstanceType<typeof Database>;

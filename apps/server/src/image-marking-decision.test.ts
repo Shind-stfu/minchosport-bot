@@ -62,6 +62,7 @@ describe('decisión de marcado por fotografía', () => {
   });
 
   it('añade solo lo que falta y detiene etiquetas conflictivas, separadas o dudosas', () => {
+    expect(decideMarking('960', [{ ...label('960', true), codeUncertain: true }], 'complete', null).status).toBe('review');
     expect(decideMarking('960', [], 'complete', null).mode).toBe('mark_all');
     expect(decideMarking('960', [label('960', false)], 'complete', null).mode).toBe('mark_world');
     expect(decideMarking('960', [label(null, true)], 'complete', null).mode).toBe('mark_code');

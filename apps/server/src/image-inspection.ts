@@ -6,6 +6,7 @@ import Tesseract from 'tesseract.js';
 import { analyzePrices } from '@tenis/core';
 import { hasNativeEmojiRenderer, renderEmojiGraphic } from './image-marking.js';
 import type { CornerLabel } from './image-marking-decision.js';
+import { IMAGE_ENGINE_VERSION } from './image-engine.js';
 
 const ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../assets');
 const WORLD_EMOJIS = new Map([
@@ -28,7 +29,27 @@ export type ImageInspection = {
   detectedCodeConfidence: number;
   world: WorldMarkDetection;
   regions?: CornerLabel[];
+  metrics?: { durationMs: number; ocrPasses: number };
 };
+
+type LabelReading = { text: string; confidence: number };
+export function resolveCornerCode(wide: LabelReading, focused: LabelReading, isolatedFromWorld = false) {
+  const readings = [wide, focused].map((reading) => ({ ...reading, code: codeOnCornerLabel(reading.text) }));
+  const [broad, narrow] = readings as [typeof readings[number], typeof readings[number]];
+  const canonical = (code: string) => code.replace(/\s+[A-Z]$/u, '').replace(/\s/gu, '');
+  // The broad OCR sometimes reads the globe as an extra 8/9. Only trust a
+  // physically isolated text crop to resolve that specific disagreement.
+  if (isolatedFromWorld && narrow.code && narrow.confidence >= 70 && (!broad.code
+    || canonical(broad.code) === canonical(narrow.code)
+    || new RegExp(`^${canonical(narrow.code).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}[0-9OQBG]{1,2}$`, 'u').test(canonical(broad.code)))) {
+    return { code: narrow.code, text: narrow.text, confidence: narrow.confidence, codeUncertain: false };
+  }
+  const codes = readings.filter((reading) => reading.code);
+  const conflict = new Set(codes.map((reading) => canonical(reading.code!))).size > 1;
+  const best = codes.sort((a, b) => b.confidence - a.confidence)[0];
+  return { code: !conflict && best && best.confidence >= 55 ? best.code : null,
+    text: best?.text ?? focused.text, confidence: best?.confidence ?? 0, codeUncertain: conflict || Boolean(best && best.confidence < 55) };
+}
 
 const CORNERS: CornerLabel['corner'][] = ['top_left', 'top_right', 'bottom_left', 'bottom_right'];
 
@@ -37,13 +58,14 @@ export function codeOnCornerLabel(text: string): string | null {
   const explicit = normalized.match(/\b(?:COD(?:IGO)?|C[ÓO]DIGO|REF(?:ERENCIA)?|SKU)\s*[:#.-]?\s*([A-Z0-9][A-Z0-9-]{1,31})(?:\s+([A-Z]))?\b/u);
   if (explicit) return `${explicit[1]}${explicit[2] ? ` ${explicit[2]}` : ''}`;
   if (/\b(?:PRECIO|CAJA|DOCENA|TALLAS?|SIZES?|EUR|US|COP|PARES?)\b|[$💲]/u.test(normalized)) return null;
+  if (/\b\d{1,3}(?:[.,]\d{3})+\b/u.test(normalized)) return null;
   // Long OCR passages are usually product/background noise, not a compact label.
   if (normalized.length > 120) return null;
-  const bare = normalized.match(/(?:^|[^\p{L}\p{N}])(\d{3,6}(?:-\d{1,4})?)(?:\s*([A-Z]))?(?=\s|$|[🌎🌍🌏🌐])/u);
+  const bare = normalized.match(/(?:^|[^\p{L}\p{N}])(\d{3,6}(?:-\d{1,4})?)(?:\s*([A-Z]))?(?=\s|$|[🌎🌍🌏🌐):,;!?])/u);
   return bare ? `${bare[1]}${bare[2] ? ` ${bare[2]}` : ''}` : null;
 }
 
-export function coloredGlobeInCorner(data: Buffer, width: number, height: number, channels: number): 'detected' | 'uncertain' | 'none' {
+function coloredGlobeLocation(data: Buffer, width: number, height: number, channels: number): { status: 'detected' | 'uncertain' | 'none'; bounds?: { left: number; top: number; width: number; height: number } } {
   // A colored globe on a pale label can be recognized when exact emoji templates differ.
   const step = Math.max(1, Math.floor(Math.min(width, height) / 160));
   const cells = new Map<string, { blue: number; green: number; minX: number; minY: number; maxX: number; maxY: number }>();
@@ -74,9 +96,24 @@ export function coloredGlobeInCorner(data: Buffer, width: number, height: number
         if (r > 190 && g > 190 && b > 190 && Math.max(r,g,b) - Math.min(r,g,b) < 40) pale += 1;
       }
     }
-    if (checked >= 8 && cell.blue + cell.green >= 12 && pale / checked >= 0.35) return 'detected';
+    if (checked >= 8 && cell.blue + cell.green >= 12 && pale / checked >= 0.35) {
+      // The 36px sampling cells can split a small globe. Merge adjacent color
+      // fragments before using its bounds to separate text from the emoji.
+      let minX = cell.minX, minY = cell.minY, maxX = cell.maxX, maxY = cell.maxY;
+      for (const neighbor of cells.values()) {
+        if (neighbor.minX > maxX + 6 || neighbor.maxX < minX - 6 || neighbor.minY > maxY + 6 || neighbor.maxY < minY - 6) continue;
+        if (Math.max(maxX, neighbor.maxX) - Math.min(minX, neighbor.minX) > 72 || Math.max(maxY, neighbor.maxY) - Math.min(minY, neighbor.minY) > 72) continue;
+        minX = Math.min(minX, neighbor.minX); minY = Math.min(minY, neighbor.minY);
+        maxX = Math.max(maxX, neighbor.maxX); maxY = Math.max(maxY, neighbor.maxY);
+      }
+      return { status: 'detected', bounds: { left: minX, top: minY, width: maxX - minX + 1, height: maxY - minY + 1 } };
+    }
   }
-  return uncertain ? 'uncertain' : 'none';
+  return { status: uncertain ? 'uncertain' : 'none' };
+}
+
+export function coloredGlobeInCorner(data: Buffer, width: number, height: number, channels: number): 'detected' | 'uncertain' | 'none' {
+  return coloredGlobeLocation(data, width, height, channels).status;
 }
 
 type ColorSample = { x: number; y: number; r: number; g: number; b: number };
@@ -221,6 +258,7 @@ export async function detectEmbeddedWorldMark(source: Buffer): Promise<WorldMark
 }
 
 export class LocalImageInspector {
+  readonly version = IMAGE_ENGINE_VERSION;
   private workerPromise: Promise<Tesseract.Worker> | null = null;
 
   constructor(private readonly cachePath: string) {
@@ -228,6 +266,14 @@ export class LocalImageInspector {
   }
 
   async inspect(source: Buffer): Promise<ImageInspection> {
+    const started = performance.now();
+    let ocrPasses = 0;
+    const recognize = async (image: Buffer, psm = Tesseract.PSM.SINGLE_BLOCK) => {
+      const worker = await this.getWorker();
+      await worker.setParameters({ tessedit_pageseg_mode: psm });
+      ocrPasses += 1;
+      return worker.recognize(image);
+    };
     const oriented = await sharp(source, { limitInputPixels: MAX_IMAGE_PIXELS, autoOrient: true, failOn: 'warning' }).toBuffer();
     const metadata = await sharp(oriented).metadata();
     const width = metadata.width ?? 0, height = metadata.height ?? 0;
@@ -236,7 +282,7 @@ export class LocalImageInspector {
       .flatten({ background: '#ffffff' }).grayscale().normalize().sharpen().png().toBuffer();
     const [world, recognition] = await Promise.all([
       detectEmbeddedWorldMark(oriented),
-      this.getWorker().then((worker) => worker.recognize(normalized)).then((result) => ({ result })).catch((error: unknown) => ({ error })),
+      recognize(normalized).then((result) => ({ result })).catch((error: unknown) => ({ error })),
     ]);
     const ocrError = 'error' in recognition
       ? (recognition.error instanceof Error ? recognition.error.message.slice(0, 300) : 'No se pudo iniciar el OCR local.')
@@ -252,37 +298,66 @@ export class LocalImageInspector {
         const top = corner.startsWith('top') ? 0 : height - cornerHeight;
         const crop = await sharp(oriented).extract({ left, top, width: cornerWidth, height: cornerHeight }).resize({ width: 1200, withoutEnlargement: true }).toBuffer();
         const ocrCrop = await sharp(crop).flatten({ background: '#ffffff' }).grayscale().normalize().sharpen().png().toBuffer();
-        const result = await this.getWorker().then((worker) => worker.recognize(ocrCrop));
+        const result = await recognize(ocrCrop);
         const focusWidth = Math.max(16, Math.floor(width * 0.38));
         const focusHeight = Math.max(16, Math.floor(height * 0.22));
         const focusLeft = corner.endsWith('left') ? 0 : width - focusWidth;
         const focusTop = corner.startsWith('top') ? 0 : height - focusHeight;
-        const focus = await sharp(oriented).extract({ left: focusLeft, top: focusTop, width: focusWidth, height: focusHeight })
-          .resize({ width: 1200, withoutEnlargement: true }).flatten({ background: '#ffffff' }).grayscale().threshold(220).png().toBuffer();
-        const focusedText = (await this.getWorker().then((worker) => worker.recognize(focus))).data.text.trim();
-        const focusedCode = codeOnCornerLabel(focusedText);
-        const code = focusedCode ?? codeOnCornerLabel(result.data.text);
         const raw = await sharp(crop).removeAlpha().raw().toBuffer({ resolveWithObject: true });
-        const colorGlobe = coloredGlobeInCorner(raw.data, raw.info.width, raw.info.height, raw.info.channels);
+        const colorLocation = coloredGlobeLocation(raw.data, raw.info.width, raw.info.height, raw.info.channels);
+        const colorGlobe = colorLocation.status;
         const worldBounds = world.bounds;
         const worldScale = Math.min(512 / width, 512 / height, 1);
         const worldCenterX = worldBounds ? (worldBounds.left + worldBounds.width / 2) / worldScale : -1;
         const worldCenterY = worldBounds ? (worldBounds.top + worldBounds.height / 2) / worldScale : -1;
-        const hasWorld = world.detected && worldCenterX >= left && worldCenterX < left + cornerWidth && worldCenterY >= top && worldCenterY < top + cornerHeight || Boolean(code) && colorGlobe === 'detected';
+        const worldInCorner = world.detected && worldCenterX >= left && worldCenterX < left + cornerWidth && worldCenterY >= top && worldCenterY < top + cornerHeight;
+        let focusedRegion = { left: focusLeft, top: focusTop, width: focusWidth, height: focusHeight };
+        let isolated = false;
+        const localScale = raw.info.width / cornerWidth;
+        const location = worldInCorner && worldBounds ? { left: worldBounds.left / worldScale, top: worldBounds.top / worldScale, height: worldBounds.height / worldScale }
+          : colorLocation.bounds ? { left: left + colorLocation.bounds.left / localScale, top: top + colorLocation.bounds.top / localScale, height: colorLocation.bounds.height / localScale } : null;
+        if (location) {
+          const worldLeft = Math.floor(location.left);
+          const worldTop = Math.floor(location.top);
+          const worldSize = Math.ceil(location.height);
+          const textLeft = Math.max(left, worldLeft - Math.floor(width * 0.4));
+          const textTop = Math.max(0, worldTop - Math.ceil(worldSize * 0.4));
+          const textWidth = worldLeft - textLeft - 2;
+          const textHeight = Math.min(height - textTop, Math.ceil(worldSize * 1.8));
+          if (textWidth >= 24 && textHeight >= 16) {
+            focusedRegion = { left: textLeft, top: textTop, width: textWidth, height: textHeight }; isolated = true;
+          }
+        }
+        let focus = await sharp(oriented).extract(focusedRegion)
+          .resize({ width: Math.min(1200, focusedRegion.width * 3) }).flatten({ background: '#ffffff' }).grayscale().threshold(220).png().toBuffer();
+        if (isolated) focus = await sharp(focus).trim({ threshold: 10 }).extend({ top: 8, bottom: 8, left: 8, right: 8, background: '#ffffff' }).png().toBuffer();
+        const focused = (await recognize(focus, Tesseract.PSM.SINGLE_LINE)).data;
+        const focusedText = focused.text.trim();
+        const resolved = resolveCornerCode({ text: result.data.text.trim(), confidence: result.data.confidence }, { text: focusedText, confidence: focused.confidence }, isolated);
+        const { code } = resolved;
+        const hasWorld = worldInCorner || Boolean(code) && colorGlobe === 'detected';
         const ambiguousText = !code && /(?:^|[^\p{L}\p{N}])\d{3,6}(?:\s*[A-Z])?(?=\s|$)/u.test(focusedText);
-        regions.push({ corner, text: (focusedCode ? focusedText : result.data.text.trim()).slice(0, 500), code, hasWorld,
+        regions.push({ corner, text: resolved.text.slice(0, 500), code, codeConfidence: clamp(resolved.confidence / 100), codeUncertain: resolved.codeUncertain, hasWorld,
           worldUncertain: !hasWorld && (colorGlobe === 'detected' || Boolean(code) && colorGlobe === 'uncertain' || ambiguousText) });
       }
     }
+    const candidates = new Map(ocr.candidates.map((candidate) => [candidate.code, candidate]));
+    for (const region of regions) {
+      if (region.code && !region.codeUncertain) addCandidate(candidates, { code: region.code.replace(/\s+[HD]$/u, '').replace(/\s/gu, ''), confidence: region.codeConfidence ?? 0, evidence: 'label' });
+    }
+    const codeCandidates = [...candidates.values()].sort((a, b) => b.confidence - a.confidence);
+    const labeled = codeCandidates.filter((candidate) => candidate.evidence === 'label');
+    const selected = labeled.length === 1 ? labeled[0] : undefined;
     return {
       ocrText: data?.text.trim().slice(0, 6000) ?? '',
       ocrConfidence: data ? clamp(data.confidence / 100) : 0,
       ocrError,
-      codeCandidates: ocr.candidates,
-      detectedCode: ocr.detectedCode,
-      detectedCodeConfidence: ocr.detectedCodeConfidence,
-      world,
+      codeCandidates,
+      detectedCode: selected?.code ?? null,
+      detectedCodeConfidence: selected?.confidence ?? 0,
+      world: { ...world, detected: world.detected || regions.some((region) => region.hasWorld) },
       regions,
+      metrics: { durationMs: Math.round(performance.now() - started), ocrPasses },
     };
   }
 

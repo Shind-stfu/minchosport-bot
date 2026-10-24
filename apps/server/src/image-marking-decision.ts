@@ -2,7 +2,7 @@ import type { AppDatabase } from './database.js';
 import { codeOnCornerLabel } from './image-inspection.js';
 
 export type MarkMode = 'original' | 'mark_all' | 'mark_code' | 'mark_world';
-export type CornerLabel = { corner: 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right'; text: string; code: string | null; hasWorld: boolean; worldUncertain: boolean };
+export type CornerLabel = { corner: 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right'; text: string; code: string | null; codeConfidence?: number; codeUncertain?: boolean; hasWorld: boolean; worldUncertain: boolean };
 export type MarkDecision = { status: 'pending' | 'ready' | 'review'; mode: MarkMode | null; reason: string; manual: boolean };
 
 function matchingCode(requested: string, observed: string): boolean {
@@ -10,6 +10,7 @@ function matchingCode(requested: string, observed: string): boolean {
   const found = observed.trim().toUpperCase().replace(/\s+/gu, ' ');
   const compact = found.replace(/\s+/gu, '');
   return found === target
+    || compact === target
     || compact === `${target}H`
     || compact === `${target}D`
     || /^\d{3,6}$/u.test(target) && compact.startsWith(target) && /^[A-Z]$/u.test(compact.slice(target.length));
@@ -25,6 +26,7 @@ export function decideMarking(requestedCode: string | null, regions: CornerLabel
   }
   if (inspectionStatus === 'pending' || inspectionStatus === 'running' || !inspectionStatus) return { status: 'pending', mode: null, reason: 'La fotografía está pendiente de análisis local.', manual: false };
   if (inspectionStatus === 'failed' || error) return { status: 'review', mode: null, reason: `No se pudo verificar la marca de la fotografía${error ? `: ${error}` : '.'}`, manual: false };
+  if (regions.some((region) => region.codeUncertain)) return { status: 'review', mode: null, reason: 'Las lecturas del código son contradictorias o tienen poca confianza. Revisa la fotografía.', manual: false };
   const observed = regions.filter((region) => region.code || region.hasWorld || region.worldUncertain);
   if (observed.some((region) => region.worldUncertain)) return { status: 'review', mode: null, reason: 'Hay una posible marca de mundo que no se pudo confirmar.', manual: false };
   const codes = observed.filter((region) => region.code);

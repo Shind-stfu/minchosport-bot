@@ -1,10 +1,22 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import sharp from 'sharp';
-import { codeOnCornerLabel, coloredGlobeInCorner, detectEmbeddedWorldMark, extractImageCodeCandidates } from './image-inspection.js';
+import { codeOnCornerLabel, coloredGlobeInCorner, detectEmbeddedWorldMark, extractImageCodeCandidates, resolveCornerCode } from './image-inspection.js';
 import { hasNativeEmojiRenderer, renderEmojiGraphic } from './image-marking.js';
 
 describe('inspección local de fotografías', () => {
+  it('requires agreement and sufficient OCR confidence, and only resolves extra globe digits from an isolated text crop', () => {
+    const reading = (text: string, confidence = 90) => ({ text, confidence });
+    expect(resolveCornerCode(reading('096-2158'), reading('096-215'), true)).toMatchObject({ code: '096-215', codeUncertain: false });
+    expect(resolveCornerCode(reading('096-2158'), reading('096-215'), false)).toMatchObject({ code: null, codeUncertain: true });
+    expect(resolveCornerCode(reading('960'), reading('999'), true)).toMatchObject({ code: null, codeUncertain: true });
+    expect(resolveCornerCode(reading('COD 001', 20), reading('001', 30))).toMatchObject({ code: null, codeUncertain: true });
+    expect(resolveCornerCode(reading('960'), reading('960 H'))).toMatchObject({ code: '960', codeUncertain: false });
+    expect(resolveCornerCode(reading('PRECIO $60.000'), reading('TALLAS 38-42'))).toMatchObject({ code: null, codeUncertain: false });
+    expect(codeOnCornerLabel('096-215:')).toBe('096-215');
+    expect(codeOnCornerLabel('60.000')).toBeNull();
+    expect(codeOnCornerLabel('60,000')).toBeNull();
+  });
   it('prioritizes explicit labels, preserves zeros and does not turn shoe sizes or models into codes', () => {
     const labeled = extractImageCodeCandidates('COD: 001\nPrecio $70.000 · EUR 41 al 44', 96);
     expect(labeled.detectedCode).toBe('001');

@@ -11,7 +11,7 @@ import { BaileysSessionRegistry } from './whatsapp.js';
 import { SupplierIngestionService } from './supplier-ingestion.js';
 import { SupplierReceptionService } from './supplier-reception.js';
 import { OutboundDistributionRegistry } from './outbound-distribution.js';
-import { LocalImageInspector } from './image-inspection.js';
+import { ImageInspectorPool } from './image-inspector-pool.js';
 import { ImageInspectionCoordinator } from './image-inspection-coordinator.js';
 
 loadEnv({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) });
@@ -25,6 +25,7 @@ const Environment = z.object({
   DATA_DIR: z.string().optional(),
   DEFAULT_MARGIN_COP: z.coerce.number().refine((value) => value === 5000 || value === 10000).transform((value) => value as 5000 | 10000).default(10000),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+  IMAGE_ANALYSIS_WORKERS: z.coerce.number().int().min(1).max(4).optional(),
 });
 
 const config = Environment.parse(process.env);
@@ -39,7 +40,7 @@ mkdirSync(dataDirectory, { recursive: true });
 const database = openDatabase(resolve(dataDirectory, 'business.sqlite'), config.DEFAULT_MARGIN_COP);
 const messagingEnabled = config.APP_MODE === 'experimental' && config.WHATSAPP_ENABLED;
 const whatsappLogger = pino({ level: config.LOG_LEVEL, redact: { paths: ['*.qr', '*.token', '*.password'], censor: '[REDACTED]' } });
-const imageInspections = new ImageInspectionCoordinator(database, dataDirectory, new LocalImageInspector(join(dataDirectory, 'ocr-cache')));
+const imageInspections = new ImageInspectionCoordinator(database, dataDirectory, new ImageInspectorPool(join(dataDirectory, 'ocr-cache'), config.IMAGE_ANALYSIS_WORKERS));
 const supplierIngestion = new SupplierIngestionService(database, dataDirectory, whatsappLogger, (assetId) => { void imageInspections.schedule(assetId); });
 const supplierReception = new SupplierReceptionService(database, dataDirectory, supplierIngestion, whatsappLogger);
 const sessions = new BaileysSessionRegistry(database, whatsappLogger, messagingEnabled, supplierIngestion, supplierReception);

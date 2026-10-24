@@ -15,6 +15,7 @@ import type { OutboundDistributionRegistry, OutboundDistributionService } from '
 import { genderIndicatorFromDescription, saveMarkedImage } from './image-marking.js';
 import { LocalImageInspector, type ImageInspection } from './image-inspection.js';
 import { ImageInspectionCoordinator } from './image-inspection-coordinator.js';
+import { ImageInspectorPool } from './image-inspector-pool.js';
 import { markOptions, readMarkDecision, type MarkMode } from './image-marking-decision.js';
 import { writeApplicationLog } from './application-log.js';
 import { removeProductImages, removeProducts } from './product-cleanup.js';
@@ -106,7 +107,8 @@ function publicProduct(db: AppDatabase, assetsDirectory: string, product: Record
   const assets = db.prepare(`SELECT m.id, m.file_name as fileName, m.mime_type as mimeType, m.size_bytes as sizeBytes, m.position,
       i.ocr_text as ocrText, i.ocr_confidence as ocrConfidence, i.ocr_error as ocrError, i.code_candidates_json as codeCandidatesJson,
       i.detected_code as detectedCode, i.code_confidence as codeConfidence, i.world_variant as worldVariant,
-      i.world_confidence as worldConfidence, i.inspected_at as inspectedAt
+      i.world_confidence as worldConfidence, i.inspected_at as inspectedAt,
+      i.engine_version as engineVersion,i.duration_ms as durationMs,i.ocr_passes as ocrPasses,i.cache_hit as cacheHit,i.world_detected as worldDetected
     FROM media_assets m LEFT JOIN image_inspections i ON i.media_asset_id=m.id WHERE m.product_id=? ORDER BY m.position`)
     .all(product.id as string) as Array<Record<string, unknown>>;
   const publications = db.prepare('SELECT group_id as groupId,group_name as groupName,status,updated_at as updatedAt FROM outbound_publications WHERE product_id=? ORDER BY created_at')
@@ -130,8 +132,9 @@ function publicProduct(db: AppDatabase, assetsDirectory: string, product: Record
         codeCandidates: JSON.parse(String(asset.codeCandidatesJson ?? '[]')),
         detectedCode: asset.detectedCode,
         codeConfidence: asset.codeConfidence,
-        world: { detected: Boolean(asset.worldVariant), variant: asset.worldVariant, confidence: asset.worldConfidence },
+        world: { detected: Boolean(asset.worldDetected), variant: asset.worldVariant, confidence: asset.worldConfidence },
         inspectedAt: asset.inspectedAt,
+        engineVersion: asset.engineVersion, durationMs: asset.durationMs, ocrPasses: asset.ocrPasses, cacheHit: Boolean(asset.cacheHit),
       } : null,
     })),
     markedImageUrl: `/api/products/${product.id as string}/preview`,
@@ -145,7 +148,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
   const { db, dataDirectory, logLevel = 'info', port = 3210, whatsapp, sessionRegistry, messagingEnabled = false, outboundDistribution, distributionRegistry, realSendsEnabled = false, supplierReception } = options;
   const mediaDirectory = join(dataDirectory, 'media');
   mkdirSync(mediaDirectory, { recursive: true });
-  const imageInspections = options.imageInspections ?? new ImageInspectionCoordinator(db, dataDirectory, options.imageInspector ?? new LocalImageInspector(join(dataDirectory, 'ocr-cache')));
+  const imageInspections = options.imageInspections ?? new ImageInspectionCoordinator(db, dataDirectory, options.imageInspector ?? new ImageInspectorPool(join(dataDirectory, 'ocr-cache')));
   const app = Fastify({
     logger: { level: logLevel, redact: { paths: ['req.headers.authorization', '*.qr', '*.token', '*.password'], censor: '[REDACTED]' } },
     bodyLimit: 1024 * 1024,
@@ -189,6 +192,12 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
   })();
 
   app.get('/api/health', async () => ({ ok: true, mode: messagingEnabled ? 'experimental' : 'simulation', connected: Boolean(sessionRegistry?.get('main')?.status().status === 'connected' || whatsapp?.status().status === 'connected'), distribution: distributionFor('main')?.status() ?? 'stopped' }));
+
+  app.get<{ Querystring: { sessionId?: string } }>('/api/image-engine', async (request, reply) => {
+    const sessionId = request.query.sessionId ?? 'main';
+    if (!sessionRow(sessionId)) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
+    return imageInspections.status(sessionId);
+  });
 
   app.get('/api/sessions', async () => {
     const rows = db.prepare('SELECT id,name,created_at as createdAt FROM whatsapp_sessions WHERE archived_at IS NULL ORDER BY created_at').all() as Array<{ id: string; name: string; createdAt: string }>;

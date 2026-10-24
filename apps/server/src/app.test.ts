@@ -85,7 +85,16 @@ describe('local simulation API', () => {
     expect(db.prepare('SELECT ocr_confidence,ocr_error,detected_code,world_variant FROM image_inspections WHERE media_asset_id=?').get('inspection-asset')).toEqual({ ocr_confidence: 0.91, ocr_error: null, detected_code: '001', world_variant: '🌎' });
 
     const catalog = await app.inject({ method: 'GET', url: '/api/products', headers });
-    expect(catalog.json()[0].images[0].inspection).toMatchObject({ ocrText: 'COD 001 · NIKE', detectedCode: '001', codeCandidates: [{ code: '001' }], world: { detected: true, variant: '🌎' } });
+    expect(catalog.json()[0].images[0].inspection).toMatchObject({ ocrText: 'COD 001 · NIKE', detectedCode: '001', codeCandidates: [{ code: '001' }], world: { detected: true, variant: '🌎' }, engineVersion: 'local-ocr-consensus-v2', durationMs: expect.any(Number), cacheHit: false });
+    const engine = await app.inject({ method: 'GET', url: '/api/image-engine?sessionId=main', headers });
+    expect(engine.statusCode).toBe(200);
+    expect(engine.json()).toMatchObject({ version: 'local-ocr-consensus-v2', concurrency: 1, counts: [{ status: 'complete', count: 1 }] });
+    expect((await app.inject({ method: 'GET', url: '/api/image-engine?sessionId=missing', headers })).statusCode).toBe(404);
+    // A globe found by its colored label has no exact emoji template variant.
+    inspection.world.variant = null;
+    await app.inject({ method: 'POST', url: '/api/products/inspection-product/inspect-image', headers });
+    const colorOnly = await app.inject({ method: 'GET', url: '/api/products', headers });
+    expect(colorOnly.json()[0].images[0].inspection.world).toMatchObject({ detected: true, variant: null });
     await app.close();
   });
 
