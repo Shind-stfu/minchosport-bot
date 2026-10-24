@@ -12,7 +12,7 @@ const EMOJI_FILES: Record<string, string> = {
 };
 const PIXEL_LIMIT = 40_000_000;
 const OUTPUT_LIMIT = 20 * 1024 * 1024;
-const RENDER_VERSION = 'native-emoji-inset-opaque-larger-gender-20261017';
+const RENDER_VERSION = 'native-emoji-gender-aliases-20261024';
 const APPLE_TEXT_FONT = '/System/Library/Fonts/SFNS.ttf';
 const APPLE_EMOJI_FONT = '/System/Library/Fonts/Apple Color Emoji.ttc';
 const WINDOWS_TEXT_FONT = 'C:/Windows/Fonts/segoeuib.ttf';
@@ -61,8 +61,10 @@ export function hasNativeEmojiRenderer() {
 
 export function genderIndicatorFromDescription(description: string): 'H' | 'D' | null {
   const normalized = description.normalize('NFD').replace(/\p{M}/gu, '').toUpperCase();
-  const hasMale = /(?:^|[^\p{L}])(?:HOMBRES?|CABALLEROS?)(?=$|[^\p{L}])/u.test(normalized);
-  const hasFemale = /(?:^|[^\p{L}])(?:MUJER(?:ES)?|DAMAS?)(?=$|[^\p{L}])/u.test(normalized);
+  const hasMale = /(?:^|[^\p{L}])(?:HOMBRES?|CABALLEROS?|VARON(?:ES)?)(?=$|[^\p{L}])/u.test(normalized)
+    || /(?:^|[^\p{L}\p{N}_-])H(?=$|[^\p{L}\p{N}_-])/u.test(normalized);
+  const hasFemale = /(?:^|[^\p{L}])(?:MUJER(?:ES)?|DAMAS?)(?=$|[^\p{L}])/u.test(normalized)
+    || /(?:^|[^\p{L}\p{N}_-])D(?=$|[^\p{L}\p{N}_-])/u.test(normalized);
   if (hasMale === hasFemale) return null;
   return hasMale ? 'H' : 'D';
 }
@@ -114,7 +116,10 @@ export async function renderMarkedImage(source: Buffer, options: { code: string 
   const padding = Math.max(5, Math.round(fontSize * 0.42));
   const parts: Array<{ input: Buffer; width: number; height: number }> = [];
 
-  if (code) parts.push(await textTile(`${code}${options.genderIndicator ?? ''}`, fontSize));
+  // Numeric supplier labels can already include the same H/D suffix.
+  const indicator = options.genderIndicator ?? '';
+  const hasIndicator = indicator && /^\d{3,6}(?:-\d{1,4})?[HD]$/iu.test(code) && code.toUpperCase().endsWith(indicator);
+  if (code) parts.push(await textTile(`${code}${hasIndicator ? '' : indicator}`, fontSize));
   for (const part of options.sourceHasWorld ? [] : markerParts(options.marker)) {
     if ('text' in part) {
       if (part.text) parts.push(await textTile(part.text, fontSize));

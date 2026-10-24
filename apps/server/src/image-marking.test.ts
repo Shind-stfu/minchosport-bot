@@ -27,11 +27,24 @@ describe('marked product photography', () => {
     ['Mujer 015-81', 'D'],
     ['DAMA 954', 'D'],
     ['MUJERES 015-81', 'D'],
+    ['1059 ADIDAS REPÓNSE DAMA $85.000 POR CAJA $70.000', 'D'],
+    ['1059 ADIDAS mujer', 'D'],
+    ['1059 ADIDAS D $70.000', 'D'],
+    ['*d* 1059', 'D'],
+    ['1059 (D)', 'D'],
+    ['1059 H $70.000', 'H'],
+    ['*h* 1059', 'H'],
+    ['1059 Varón', 'H'],
+    ['1059 varon', 'H'],
+    ['1059 VARONES', 'H'],
+    ['DAMA-1059', 'D'],
+    ['HOMBRE-1059', 'H'],
+    ['VARÓN-1059', 'H'],
   ] as const)('detects the gender indicator from "%s"', (description, expected) => {
     expect(genderIndicatorFromDescription(description)).toBe(expected);
   });
 
-  it.each(['modelo DAMASCO 123', 'HOMBRERA 123', 'calzado unisex', 'HOMBRE Y DAMA'])('does not guess a gender for "%s"', (description) => {
+  it.each(['modelo DAMASCO 123', 'HOMBRERA 123', 'calzado unisex', 'HOMBRE Y DAMA', 'ADIDAS 1059', 'NIKE DH1234', 'COD H-123', 'SKU D-1059', '1059D', '1059H', 'UNISEX H/D', 'MUJER Y VARÓN'])('does not guess a gender for "%s"', (description) => {
     expect(genderIndicatorFromDescription(description)).toBeNull();
   });
 
@@ -40,6 +53,15 @@ describe('marked product photography', () => {
     const withGender = await renderMarkedImage(source, { code: '123-16', genderIndicator: 'H', marker: '🌎', position: 'top_left' });
     const withoutGender = await renderMarkedImage(source, { code: '123-16', marker: '🌎', position: 'top_left' });
     expect(withGender.bytes.equals(withoutGender.bytes)).toBe(false);
+  });
+
+  it.each(['H', 'D'] as const)('does not duplicate an existing %s suffix on a numeric supplier code', async (indicator) => {
+    const source = await plainImage();
+    const expected = await renderMarkedImage(source, { code: `1059${indicator}`, marker: '🌎', position: 'bottom_right' });
+    const appended = await renderMarkedImage(source, { code: '1059', genderIndicator: indicator, marker: '🌎', position: 'bottom_right' });
+    const alreadyPresent = await renderMarkedImage(source, { code: `1059${indicator}`, genderIndicator: indicator, marker: '🌎', position: 'bottom_right' });
+    expect(appended.bytes).toEqual(expected.bytes);
+    expect(alreadyPresent.bytes).toEqual(expected.bytes);
   });
 
   it.each<OverlayPosition>(['top_left', 'top_right', 'bottom_left', 'bottom_right'])(
