@@ -39,6 +39,32 @@ function analyzedPhotos(db: ReturnType<typeof openDatabase>, productId?: string)
 }
 
 describe('manual outbound distribution', () => {
+  it.each(['individual', 'batch'] as const)('completes only the missing community destination through an explicit %s send', async (mode) => {
+    const sent: string[] = [];
+    const { db, ingestion, distribution } = setup(async (groupId) => { sent.push(groupId); return { messageId: `wa-${sent.length}` }; });
+    await ingestion.receive({ groupId: 'supplier@g.us', participantId: 'vendor@s.whatsapp.net', messageId: 'partial-photo', timestampMs: Date.now() - 20_000,
+      text: 'COD 143 PRECIO $60.000', image: { bytes: await photo(), mimeType: 'image/png', expectedAlbumImages: 1 } });
+    await distribution.processNow();
+    analyzedPhotos(db);
+    const { id } = db.prepare('SELECT id FROM products').get() as { id: string };
+    await distribution.sendApprovedProduct(id);
+    expect(sent).toEqual(['buyers-a@g.us', 'buyers-b@g.us']);
+    const child = 'community-child@g.us';
+    db.prepare("INSERT INTO whatsapp_groups(session_id,jid,subject,updated_at) VALUES ('main',?,?,?)").run(child, '#3 Mincho Sport STEFFA Mundo Zapatillas L302', new Date().toISOString());
+    db.prepare("UPDATE whatsapp_session_settings SET target_group_ids=? WHERE session_id='main'").run(JSON.stringify(['buyers-a@g.us', 'buyers-b@g.us', child]));
+    expect(sent).toHaveLength(2); // Saving a target alone must never send anything.
+    if (mode === 'individual') expect(await distribution.sendApprovedProduct(id)).toEqual({ groupCount: 1, imageCount: 1 });
+    else expect(await distribution.approveAndSendAll(undefined, [id])).toMatchObject({ sentProducts: 1, sentGroups: 1, sentImages: 1, skipped: 0 });
+    expect(sent).toEqual(['buyers-a@g.us', 'buyers-b@g.us', child]);
+    expect(db.prepare('SELECT group_id,status FROM outbound_publications ORDER BY group_id').all()).toEqual([
+      { group_id: 'buyers-a@g.us', status: 'submitted' }, { group_id: 'buyers-b@g.us', status: 'submitted' }, { group_id: child, status: 'submitted' },
+    ]);
+    await expect(distribution.sendApprovedProduct(id)).rejects.toThrow('ya fue enviado');
+    expect(await distribution.approveAndSendAll(undefined, [id])).toMatchObject({ sentProducts: 0, skipped: 1 });
+    expect(sent).toHaveLength(3);
+    await distribution.stop(); db.close();
+  });
+
   it('waits at least the configured interval between photos across destination groups', async () => {
     const pauses: number[] = [];
     let sentCount = 0;

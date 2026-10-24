@@ -499,6 +499,29 @@ describe('local simulation API', () => {
     await app.close();
   });
 
+  it('preserves saved community destinations and suppliers when refreshing returns only some groups', async () => {
+    const child = { id: 'community-child@g.us', name: '#3 Mincho Sport STEFFA Mundo Zapatillas L302' };
+    let groups = [child, { id: 'buyers-a@g.us', name: 'Clientes A' }, { id: 'buyers-b@g.us', name: 'Clientes B' }, { id: 'supplier@g.us', name: 'Bodega' }, { id: 'unused@g.us', name: 'Sin configurar' }];
+    const connector: WhatsAppConnector = {
+      status: () => ({ status: 'connected', qr: null, lastError: null }), connect: async () => {}, disconnect: async () => {}, resetSession: async () => {},
+      listGroups: async () => groups, sendImage: async () => ({ messageId: 'unused' }),
+    };
+    const { app, db } = setup(connector);
+    const headers = { host: '127.0.0.1:3210', 'content-type': 'application/json' };
+    await app.inject({ method: 'GET', url: '/api/sessions/main/groups', headers });
+    const targets = ['buyers-a@g.us', 'buyers-b@g.us', child.id];
+    expect((await app.inject({ method: 'PUT', url: '/api/sessions/main/targets', headers, payload: { targetGroupIds: targets } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: '/api/sessions/main/providers', headers, payload: { name: 'Bodega', sourceGroupId: 'supplier@g.us', priceMarginCop: 0, boxMarginCop: 0, markerText: '🌎', defaultPosition: 'top_left' } })).statusCode).toBe(201);
+    groups = [{ id: 'buyers-a@g.us', name: 'Clientes A actualizado' }, { id: 'buyers-b@g.us', name: 'Clientes B' }];
+    const refreshed = await app.inject({ method: 'GET', url: '/api/sessions/main/groups', headers });
+    expect(refreshed.statusCode).toBe(200);
+    expect(refreshed.json()).toEqual(expect.arrayContaining([child, groups[0], { id: 'supplier@g.us', name: 'Bodega' }]));
+    expect(refreshed.json()).toHaveLength(4);
+    expect(db.prepare("SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id='main'").get()).toEqual({ target_group_ids: JSON.stringify(targets) });
+    expect((await app.inject({ method: 'PUT', url: '/api/sessions/main/targets', headers, payload: { targetGroupIds: targets } })).statusCode).toBe(200);
+    await app.close();
+  });
+
   it('creates more than nine providers and reads their stored groups without querying WhatsApp again', async () => {
     let groupQueries = 0;
     const groups = Array.from({ length: 12 }, (_, index) => ({ id: `supplier-${index}@g.us`, name: `Bodega ${index + 1}` }));

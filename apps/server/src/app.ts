@@ -311,12 +311,12 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
         const groups = await connector.listGroups(); const now = new Date().toISOString();
         const upsert = db.prepare('INSERT INTO whatsapp_groups(session_id,jid,subject,updated_at) VALUES (?,?,?,?) ON CONFLICT(session_id,jid) DO UPDATE SET subject=excluded.subject,updated_at=excluded.updated_at');
         db.transaction(() => {
-          db.prepare('DELETE FROM whatsapp_groups WHERE session_id=?').run(account.id);
+          // A partial WhatsApp response must not erase configured destinations or suppliers.
+          db.prepare(`DELETE FROM whatsapp_groups WHERE session_id=?
+            AND jid NOT IN (SELECT value FROM json_each((SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?)))
+            AND jid NOT IN (SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL)`)
+            .run(account.id, account.id, account.id);
           for (const group of groups) upsert.run(account.id, group.id, group.name, now);
-          const active = new Set(groups.map((group) => group.id));
-          const selection = db.prepare('SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?').get(account.id) as { target_group_ids: string };
-          const targets = (JSON.parse(selection.target_group_ids) as string[]).filter((id) => active.has(id));
-          db.prepare('UPDATE whatsapp_session_settings SET target_group_ids=?,updated_at=? WHERE session_id=?').run(JSON.stringify(targets), now, account.id);
         })();
       }
       return storedGroups();
@@ -843,7 +843,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     try {
       const result = await distribution.sendApprovedProduct(request.params.id);
       audit(db, 'product.sent.manually', 'product', request.params.id, result);
-      return { ok: true, ...result, message: `Envío solicitado a ${result.groupCount} grupos con ${result.imageCount} fotos por grupo. Baileys confirmó el envío al servidor; revisa WhatsApp para confirmar la entrega.` };
+      return { ok: true, ...result, message: `Envío solicitado a ${result.groupCount} grupos con ${result.imageCount} envíos de fotos en total. Baileys confirmó el envío al servidor; revisa WhatsApp para confirmar la entrega.` };
     } catch (error) {
       audit(db, 'product.send.failed', 'product', request.params.id, {});
       return reply.code(409).send({ error: error instanceof Error ? error.message : 'No se pudo enviar el producto.' });

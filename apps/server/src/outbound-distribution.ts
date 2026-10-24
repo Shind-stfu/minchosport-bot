@@ -135,7 +135,6 @@ export class OutboundDistributionService {
         FROM outbound_publications p WHERE p.product_id=? AND p.session_id=?`).all(productId, this.sessionId) as Array<{ group_id: string; status: string; unresolved: number }>;
       if (existing.some((entry) => entry.status === 'needs_review' || entry.unresolved === 1)) throw new Error('Hay un envío incierto. Confirma el resultado en WhatsApp antes de volver a enviar.');
       const resumable = existing.some((entry) => entry.status === 'queued' || entry.status === 'in_progress');
-      if (!resumable && existing.some((entry) => entry.status === 'submitted')) throw new Error('Este producto ya fue enviado a uno o más grupos.');
 
       if (!resumable) {
         const selection = this.db.prepare('SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?').get(this.sessionId) as { target_group_ids: string };
@@ -144,7 +143,10 @@ export class OutboundDistributionService {
         if (targets.length < 1 || targets.length > 5 || targets.some((target) => sourceGroups.has(target))) {
           throw new Error('Guarda entre uno y cinco grupos destino, distintos de todos los proveedores de esta cuenta.');
         }
-        await this.enqueueProduct(productId);
+        const submitted = new Set(existing.filter((entry) => entry.status === 'submitted').map((entry) => entry.group_id));
+        const pendingTargets = targets.filter((target) => !submitted.has(target));
+        if (!pendingTargets.length) throw new Error('Este producto ya fue enviado a todos los grupos destino seleccionados.');
+        await this.enqueueProduct(productId, pendingTargets);
       }
       signal.throwIfAborted();
       const queued = this.db.prepare("SELECT COUNT(DISTINCT p.group_id) as groups,COUNT(u.id) as images FROM outbound_publications p JOIN outbound_units u ON u.publication_id=p.id WHERE p.product_id=? AND p.session_id=? AND p.status IN ('queued','in_progress') AND u.status='pending'").get(productId, this.sessionId) as { groups: number; images: number };
@@ -190,8 +192,10 @@ export class OutboundDistributionService {
 
     for (const product of ready) {
       signal.throwIfAborted();
-      const existing = this.db.prepare('SELECT status FROM outbound_publications WHERE product_id=? AND session_id=?').all(product.id, this.sessionId) as Array<{ status: string }>;
-      if (existing.some((entry) => ['submitted', 'in_progress', 'needs_review'].includes(entry.status))) {
+      const existing = this.db.prepare('SELECT group_id,status FROM outbound_publications WHERE product_id=? AND session_id=?').all(product.id, this.sessionId) as Array<{ group_id: string; status: string }>;
+      const targets = JSON.parse((this.db.prepare('SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?').get(this.sessionId) as { target_group_ids: string }).target_group_ids) as string[];
+      const allSubmitted = targets.length > 0 && targets.every((target) => existing.some((entry) => entry.group_id === target && entry.status === 'submitted'));
+      if (existing.some((entry) => ['in_progress', 'needs_review'].includes(entry.status)) || allSubmitted) {
         skipped += 1;
         continue;
       }
@@ -266,16 +270,14 @@ export class OutboundDistributionService {
     })();
   }
 
-  private async enqueueProduct(productId: string): Promise<number> {
+  private async enqueueProduct(productId: string, targets: string[]): Promise<number> {
     if (!this.enabled) return 0;
     const product = this.db.prepare('SELECT output_text,status,session_id,supplier_id,raw_text,shoe_code,shoe_code_override,marker_text_applied,image_position FROM products WHERE id=?').get(productId) as { output_text: string | null; status: string; session_id: string; supplier_id: string | null; raw_text: string; shoe_code: string | null; shoe_code_override: number; marker_text_applied: string | null; image_position: 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right' | null } | undefined;
     if (!product || product.session_id !== this.sessionId || !product.supplier_id || !['approved', 'simulated'].includes(product.status) || !product.output_text) return 0;
     const shoeCode = product.shoe_code_override === 1 ? product.shoe_code : product.shoe_code ?? extractShoeCode(product.raw_text).code;
     const outgoingText = prepareOutgoingDescription(product.output_text);
-    const settings = this.db.prepare('SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?').get(this.sessionId) as { target_group_ids: string } | undefined;
-    const selected = JSON.parse(settings?.target_group_ids ?? '[]') as string[];
     const sources = new Set((this.db.prepare("SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL").all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
-    const groups = selected.filter((groupId) => !sources.has(groupId)).map((groupId) => {
+    const groups = targets.filter((groupId) => !sources.has(groupId)).map((groupId) => {
       const row = this.db.prepare('SELECT subject FROM whatsapp_groups WHERE session_id=? AND jid=?').get(this.sessionId, groupId) as { subject: string } | undefined;
       return { id: groupId, name: row?.subject ?? groupId };
     });
