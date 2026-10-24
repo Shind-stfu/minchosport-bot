@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,7 +12,7 @@ import type { WhatsAppConnector } from './whatsapp.js';
 import type { ImageInspection } from './image-inspection.js';
 
 const temporaryDirectories: string[] = [];
-afterEach(() => { for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
 function setup(whatsapp?: WhatsAppConnector, imageInspector?: { inspect: (source: Buffer) => Promise<ImageInspection> }) {
   const directory = mkdtempSync(join(tmpdir(), 'tenis-server-'));
@@ -33,7 +33,7 @@ describe('local simulation API', () => {
     const headers = { host: '127.0.0.1:3210' };
     const saved = await app.inject({ method: 'PUT', url: '/api/sessions/main/reception-schedule', headers: { ...headers, 'content-type': 'application/json' }, payload: { startTime: '17:00', endTime: '20:00' } });
     expect(saved.statusCode, saved.body).toBe(200);
-    expect(saved.json()).toMatchObject({ recoveryRequested: true, receptionSchedule: { startTime: '17:00', endTime: '20:00' } });
+    expect(saved.json()).toMatchObject({ recoveryRequested: false, receptionSchedule: { startTime: '17:00', endTime: '20:00' } });
     expect(requests).toBe(1);
     const retried = await app.inject({ method: 'POST', url: '/api/sessions/main/recover-history', headers });
     expect(retried.statusCode).toBe(202); expect(requests).toBe(2); expect(disconnects).toBe(0);
@@ -42,6 +42,34 @@ describe('local simulation API', () => {
     connected = false;
     const offline = await app.inject({ method: 'POST', url: '/api/sessions/main/recover-history', headers });
     expect(offline.statusCode).toBe(409); expect(requests).toBe(2);
+    await app.close();
+  });
+
+  it('reports blocked or future recovery attempts as warnings instead of a successful phone request', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-24T14:49:00-05:00'));
+    const connector: WhatsAppConnector = {
+      status: () => ({ status: 'connected', qr: null, lastError: null }), connect: async () => {}, disconnect: async () => {}, resetSession: async () => {},
+      listGroups: async () => [], sendImage: async () => ({ messageId: 'unused' }), requestHistory: async () => {},
+    };
+    const { app, db } = setup(connector);
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES ('provider','main','provider@g.us','Bodega',0,?,?)").run(now, now);
+    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='14:50',reception_end_time='15:00' WHERE session_id='main'").run();
+    const headers = { host: '127.0.0.1:3210' };
+    const scheduled = await app.inject({ method: 'POST', url: '/api/sessions/main/recover-history', headers });
+    expect(scheduled.json()).toMatchObject({ historyRecovery: { status: 'scheduled' } });
+    expect(scheduled.json().message).toContain('14:50');
+    clock.mockReturnValue(Date.parse('2026-10-24T14:51:00-05:00'));
+    const blocked = await app.inject({ method: 'POST', url: '/api/sessions/main/recover-history', headers });
+    expect(blocked.json()).toMatchObject({ historyRecovery: { status: 'waiting_reference', eligibleGroups: 0, missingReferences: 1 } });
+    expect(blocked.json().message).toContain('No se pudo solicitar historial');
+    const events = db.prepare("SELECT level,message FROM application_logs WHERE action IN ('supplier.history.recovery.scheduled','supplier.history.recovery.waiting_reference')").all() as Array<{ level: string; message: string }>;
+    expect(events).toHaveLength(2);
+    expect(events.every((event) => event.level === 'warning')).toBe(true);
+    db.prepare("INSERT INTO whatsapp_history_anchors(session_id,group_jid,message_id,message_timestamp_ms) VALUES ('main','provider@g.us','real-reference',?)").run(Date.now());
+    const ready = await app.inject({ method: 'POST', url: '/api/sessions/main/recover-history', headers });
+    expect(ready.json()).toMatchObject({ historyRecovery: { status: 'requesting', eligibleGroups: 1, missingReferences: 0 } });
+    expect(ready.json().message).toContain('no confirma que se hayan recuperado fotos');
     await app.close();
   });
 

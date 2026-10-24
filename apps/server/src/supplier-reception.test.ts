@@ -26,10 +26,10 @@ function setup(initialTime = '2026-10-20T07:00:00.000Z') {
 describe('durable supplier reception queue', () => {
   it('updates recovery when history arrives after the timeout and preserves a received status on empty batches', async () => {
     vi.useFakeTimers();
-    const { db, reception, setNow } = setup('2026-10-21T16:10:00.000Z');
+    const { db, reception, setNow } = setup('2026-10-21T21:10:00.000Z');
     reception.beginRecovery('main');
     expect(reception.snapshot('main').recoveryStatus).toBe('waiting');
-    setNow('2026-10-21T16:10:36.000Z');
+    setNow('2026-10-21T21:10:36.000Z');
     await vi.advanceTimersByTimeAsync(36_000);
     expect(reception.snapshot('main').recoveryStatus).toBe('unavailable');
     await reception.recordHistoryBatch('main', 3);

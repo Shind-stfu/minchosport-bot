@@ -33,6 +33,12 @@ export class HistoryRecovery {
     this.active = true;
     this.startMs = recoveryStartTimestampMs(readReceptionSchedule(this.db, this.sessionId));
     this.endMs = Math.min(Date.now(), recoveryEndTimestampMs(readReceptionSchedule(this.db, this.sessionId)));
+    if (this.startMs > Date.now()) {
+      this.reception?.beginRecovery(this.sessionId);
+      this.timer = setTimeout(() => { this.timer = undefined; this.start(); }, this.startMs - Date.now());
+      this.timer.unref();
+      return;
+    }
     if (resetStatus) this.reception?.beginRecovery(this.sessionId);
     const suppliers = this.db.prepare('SELECT source_group_id as groupId FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL').all(this.sessionId) as Array<{ groupId: string }>;
     for (const { groupId } of suppliers) {
@@ -160,6 +166,7 @@ export class HistoryRecovery {
   }
 
   private report() {
+    if (this.startMs > Date.now()) return;
     const states = [...this.groups.values()];
     this.reception?.recordRecoveryRequests(this.sessionId, states.filter((state) => state.requested).length,
       states.filter((state) => !state.cursor).length, states.filter((state) => state.failed).length);

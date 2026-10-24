@@ -30,6 +30,33 @@ function setup() {
 }
 
 describe('explicit supplier history requests', () => {
+  it('defers a 14:50 range requested at 14:49 instead of reporting no history after 35 seconds', async () => {
+    const { db, history, reception, fetchHistory, message } = setup();
+    vi.setSystemTime(new Date('2026-10-22T14:49:00-05:00'));
+    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='14:50',reception_end_time='15:00' WHERE session_id='main'").run();
+    db.prepare("DELETE FROM supplier_reception_state WHERE session_id='main'").run();
+    history.observe([message('before-range', '14:48:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(fetchHistory).not.toHaveBeenCalled();
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'idle', recoveryMissingAnchors: 0, recoveryFinishedAt: null });
+    expect(reception.snapshot('main').recoveryWarning).toContain('14:50');
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'waiting', recoveryMissingAnchors: 1 });
+    history.observe([message('at-range-start', '14:50:00')]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchHistory.mock.calls[0]?.[1]).toMatchObject({ id: 'at-range-start' });
+  });
+
+  it('cancels the scheduled range start when the connection stops', async () => {
+    const { db, history, fetchHistory } = setup();
+    vi.setSystemTime(new Date('2026-10-22T14:49:00-05:00'));
+    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='14:50',reception_end_time='15:00' WHERE session_id='main'").run();
+    history.start(); history.stop();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(fetchHistory).not.toHaveBeenCalled();
+  });
+
   it('keeps real group references received before suppliers are configured without storing their message bodies', async () => {
     const { db, history, fetchHistory, message } = setup();
     db.prepare("DELETE FROM supplier_profiles WHERE id='provider'").run();

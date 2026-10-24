@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node
 import { join } from 'node:path';
 import type { FastifyBaseLogger } from 'fastify';
 import type { AppDatabase } from './database.js';
-import { isInRecoveryWindow, readReceptionSchedule } from './reception-schedule.js';
+import { isInRecoveryWindow, readReceptionSchedule, recoveryStartTimestampMs } from './reception-schedule.js';
 import type { IncomingSupplierMessage, SupplierIngestionService } from './supplier-ingestion.js';
 import { writeApplicationLog } from './application-log.js';
 
@@ -154,6 +154,17 @@ export class SupplierReceptionService {
   }
 
   beginRecovery(sessionId: string) {
+    const schedule = readReceptionSchedule(this.db, sessionId);
+    if (recoveryStartTimestampMs(schedule, this.now()) > this.now()) {
+      const timer = this.recoveryTimers.get(sessionId);
+      if (timer) clearTimeout(timer);
+      this.recoveryTimers.delete(sessionId);
+      this.db.prepare(`INSERT INTO supplier_reception_state(session_id,recovery_status,recovery_warning) VALUES (?,'idle',?)
+        ON CONFLICT(session_id) DO UPDATE SET recovery_status='idle',recovery_started_at=NULL,recovery_finished_at=NULL,
+        recovery_message_count=0,recovery_requested_groups=0,recovery_missing_anchors=0,recovery_failed_requests=0,recovery_warning=excluded.recovery_warning`)
+        .run(sessionId, `El rango de hoy todavía no comienza. Se iniciará el intento de recuperación a las ${schedule.startTime}, hora de Colombia. Los mensajes nuevos siguen entrando.`);
+      return;
+    }
     const now = new Date(this.now()).toISOString();
     this.db.prepare(`INSERT INTO supplier_reception_state(session_id,recovery_status,recovery_started_at,recovery_finished_at,recovery_message_count,recovery_warning)
       VALUES (?,'waiting',?,NULL,0,NULL) ON CONFLICT(session_id) DO UPDATE SET recovery_status='waiting',recovery_started_at=excluded.recovery_started_at,

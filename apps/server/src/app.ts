@@ -21,6 +21,7 @@ import { writeApplicationLog } from './application-log.js';
 import { removeProductImages, removeProducts } from './product-cleanup.js';
 import type { SupplierReceptionService } from './supplier-reception.js';
 import QRCode from 'qrcode';
+import { readReceptionSchedule, recoveryStartTimestampMs } from './reception-schedule.js';
 
 class ApprovalError extends Error {
   constructor(readonly statusCode: number, message: string) { super(message); }
@@ -87,6 +88,9 @@ function audit(db: AppDatabase, action: string, type: string, id: string, detail
     'distribution.stopped': 'Se detuvo la distribución', 'settings.updated': 'Se actualizó la configuración',
     'distribution.send_interval.updated': 'Se actualizó la pausa entre envíos',
     'supplier.reception.schedule.updated': 'Se actualizó el rango de recuperación del historial de esta cuenta',
+    'supplier.history.recovery.requested': 'Se inició un intento de recuperación; los contadores indican qué grupos se solicitaron y cuántos mensajes llegaron',
+    'supplier.history.recovery.waiting_reference': 'Todavía no se pudo solicitar historial al teléfono: faltan referencias recientes de mensajes de los proveedores',
+    'supplier.history.recovery.scheduled': 'El rango de hoy aún no comienza; el intento de recuperación quedó programado para la hora de inicio',
     'product.image_options.updated': 'Se actualizó el código o la posición de la marca',
     'product.image.inspected': 'Se analizaron localmente los códigos y marcas de la fotografía',
     'product.image.inspect.failed': 'No se pudo analizar una fotografía',
@@ -99,7 +103,7 @@ function audit(db: AppDatabase, action: string, type: string, id: string, detail
     'products.send-all.failed': 'No se pudo iniciar el envío masivo',
     'product.simulated': 'Se registró una simulación local',
   };
-  const level = /failed|error|uncertain/i.test(action) ? 'error' : /warning|review/i.test(action) ? 'warning' : 'info';
+  const level = /failed|error|uncertain/i.test(action) ? 'error' : /warning|review|waiting_reference|scheduled/i.test(action) ? 'warning' : 'info';
   writeApplicationLog(db, { sessionId, category, action, entityType: type, entityId: id, message: messages[action] ?? action.replaceAll('.', ' '), details, createdAt, level });
 }
 
@@ -191,6 +195,29 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       lastSupplierMessageAt: state?.lastSupplierMessageAt ?? null, lastSupplierGroupJid: state?.lastSupplierGroupJid ?? null, lastSupplierResult: state?.lastSupplierResult ?? null };
   })();
 
+  function historyAttemptInfo(sessionId: string) {
+    const schedule = readReceptionSchedule(db, sessionId);
+    const startMs = recoveryStartTimestampMs(schedule);
+    const references = (db.prepare(`SELECT p.name,a.message_timestamp_ms as timestampMs FROM supplier_profiles p
+      LEFT JOIN whatsapp_history_anchors a ON a.session_id=p.session_id AND a.group_jid=p.source_group_id
+      WHERE p.session_id=? AND p.archived_at IS NULL ORDER BY p.name`).all(sessionId) as Array<{ name: string; timestampMs: number | null }>);
+    const eligibleGroups = references.filter((row) => row.timestampMs !== null && row.timestampMs >= startMs && row.timestampMs <= Date.now() + 300_000).length;
+    const missingReferences = references.length - eligibleGroups;
+    const status = startMs > Date.now() ? 'scheduled' : eligibleGroups ? 'requesting' : 'waiting_reference';
+    const message = status === 'scheduled'
+      ? `El rango de hoy empieza a las ${schedule.startTime}, hora de Colombia. El intento quedó programado; todavía no hay historial de ese rango para pedir.`
+      : status === 'waiting_reference'
+        ? `No se pudo solicitar historial al teléfono: ${missingReferences} grupo(s) no tienen una referencia reciente dentro o después del rango. El intento queda esperando una referencia real de WhatsApp.`
+        : `Se inició un intento de recuperación para ${eligibleGroups} grupo(s). Revisa los contadores de solicitudes y mensajes recibidos; iniciar el intento no confirma que se hayan recuperado fotos.${missingReferences ? ` Otros ${missingReferences} grupo(s) siguen sin referencia reciente.` : ''}`;
+    return { status, message, eligibleGroups, missingReferences, ...schedule,
+      references: references.map((row) => ({ name: row.name, lastReferenceAt: row.timestampMs === null ? null : new Date(row.timestampMs).toISOString() })) };
+  }
+  function recordHistoryAttempt(sessionId: string) {
+    const attempt = historyAttemptInfo(sessionId);
+    audit(db, `supplier.history.recovery.${attempt.status === 'requesting' ? 'requested' : attempt.status}`, 'whatsapp_session', sessionId, attempt);
+    return attempt;
+  }
+
   app.get('/api/health', async () => ({ ok: true, mode: messagingEnabled ? 'experimental' : 'simulation', connected: Boolean(sessionRegistry?.get('main')?.status().status === 'connected' || whatsapp?.status().status === 'connected'), distribution: distributionFor('main')?.status() ?? 'stopped' }));
 
   app.get<{ Querystring: { sessionId?: string } }>('/api/image-engine', async (request, reply) => {
@@ -246,10 +273,11 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     await supplierReception?.scheduleChanged(account.id);
     const connector = connectorFor(account.id);
     let recoveryRequested = false;
+    let historyRecovery: ReturnType<typeof historyAttemptInfo> | undefined;
     if (messagingEnabled && connector?.status().status === 'connected' && connector.requestHistory) {
-      await connector.requestHistory(); recoveryRequested = true;
+      await connector.requestHistory(); historyRecovery = recordHistoryAttempt(account.id); recoveryRequested = historyRecovery.status === 'requesting';
     }
-    return { ok: true, recoveryRequested, receptionSchedule: { ...input.data, timeZone: 'America/Bogota' }, receptionQueue: receptionFor(account.id) };
+    return { ok: true, recoveryRequested, historyRecovery, message: historyRecovery?.message ?? 'Rango guardado. Se intentará recuperar el historial al conectar WhatsApp.', receptionSchedule: { ...input.data, timeZone: 'America/Bogota' }, receptionQueue: receptionFor(account.id) };
   });
 
   app.post<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/recover-history', async (request, reply) => {
@@ -259,8 +287,8 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     if (!messagingEnabled || connector?.status().status !== 'connected' || !connector.requestHistory) return reply.code(409).send({ error: 'Conecta WhatsApp antes de solicitar la recuperación del historial.' });
     try {
       await connector.requestHistory();
-      audit(db, 'supplier.history.recovery.requested', 'whatsapp_session', account.id, {});
-      return reply.code(202).send({ ok: true, receptionQueue: receptionFor(account.id) });
+      const historyRecovery = recordHistoryAttempt(account.id);
+      return reply.code(202).send({ ok: true, historyRecovery, message: historyRecovery.message, receptionQueue: receptionFor(account.id) });
     } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : 'No se pudo iniciar la recuperación.' }); }
   });
 
