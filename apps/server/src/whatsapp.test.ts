@@ -173,6 +173,47 @@ describe('Baileys QR pairing lifecycle', () => {
     await connector.disconnect(); await reception.close(); db.close();
   });
 
+  it('reports undecryptable supplier messages safely and accepts a later decrypted delivery without duplicates', async () => {
+    const clock = Date.parse('2026-10-24T10:52:00-05:00');
+    vi.spyOn(Date, 'now').mockReturnValue(clock);
+    const directory = mkdtempSync(join(tmpdir(), 'tenis-decrypt-retry-')); directories.push(directory);
+    const db = openDatabase(join(directory, 'business.sqlite'));
+    const now = new Date(clock).toISOString();
+    db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES ('provider','main','provider@g.us','Proveedor',0,?,?)").run(now, now);
+    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='07:00',reception_end_time='22:00' WHERE session_id='main'").run();
+    const logger = pino({ level: 'silent' }) as unknown as FastifyBaseLogger;
+    const ingestion = new SupplierIngestionService(db, directory, logger);
+    const reception = new SupplierReceptionService(db, directory, ingestion, logger, () => clock);
+    const socket = fakeSocket(); mocks.makeWASocket.mockReturnValue(socket);
+    const connector = new BaileysConnector(db, logger, true, ingestion, 'main', reception);
+    await connector.connect();
+    socket.ev.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(connector.status().status).toBe('connected'));
+    const key = { remoteJid: 'provider@g.us', id: 'retry-photo', participant: 'vendor@s.whatsapp.net', fromMe: false };
+    const failed = { key, messageTimestamp: clock / 1000, messageStubType: proto.WebMessageInfo.StubType.CIPHERTEXT, messageStubParameters: ['synthetic-secret-must-not-be-logged'] };
+    socket.ev.emit('messaging-history.set', { syncType: proto.HistorySync.HistorySyncType.RECENT, messages: [failed] });
+    await vi.waitFor(() => expect(reception.snapshot('main').failedCount).toBe(1));
+    expect(reception.snapshot('main').recoveryMessageCount).toBe(0);
+    expect(connector.status().status).toBe('connected');
+    expect(db.prepare('SELECT COUNT(*) as n FROM products').get()).toEqual({ n: 0 });
+    expect(mocks.downloadMediaMessage).not.toHaveBeenCalled();
+    socket.ev.emit('messages.upsert', { type: 'notify', messages: [failed] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(db.prepare("SELECT COUNT(*) as n FROM application_logs WHERE action='supplier.message.decrypt.failed'").get()).toEqual({ n: 1 });
+    expect(JSON.stringify(db.prepare('SELECT message,details_json FROM application_logs').all())).not.toContain('synthetic-secret');
+    mocks.downloadMediaMessage.mockResolvedValue(Buffer.from([0xff, 0xd8, 0xff, 0x00]));
+    const recovered = { key, messageTimestamp: clock / 1000, message: { imageMessage: { mimetype: 'image/jpeg', caption: 'COD 143 PRECIO $60.000' } } };
+    socket.ev.emit('messages.upsert', { type: 'notify', messages: [recovered] });
+    await vi.waitFor(() => expect(reception.snapshot('main').failedCount).toBe(0));
+    expect(db.prepare('SELECT COUNT(*) as n FROM products').get()).toEqual({ n: 1 });
+    expect(db.prepare("SELECT COUNT(*) as n FROM application_logs WHERE action='supplier.message.decrypt.recovered'").get()).toEqual({ n: 1 });
+    socket.ev.emit('messages.upsert', { type: 'notify', messages: [recovered, failed] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(db.prepare('SELECT COUNT(*) as n FROM products').get()).toEqual({ n: 1 });
+    expect(reception.snapshot('main').failedCount).toBe(0);
+    await connector.disconnect(); await reception.close(); db.close();
+  });
+
   it('processes recent history events only from active supplier groups and rejects a full-history request', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-22T17:00:00-05:00'));
     const directory = mkdtempSync(join(tmpdir(), 'tenis-history-sync-'));

@@ -38,6 +38,7 @@ export type WhatsAppReceptionDiagnostics = {
 };
 
 const MAX_APPENDED_SUPPLIER_MESSAGE_AGE_MS = 24 * 60 * 60 * 1000;
+const DECRYPTION_PENDING = 'WhatsApp no pudo descifrar este mensaje. Se espera una nueva entrega antes de incorporarlo al catálogo.';
 const ACCEPTED_HISTORY_TYPES = new Set<number>([
   proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP,
   proto.HistorySync.HistorySyncType.RECENT,
@@ -196,7 +197,7 @@ export class BaileysConnector implements WhatsAppConnector {
             const eligibleCount = ordered.filter((message) => {
               const groupId = message.key.remoteJid;
               const timestampMs = Number(message.messageTimestamp ?? 0) * 1000;
-              if (message.key.fromMe || !groupId?.endsWith('@g.us') || !message.key.id || !this.supplierIngestion?.isSupplierGroup(groupId, this.sessionId)
+              if (message.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT || message.key.fromMe || !groupId?.endsWith('@g.us') || !message.key.id || !this.supplierIngestion?.isSupplierGroup(groupId, this.sessionId)
                 || isLiveMessage(type, timestampMs, this.liveSinceMs) || !this.acceptsMessage(type, timestampMs)) return false;
               const seen = this.db.prepare('SELECT 1 FROM whatsapp_source_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(this.sessionId, groupId, message.key.id)
                 ?? this.db.prepare("SELECT 1 FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=? AND status<>'failed'").get(this.sessionId, groupId, message.key.id);
@@ -314,10 +315,20 @@ export class BaileysConnector implements WhatsAppConnector {
       writeApplicationLog(this.db, { sessionId: this.sessionId, level: 'warning', category: 'products', action: 'product.received.too_old', entityType: 'whatsapp_group', entityId: groupId, message: 'Se omitió un mensaje del proveedor con más de 24 horas', details: { supplierName, upsertType } });
       return;
     }
-    const inbox = this.db.prepare('SELECT status FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(this.sessionId, groupId, messageId) as { status: string } | undefined;
+    const inbox = this.db.prepare('SELECT status,error FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(this.sessionId, groupId, messageId) as { status: string; error: string | null } | undefined;
     const ledger = this.db.prepare('SELECT 1 FROM whatsapp_source_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(this.sessionId, groupId, messageId);
     if (ledger || inbox && inbox.status !== 'failed') {
       this.reception = { ...this.reception, lastSupplierResult: inbox?.status === 'pending' ? 'pending' : 'duplicate' };
+      return;
+    }
+    if (message.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT) {
+      this.reception = { ...this.reception, lastSupplierResult: 'error' };
+      if (inbox?.error !== DECRYPTION_PENDING) {
+        this.supplierReception?.recordUnsupported(this.sessionId, groupId, messageId, messageTimestampMs, DECRYPTION_PENDING);
+        writeApplicationLog(this.db, { sessionId: this.sessionId, level: 'warning', category: 'connection', action: 'supplier.message.decrypt.failed', entityType: 'whatsapp_group', entityId: groupId,
+          message: 'No se pudo descifrar una publicación del proveedor. Se espera un reintento de WhatsApp; si persiste, vuelve a conectar esta cuenta.', details: { supplierName, messageId } });
+        this.logger.warn({ sessionId: this.sessionId, groupId, messageId }, 'Publicación del proveedor pendiente de descifrado');
+      }
       return;
     }
     const content = normalizeMessageContent(message.message);
@@ -348,6 +359,8 @@ export class BaileysConnector implements WhatsAppConnector {
       if (this.supplierReception) {
         const outcome = await this.supplierReception.capture(payload, upsertType === 'history');
         this.reception = { ...this.reception, lastSupplierResult: outcome === 'stored' ? 'stored' : outcome === 'failed' ? 'error' : outcome === 'pending' ? 'pending' : outcome === 'outside_window' ? 'outside_recovery_window' : 'duplicate' };
+        if (outcome === 'stored' && inbox?.error === DECRYPTION_PENDING) writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'connection', action: 'supplier.message.decrypt.recovered', entityType: 'whatsapp_group', entityId: groupId,
+          message: 'WhatsApp volvió a entregar la publicación descifrada y se incorporó al catálogo', details: { supplierName, messageId } });
       } else {
         await this.supplierIngestion.receive(payload);
         this.reception = { ...this.reception, lastSupplierResult: 'stored' };

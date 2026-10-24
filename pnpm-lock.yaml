@@ -7,6 +7,9 @@ settings:
 overrides:
   libsignal: 6.0.0
 
+patchedDependencies:
+  libsignal@6.0.0: be03050f5c8f9816322a707a6fdcf11ad84656e14e15f5440bb86f39b8cb7af1
+
 importers:
 
   .:
@@ -2687,7 +2690,7 @@ snapshots:
       '@hapi/boom': 9.1.4
       async-mutex: 0.5.0
       axios: 1.20.0(debug@4.4.3)
-      libsignal: 6.0.0
+      libsignal: 6.0.0(patch_hash=be03050f5c8f9816322a707a6fdcf11ad84656e14e15f5440bb86f39b8cb7af1)
       music-metadata: 11.16.1
       pino: 9.14.0
       protobufjs: 7.6.6
@@ -3155,7 +3158,7 @@ snapshots:
     dependencies:
       '@keyv/serialize': 1.1.1
 
-  libsignal@6.0.0:
+  libsignal@6.0.0(patch_hash=be03050f5c8f9816322a707a6fdcf11ad84656e14e15f5440bb86f39b8cb7af1):
     dependencies:
       curve25519-js: 0.0.4
       protobufjs: 7.6.6
