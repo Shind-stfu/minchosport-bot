@@ -57,6 +57,22 @@ function fakeSocket(): FakeSocket {
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
 describe('Baileys QR pairing lifecycle', () => {
+  it('keeps the existing browser profile when reconnecting a registered session', async () => {
+    mocks.authState.creds = { registered: false, me: { id: 'already-linked@s.whatsapp.net' } };
+    try {
+      const directory = mkdtempSync(join(tmpdir(), 'tenis-registered-session-')); directories.push(directory);
+      const db = openDatabase(join(directory, 'business.sqlite'));
+      const logger = pino({ level: 'silent' }) as unknown as FastifyBaseLogger;
+      const socket = fakeSocket(); mocks.makeWASocket.mockReturnValue(socket);
+      const connector = new BaileysConnector(db, logger, true, new SupplierIngestionService(db, directory, logger));
+      await connector.connect();
+      const options = mocks.makeWASocket.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      expect(options.syncFullHistory).toBe(false);
+      expect(options).not.toHaveProperty('browser');
+      await connector.disconnect(); db.close();
+    } finally { mocks.authState.creds = {}; }
+  });
+
   it('persists pairing credentials before reconnecting after restartRequired (515)', async () => {
     mocks.timeline.length = 0;
     mocks.authState.creds = {};
@@ -153,7 +169,7 @@ describe('Baileys QR pairing lifecycle', () => {
     await connector.connect();
     const options = mocks.makeWASocket.mock.calls.at(-1)?.[0] as { shouldSyncHistoryMessage: (notification: { syncType: number }) => boolean };
     expect(options.shouldSyncHistoryMessage({ syncType: proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP })).toBe(true);
-    expect(options.shouldSyncHistoryMessage({ syncType: proto.HistorySync.HistorySyncType.FULL })).toBe(false);
+    expect(options.shouldSyncHistoryMessage({ syncType: proto.HistorySync.HistorySyncType.FULL })).toBe(true);
     const chats = [
       { id: 'provider@g.us', messages: [{ message: { key: { remoteJid: 'provider@g.us', id: 'real-chat-reference', participant: 'vendor@s.whatsapp.net', fromMe: false }, messageTimestamp: Date.parse('2026-10-24T10:30:00-05:00') / 1000, message: { conversation: 'Este contenido no se incorpora al catálogo' } } }] },
       { id: 'timestamp-only@g.us', lastMessageRecvTimestamp: clock / 1000 },
@@ -161,15 +177,43 @@ describe('Baileys QR pairing lifecycle', () => {
     ];
     socket.ev.emit(eventName, eventName === 'messaging-history.set' ? { chats, messages: [], syncType: proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP } : chats);
     expect(db.prepare('SELECT group_jid,message_id FROM whatsapp_history_anchors').all()).toEqual([{ group_jid: 'provider@g.us', message_id: 'real-chat-reference' }]);
+    await vi.waitFor(() => expect(connector.status().reception?.lastUpsertAt).not.toBeNull());
     expect(db.prepare('SELECT COUNT(*) as count FROM supplier_inbox_messages').get()).toEqual({ count: 0 });
     expect(db.prepare('SELECT COUNT(*) as count FROM products').get()).toEqual({ count: 0 });
     expect(mocks.downloadMediaMessage).not.toHaveBeenCalled();
     const now = new Date(clock).toISOString();
     db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES ('provider','main','provider@g.us','Proveedor',0,?,?)").run(now, now);
     socket.ev.emit('connection.update', { connection: 'open' });
-    await vi.waitFor(() => expect(socket.fetchMessageHistory).toHaveBeenCalledWith(100,
+    await vi.waitFor(() => expect(socket.fetchMessageHistory).toHaveBeenCalledWith(50,
       { remoteJid: 'provider@g.us', id: 'real-chat-reference', participant: 'vendor@s.whatsapp.net', fromMe: false }, Date.parse('2026-10-24T10:30:00-05:00')));
     expect(reception.snapshot('main')).toMatchObject({ recoveryRequestedGroups: 1, recoveryMissingAnchors: 0, recoveryMessageCount: 0 });
+    await connector.disconnect(); await reception.close(); db.close();
+  });
+
+  it.each(['chats.upsert', 'messaging-history.set'])('captures a supplier photo included only in %s chat metadata', async (eventName) => {
+    const clock = Date.parse('2026-10-26T16:22:00-05:00');
+    vi.spyOn(Date, 'now').mockReturnValue(clock);
+    const directory = mkdtempSync(join(tmpdir(), 'tenis-chat-photo-')); directories.push(directory);
+    const db = openDatabase(join(directory, 'business.sqlite'));
+    const now = new Date(clock).toISOString();
+    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='14:30',reception_end_time='16:10' WHERE session_id='main'").run();
+    db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES ('martin','main','martin@g.us','martin informa',0,?,?)").run(now, now);
+    const logger = pino({ level: 'silent' }) as unknown as FastifyBaseLogger;
+    const ingestion = new SupplierIngestionService(db, directory, logger);
+    const reception = new SupplierReceptionService(db, directory, ingestion, logger, () => clock);
+    mocks.downloadMediaMessage.mockResolvedValue(Buffer.from([0xff, 0xd8, 0xff, 0x00]));
+    const socket = fakeSocket(); mocks.makeWASocket.mockReturnValue(socket);
+    const connector = new BaileysConnector(db, logger, true, ingestion, 'main', reception);
+    await connector.connect();
+    const photo = { key: { remoteJid: 'martin@g.us', id: 'photo-1541', participant: 'vendor@s.whatsapp.net', fromMe: false },
+      messageTimestamp: Date.parse('2026-10-26T15:41:51-05:00') / 1000,
+      message: { imageMessage: { mimetype: 'image/jpeg', caption: 'REF 595 D PRECIO $50.000' } } };
+    const chats = [{ id: 'martin@g.us', messages: [{ message: photo }] }];
+    socket.ev.emit(eventName, eventName === 'messaging-history.set' ? { syncType: proto.HistorySync.HistorySyncType.FULL, chats, messages: [] } : chats);
+    await vi.waitFor(() => expect(db.prepare('SELECT COUNT(*) as count FROM products').get()).toEqual({ count: 1 }));
+    expect(db.prepare('SELECT message_id FROM whatsapp_source_messages').get()).toEqual({ message_id: 'photo-1541' });
+    expect(db.prepare('SELECT message_id FROM whatsapp_history_anchors').get()).toEqual({ message_id: 'photo-1541' });
+    expect(mocks.downloadMediaMessage).toHaveBeenCalledTimes(1);
     await connector.disconnect(); await reception.close(); db.close();
   });
 
@@ -214,7 +258,7 @@ describe('Baileys QR pairing lifecycle', () => {
     await connector.disconnect(); await reception.close(); db.close();
   });
 
-  it('processes recent history events only from active supplier groups and rejects a full-history request', async () => {
+  it('processes recent history events only from active supplier groups and accepts full history', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-22T17:00:00-05:00'));
     const directory = mkdtempSync(join(tmpdir(), 'tenis-history-sync-'));
     directories.push(directory);
@@ -233,7 +277,7 @@ describe('Baileys QR pairing lifecycle', () => {
     expect(socketOptions.shouldSyncHistoryMessage({ syncType: proto.HistorySync.HistorySyncType.RECENT })).toBe(true);
     expect(socketOptions.shouldSyncHistoryMessage({ syncType: proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP })).toBe(true);
     expect(socketOptions.shouldSyncHistoryMessage({ syncType: proto.HistorySync.HistorySyncType.ON_DEMAND })).toBe(true);
-    expect(socketOptions.shouldSyncHistoryMessage({ syncType: proto.HistorySync.HistorySyncType.FULL })).toBe(false);
+    expect(socketOptions.shouldSyncHistoryMessage({ syncType: proto.HistorySync.HistorySyncType.FULL })).toBe(true);
     socket.ev.emit('connection.update', { connection: 'open' });
     await vi.waitFor(() => expect(db.prepare("SELECT recovery_status FROM supplier_reception_state WHERE session_id='main'").get()).toEqual({ recovery_status: 'waiting' }));
     const nowMs = Date.now();
@@ -250,7 +294,7 @@ describe('Baileys QR pairing lifecycle', () => {
     db.close();
   });
 
-  it.each(['initial', 'recent', 'on-demand', 'append', 'notify'] as const)('recovers only 4–6 p.m. photos delivered by %s at 7 p.m. and continues receiving live photos', async (kind) => {
+  it.each(['initial', 'full', 'recent', 'on-demand', 'append', 'notify'] as const)('recovers only 4–6 p.m. photos delivered by %s at 7 p.m. and continues receiving live photos', async (kind) => {
     let clock = Date.parse('2026-10-22T19:00:00-05:00');
     vi.spyOn(Date, 'now').mockImplementation(() => clock);
     const directory = mkdtempSync(join(tmpdir(), 'tenis-recovery-range-')); directories.push(directory);
@@ -265,9 +309,9 @@ describe('Baileys QR pairing lifecycle', () => {
     const socket = fakeSocket(); mocks.makeWASocket.mockReturnValue(socket);
     const connector = new BaileysConnector(db, logger, true, ingestion, 'main', reception);
     await connector.connect();
-    const syncType = kind === 'initial' ? proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP : kind === 'on-demand' ? proto.HistorySync.HistorySyncType.ON_DEMAND : proto.HistorySync.HistorySyncType.RECENT;
+    const syncType = kind === 'initial' ? proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP : kind === 'full' ? proto.HistorySync.HistorySyncType.FULL : kind === 'on-demand' ? proto.HistorySync.HistorySyncType.ON_DEMAND : proto.HistorySync.HistorySyncType.RECENT;
     const options = mocks.makeWASocket.mock.calls.at(-1)?.[0];
-    expect(options.syncFullHistory).toBe(false);
+    expect(options.syncFullHistory).toBe(true);
     expect(options.shouldSyncHistoryMessage({ syncType })).toBe(true);
     const photo = (id: string, date: string) => ({ key: { remoteJid: 'provider@g.us', id, participant: 'vendor@s.whatsapp.net', fromMe: false }, messageTimestamp: Date.parse(date) / 1000, message: { imageMessage: { mimetype: 'image/jpeg', caption: 'COD 143 PRECIO $60.000' } } });
     const messages = [
@@ -283,7 +327,7 @@ describe('Baileys QR pairing lifecycle', () => {
     expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'received', recoveryMessageCount: 2, pendingCount: 0 });
     expect(mocks.downloadMediaMessage).toHaveBeenCalledTimes(2);
     expect(db.prepare('SELECT message_id FROM whatsapp_source_messages ORDER BY message_id').all()).toEqual([{ message_id: 'at-start' }, { message_id: 'within-range' }]);
-    socket.ev.emit('messaging-history.set', { syncType: proto.HistorySync.HistorySyncType.FULL, messages: [photo('ignore-full', '2026-10-22T17:00:00-05:00')] });
+    socket.ev.emit('messaging-history.set', { syncType: proto.HistorySync.HistorySyncType.FULL, messages: [photo('within-range', '2026-10-22T17:59:59-05:00')] });
     deliver();
     // A new append event at 7:05 p.m. must bypass the 4–6 p.m. recovery filter.
     clock = Date.parse('2026-10-22T19:05:00-05:00');

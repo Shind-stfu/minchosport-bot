@@ -4,7 +4,7 @@ import type { SupplierReceptionService } from './supplier-reception.js';
 import { readReceptionSchedule, recoveryEndTimestampMs, recoveryStartTimestampMs } from './reception-schedule.js';
 import { writeApplicationLog } from './application-log.js';
 
-const PAGE_SIZE = 100;
+const PAGE_SIZE = 50;
 const MAX_PAGES_PER_GROUP = 20;
 const REQUEST_INTERVAL_MS = 1000;
 type Cursor = { groupId: string; messageId: string; timestampMs: number; fromMe: number; participantId: string | null };

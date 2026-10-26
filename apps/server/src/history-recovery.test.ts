@@ -105,7 +105,7 @@ describe('explicit supplier history requests', () => {
     history.observe([message('latest', '20:10:00')]);
     history.start();
     await vi.advanceTimersByTimeAsync(0);
-    expect(fetchHistory).toHaveBeenCalledWith(100, { id: 'latest', remoteJid: 'provider@g.us', fromMe: false, participant: 'vendor@s.whatsapp.net' }, Date.parse('2026-10-22T20:10:00-05:00'));
+    expect(fetchHistory).toHaveBeenCalledWith(50, { id: 'latest', remoteJid: 'provider@g.us', fromMe: false, participant: 'vendor@s.whatsapp.net' }, Date.parse('2026-10-22T20:10:00-05:00'));
     expect(reception.snapshot('main')).toMatchObject({ recoveryRequestedGroups: 1, recoveryMissingAnchors: 0, recoveryMessageCount: 0, recoveryStatus: 'waiting' });
     history.observe([message('page-one-newer', '19:50:00'), message('page-one-oldest', '19:30:00')], true, 'request-1');
     await vi.advanceTimersByTimeAsync(1000);

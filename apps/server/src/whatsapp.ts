@@ -1,4 +1,4 @@
-import makeWASocket, { DisconnectReason, downloadMediaMessage, normalizeMessageContent, proto } from '@whiskeysockets/baileys';
+import makeWASocket, { Browsers, DisconnectReason, downloadMediaMessage, normalizeMessageContent, proto } from '@whiskeysockets/baileys';
 import type { Chat, WAMessage } from '@whiskeysockets/baileys';
 import type { FastifyBaseLogger } from 'fastify';
 import { Boom } from '@hapi/boom';
@@ -41,6 +41,7 @@ const MAX_APPENDED_SUPPLIER_MESSAGE_AGE_MS = 24 * 60 * 60 * 1000;
 const DECRYPTION_PENDING = 'WhatsApp no pudo descifrar este mensaje. Se espera una nueva entrega antes de incorporarlo al catálogo.';
 const ACCEPTED_HISTORY_TYPES = new Set<number>([
   proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP,
+  proto.HistorySync.HistorySyncType.FULL,
   proto.HistorySync.HistorySyncType.RECENT,
   proto.HistorySync.HistorySyncType.ON_DEMAND,
 ]);
@@ -102,14 +103,19 @@ export class BaileysConnector implements WhatsAppConnector {
       const { state, saveCreds } = await auth.state();
       const skippedHistoryTypes = new Set<number>();
       const hasSuppliers = () => Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId));
-      const socket = makeWASocket({ auth: state, logger: baileysLogger, printQRInTerminal: false, markOnlineOnConnect: false, syncFullHistory: false,
+      // A saved identity can remain present even if Baileys reports a stale
+      // registered flag after a failed reconnect. Keep its original profile.
+      const newPairing = !state.creds.me;
+      const socket = makeWASocket({ auth: state, logger: baileysLogger, printQRInTerminal: false, markOnlineOnConnect: false,
+        ...(newPairing && this.supplierIngestion ? { browser: Browsers.macOS('Desktop') } : {}),
+        syncFullHistory: newPairing && Boolean(this.supplierIngestion),
         shouldSyncHistoryMessage: (notification) => {
           if (notification.syncType == null || !this.supplierIngestion) return false;
           const accepted = ACCEPTED_HISTORY_TYPES.has(notification.syncType);
           if (!accepted && !skippedHistoryTypes.has(notification.syncType)) {
             skippedHistoryTypes.add(notification.syncType);
             writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'connection', action: 'supplier.history.type.skipped', entityType: 'whatsapp_session', entityId: this.sessionId,
-              message: 'Se omitió una sincronización de historial completo o de metadatos', details: { syncType: notification.syncType } });
+              message: 'Se omitió una sincronización de metadatos', details: { syncType: notification.syncType } });
           }
           return accepted;
         } });
@@ -221,6 +227,11 @@ export class BaileysConnector implements WhatsAppConnector {
           return message?.key && message.key.remoteJid === chat.id ? [message as WAMessage] : [];
         }));
         this.historyRecovery.observe(references);
+        // Some chat syncs place the newest message in chats rather than in
+        // event.messages. A history request starts before that key, so its
+        // photo must be captured from the chat payload when present.
+        const withContent = references.filter((message) => Boolean(message.message));
+        if (withContent.length) enqueueMessages(withContent, 'history');
       };
       socket.ev.on('chats.upsert', observeChatReferences);
       socket.ev.on('chats.update', observeChatReferences);
