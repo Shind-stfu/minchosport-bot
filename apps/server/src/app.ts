@@ -22,7 +22,6 @@ import { removeProductImages, removeProducts } from './product-cleanup.js';
 import type { SupplierReceptionService } from './supplier-reception.js';
 import QRCode from 'qrcode';
 import { readReceptionSchedule, recoveryStartTimestampMs } from './reception-schedule.js';
-import { importWhatsAppChatZip } from './chat-export-import.js';
 
 class ApprovalError extends Error {
   constructor(readonly statusCode: number, message: string) { super(message); }
@@ -291,31 +290,6 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       const historyRecovery = recordHistoryAttempt(account.id);
       return reply.code(202).send({ ok: true, historyRecovery, message: historyRecovery.message, receptionQueue: receptionFor(account.id) });
     } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : 'No se pudo iniciar la recuperación.' }); }
-  });
-
-  app.post<{ Params: { sessionId: string }; Querystring: { groupId?: string } }>('/api/sessions/:sessionId/import-chat', async (request, reply) => {
-    const account = sessionRow(request.params.sessionId);
-    if (!account) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
-    if (!supplierReception) return reply.code(503).send({ error: 'La bandeja de proveedores no está disponible.' });
-    const groupId = request.query.groupId;
-    if (!groupId || !db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL').get(account.id, groupId))
-      return reply.code(400).send({ error: 'Selecciona un grupo proveedor activo.' });
-    if (!request.isMultipart()) return reply.code(415).send({ error: 'Adjunta el ZIP exportado desde WhatsApp.' });
-    const directory = join(dataDirectory, 'tmp');
-    mkdirSync(directory, { recursive: true });
-    const path = join(directory, `${randomUUID()}.chat.zip`);
-    try {
-      const part = await request.file({ limits: { files: 1, fileSize: 250 * 1024 * 1024, fields: 0 } });
-      if (!part || part.mimetype !== 'application/zip' && !part.filename.toLowerCase().endsWith('.zip'))
-        return reply.code(400).send({ error: 'Selecciona una exportación de chat en formato ZIP con archivos multimedia.' });
-      await pipeline(part.file, createWriteStream(path, { flags: 'wx' }));
-      if (part.file.truncated) return reply.code(413).send({ error: 'El ZIP supera el límite de 250 MiB.' });
-      const result = await importWhatsAppChatZip({ path, db, reception: supplierReception, sessionId: account.id, groupId });
-      audit(db, 'supplier.chat_export.imported', 'whatsapp_session', account.id, { groupId, ...result });
-      return { ok: true, result, message: `Importación terminada: ${result.imported} foto(s) incorporadas, ${result.pending} pendiente(s), ${result.duplicate} repetida(s), ${result.outsideRange} mensaje(s) fuera del horario, ${result.missingMedia} imagen(es) sin archivo y ${result.failed} con error. No se hicieron envíos.` };
-    } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'No se pudo importar el chat.' });
-    } finally { rmSync(path, { force: true }); }
   });
 
   app.get<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/reception', async (request, reply) => {
