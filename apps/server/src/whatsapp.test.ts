@@ -57,6 +57,57 @@ function fakeSocket(): FakeSocket {
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
 describe('Baileys QR pairing lifecycle', () => {
+  it('reconnects a linked session after a transient close and cancels retries after an explicit disconnect', async () => {
+    vi.useFakeTimers();
+    mocks.authState.creds = { me: { id: 'linked@s.whatsapp.net' } };
+    try {
+      const directory = mkdtempSync(join(tmpdir(), 'tenis-reconnect-')); directories.push(directory);
+      const db = openDatabase(join(directory, 'business.sqlite'));
+      const logger = pino({ level: 'silent' }) as unknown as FastifyBaseLogger;
+      const sockets: FakeSocket[] = [];
+      mocks.makeWASocket.mockImplementation(() => { const socket = fakeSocket(); sockets.push(socket); return socket; });
+      const connector = new BaileysConnector(db, logger, true);
+      await connector.connect();
+      const close = { connection: 'close', lastDisconnect: { error: Object.assign(new Error('Connection lost'), { output: { statusCode: 408 } }) } };
+      sockets[0]!.ev.emit('connection.update', close);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(connector.status().status).toBe('disconnected');
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(sockets).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sockets).toHaveLength(2);
+      sockets[1]!.ev.emit('connection.update', { connection: 'open' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(connector.status().status).toBe('connected');
+      sockets[1]!.ev.emit('connection.update', close);
+      await vi.advanceTimersByTimeAsync(0);
+      await connector.disconnect();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sockets).toHaveLength(2);
+      db.close();
+    } finally { mocks.authState.creds = {}; vi.useRealTimers(); }
+  });
+
+  it.each([
+    { name: 'an unpaired QR session', creds: {}, status: 408 },
+    { name: 'a replaced linked session', creds: { me: { id: 'linked@s.whatsapp.net' } }, status: DisconnectReason.connectionReplaced },
+  ])('does not automatically reconnect $name', async ({ creds, status }) => {
+    vi.useFakeTimers();
+    mocks.authState.creds = creds;
+    try {
+      const directory = mkdtempSync(join(tmpdir(), 'tenis-no-reconnect-')); directories.push(directory);
+      const db = openDatabase(join(directory, 'business.sqlite'));
+      const logger = pino({ level: 'silent' }) as unknown as FastifyBaseLogger;
+      const socket = fakeSocket(); mocks.makeWASocket.mockReturnValue(socket);
+      const connector = new BaileysConnector(db, logger, true);
+      await connector.connect();
+      socket.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: Object.assign(new Error('Closed'), { output: { statusCode: status } }) } });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mocks.makeWASocket).toHaveBeenCalledTimes(1);
+      await connector.disconnect(); db.close();
+    } finally { mocks.authState.creds = {}; vi.useRealTimers(); }
+  });
+
   it('keeps the existing browser profile when reconnecting a registered session', async () => {
     mocks.authState.creds = { registered: false, me: { id: 'already-linked@s.whatsapp.net' } };
     try {

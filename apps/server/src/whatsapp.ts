@@ -80,6 +80,9 @@ export class BaileysConnector implements WhatsAppConnector {
   private nextGroupRefreshAt = 0;
   private liveSinceMs = 0;
   private historyRecovery: HistoryRecovery | undefined;
+  private reconnectTimer: NodeJS.Timeout | undefined;
+  private reconnectAttempts = 0;
+  private keepConnected = false;
   private reception: WhatsAppReceptionDiagnostics = this.emptyReceptionDiagnostics();
 
   constructor(private readonly db: AppDatabase, private readonly logger: FastifyBaseLogger, private readonly enabled: boolean, private readonly supplierIngestion?: SupplierIngestionService, readonly sessionId = 'main', private readonly supplierReception?: SupplierReceptionService) {}
@@ -90,6 +93,8 @@ export class BaileysConnector implements WhatsAppConnector {
 
   async connect() {
     if (!this.enabled) throw new Error('La integración está deshabilitada. Activa WHATSAPP_ENABLED=true para habilitarla.');
+    this.keepConnected = true;
+    this.clearReconnectTimer();
     if (this.starting || this.socket) return;
     this.starting = true;
     this.currentStatus = 'connecting';
@@ -156,6 +161,7 @@ export class BaileysConnector implements WhatsAppConnector {
           this.logger.info('WhatsApp aceptó el QR; completando el inicio de sesión');
         }
         if (update.connection === 'open') {
+          this.reconnectAttempts = 0;
           this.currentStatus = 'connected';
           this.qr = null;
           this.lastError = null;
@@ -177,6 +183,7 @@ export class BaileysConnector implements WhatsAppConnector {
             this.logger.info({ statusCode: status }, 'WhatsApp requiere reiniciar el socket para completar la vinculación');
             await this.connect();
           } else if (status === DisconnectReason.loggedOut) {
+            this.keepConnected = false;
             this.currentStatus = 'logged_out';
             this.clearStoredSession();
             this.lastError = 'WhatsApp cerró la sesión guardada. Genera un QR nuevo para volver a vincular.';
@@ -190,6 +197,8 @@ export class BaileysConnector implements WhatsAppConnector {
               : `La conexión se cerró${status ? ` (código ${status})` : ''}: ${detail}`;
             this.logger.warn({ statusCode: status, disconnectMessage: detail }, 'Conexión experimental de WhatsApp cerrada');
             writeApplicationLog(this.db, { sessionId: this.sessionId, level: 'warning', category: 'connection', action: 'whatsapp.session.disconnected', entityType: 'whatsapp_session', entityId: this.sessionId, message: 'La conexión de WhatsApp se cerró', details: { statusCode: typeof status === 'number' ? status : null } });
+            const transientClose = status == null || status === DisconnectReason.connectionClosed || status === DisconnectReason.connectionLost;
+            if (transientClose && state.creds.me?.id) this.scheduleReconnect();
           }
         }
       }));
@@ -253,6 +262,9 @@ export class BaileysConnector implements WhatsAppConnector {
   }
 
   async disconnect() {
+    this.keepConnected = false;
+    this.reconnectAttempts = 0;
+    this.clearReconnectTimer();
     const socket = this.socket;
     this.socket = undefined;
     this.historyRecovery?.stop(); this.historyRecovery = undefined;
@@ -266,6 +278,9 @@ export class BaileysConnector implements WhatsAppConnector {
     if (this.currentStatus === 'connected' || this.currentStatus === 'connecting' || this.starting) {
       throw new Error('Desconecta la sesión antes de restablecer la vinculación.');
     }
+    this.keepConnected = false;
+    this.reconnectAttempts = 0;
+    this.clearReconnectTimer();
     const socket = this.socket;
     this.socket = undefined;
     this.qr = null;
@@ -420,6 +435,26 @@ export class BaileysConnector implements WhatsAppConnector {
       this.logger.error({ err: loggingError }, 'No se pudo guardar el error de WhatsApp en el historial local');
     }
     this.logger.error({ err: error }, 'Error del adaptador experimental de WhatsApp');
+  }
+
+  private scheduleReconnect() {
+    if (!this.keepConnected || this.reconnectTimer) return;
+    const delayMs = Math.min(5_000 * 2 ** Math.min(this.reconnectAttempts, 4), 60_000);
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (!this.keepConnected || this.socket || this.starting) return;
+      void this.connect().catch((error: unknown) => {
+        this.logger.warn({ err: error, sessionId: this.sessionId }, 'Falló el intento de reconexión de WhatsApp');
+        this.scheduleReconnect();
+      });
+    }, delayMs);
+    this.reconnectTimer.unref();
+  }
+
+  private clearReconnectTimer() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
   }
 
   private clearStoredSession() {
