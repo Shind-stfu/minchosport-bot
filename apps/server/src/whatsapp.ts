@@ -1,4 +1,4 @@
-import makeWASocket, { Browsers, DisconnectReason, downloadMediaMessage, normalizeMessageContent, proto } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, downloadMediaMessage, normalizeMessageContent, proto } from '@whiskeysockets/baileys';
 import type { Chat, WAMessage } from '@whiskeysockets/baileys';
 import type { FastifyBaseLogger } from 'fastify';
 import { Boom } from '@hapi/boom';
@@ -107,7 +107,8 @@ export class BaileysConnector implements WhatsAppConnector {
       // registered flag after a failed reconnect. Keep its original profile.
       const newPairing = !state.creds.me;
       const socket = makeWASocket({ auth: state, logger: baileysLogger, printQRInTerminal: false, markOnlineOnConnect: false,
-        ...(newPairing && this.supplierIngestion ? { browser: Browsers.macOS('Desktop') } : {}),
+        // The macOS Desktop preset triggers 428 before a QR is issued on the
+        // current WhatsApp Web connection. Keep the working default profile.
         syncFullHistory: newPairing && Boolean(this.supplierIngestion),
         shouldSyncHistoryMessage: (notification) => {
           if (notification.syncType == null || !this.supplierIngestion) return false;

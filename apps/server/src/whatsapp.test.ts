@@ -312,6 +312,7 @@ describe('Baileys QR pairing lifecycle', () => {
     const syncType = kind === 'initial' ? proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP : kind === 'full' ? proto.HistorySync.HistorySyncType.FULL : kind === 'on-demand' ? proto.HistorySync.HistorySyncType.ON_DEMAND : proto.HistorySync.HistorySyncType.RECENT;
     const options = mocks.makeWASocket.mock.calls.at(-1)?.[0];
     expect(options.syncFullHistory).toBe(true);
+    expect(options).not.toHaveProperty('browser');
     expect(options.shouldSyncHistoryMessage({ syncType })).toBe(true);
     const photo = (id: string, date: string) => ({ key: { remoteJid: 'provider@g.us', id, participant: 'vendor@s.whatsapp.net', fromMe: false }, messageTimestamp: Date.parse(date) / 1000, message: { imageMessage: { mimetype: 'image/jpeg', caption: 'COD 143 PRECIO $60.000' } } });
     const messages = [
