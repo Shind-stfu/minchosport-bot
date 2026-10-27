@@ -174,13 +174,13 @@ export class SupplierReceptionService {
   }
 
   recordRecoveryRequests(sessionId: string, requested: number, missing: number, failed: number) {
-    const previous = this.db.prepare('SELECT recovery_requested_groups as requested,recovery_status as status FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { requested: number; status: string } | undefined;
+    const previous = this.db.prepare('SELECT recovery_requested_groups as requested,recovery_failed_requests as failed,recovery_status as status FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { requested: number; failed: number; status: string } | undefined;
     const warnings: string[] = [];
     if (missing) warnings.push(`${missing} grupo(s) sin una referencia de mensaje dentro o después del rango de hoy. Se intentará al recibir una referencia reciente de WhatsApp o un mensaje nuevo de esos grupos.`);
     if (failed) warnings.push(`No se completó la recuperación de historial de ${failed} grupo(s). Puedes volver a intentar la recuperación.`);
     this.db.prepare(`UPDATE supplier_reception_state SET recovery_requested_groups=?,recovery_missing_anchors=?,recovery_failed_requests=?,
       recovery_warning=? WHERE session_id=?`).run(requested, missing, failed, warnings.length ? warnings.join(' ') : RECOVERY_WARNING, sessionId);
-    if (previous?.status === 'unavailable' && requested > previous.requested) {
+    if (previous?.status === 'unavailable' && (requested > previous.requested || failed < previous.failed)) {
       this.db.prepare("UPDATE supplier_reception_state SET recovery_status='waiting',recovery_finished_at=NULL WHERE session_id=?").run(sessionId);
       this.armRecoveryTimeout(sessionId);
     }

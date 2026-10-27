@@ -169,14 +169,16 @@ describe('explicit supplier history requests', () => {
   });
 
   it('uses a fresh group message to retry after the phone ignored all requests', async () => {
-    const { history, fetchHistory, message } = setup();
+    const { history, fetchHistory, reception, message } = setup();
     history.observe([message('first-anchor', '20:10:00')]);
     history.start();
-    await vi.advanceTimersByTimeAsync(138_000);
+    await vi.advanceTimersByTimeAsync(151_000);
     expect(fetchHistory).toHaveBeenCalledTimes(3);
+    expect(reception.snapshot('main').recoveryStatus).toBe('unavailable');
     history.observe([message('fresh-anchor', '20:22:00')]);
     await vi.advanceTimersByTimeAsync(0);
     expect(fetchHistory.mock.calls[3]?.[1]).toMatchObject({ id: 'fresh-anchor' });
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'waiting', recoveryFailedRequests: 0 });
   });
 
   it('does not loop on repeated pages or let an old request paginate a new attempt', async () => {
