@@ -7,8 +7,10 @@ import { writeApplicationLog } from './application-log.js';
 const PAGE_SIZE = 50;
 const MAX_PAGES_PER_GROUP = 20;
 const REQUEST_INTERVAL_MS = 1000;
+const RESPONSE_TIMEOUT_MS = 45_000;
+const MAX_SILENT_ATTEMPTS = 3;
 type Cursor = { groupId: string; messageId: string; timestampMs: number; fromMe: number; participantId: string | null };
-type GroupRequest = { cursor: Cursor | undefined; upperBoundMs: number; requestIds: Set<string>; sentCursors: Set<string>; earlyPages: Map<string, Cursor[]>; awaitingAck: boolean; pages: number; pending: boolean; done: boolean; requested: boolean; failed: boolean };
+type GroupRequest = { cursor: Cursor | undefined; upperBoundMs: number; requestIds: Set<string>; sentCursors: Set<string>; earlyPages: Map<string, Cursor[]>; awaitingAck: boolean; pages: number; silentAttempts: number; responseTimer: NodeJS.Timeout | undefined; pending: boolean; done: boolean; requested: boolean; failed: boolean };
 
 /** Requests older messages using real group/message keys; never invent an anchor. */
 export class HistoryRecovery {
@@ -54,6 +56,7 @@ export class HistoryRecovery {
     this.active = false;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+    for (const state of this.groups.values()) if (state.responseTimer) clearTimeout(state.responseTimer);
     this.groups.clear(); this.queue.length = 0;
     this.pumping = false;
   }
@@ -79,9 +82,11 @@ export class HistoryRecovery {
       let state = this.groups.get(groupId);
       if (!state) continue;
       const latest = this.anchor(groupId);
-      // A persisted cursor can predate the end of the range. A newer event lets
-      // us cover the missing upper part instead of only fetching older photos.
-      if (latest && state.cursor && state.upperBoundMs < this.endMs && latest.timestampMs > state.upperBoundMs) {
+      // A newer real group message can open the missing upper part of the range
+      // or retry a request that the phone did not answer.
+      if (latest && state.cursor && latest.timestampMs > state.cursor.timestampMs &&
+          (state.upperBoundMs < this.endMs || state.failed || (!state.pending && state.silentAttempts > 0))) {
+        if (state.responseTimer) clearTimeout(state.responseTimer);
         state = this.groupRequest(latest);
         this.groups.set(groupId, state);
         this.enqueue(groupId);
@@ -90,7 +95,7 @@ export class HistoryRecovery {
       if (!state.cursor) {
         state.cursor = latest; state.upperBoundMs = latest?.timestampMs ?? 0;
         this.enqueue(groupId);
-      } else if (onDemand && state.pending) {
+      } else if (onDemand && (state.pending || Boolean(requestId && state.requestIds.has(requestId)))) {
         if (!requestId || state.requestIds.has(requestId)) this.acceptPage(groupId, state, batch);
         else if (state.awaitingAck) state.earlyPages.set(requestId, batch);
       }
@@ -106,7 +111,7 @@ export class HistoryRecovery {
   }
 
   private groupRequest(cursor: Cursor | undefined): GroupRequest {
-    return { cursor, upperBoundMs: cursor?.timestampMs ?? 0, requestIds: new Set(), sentCursors: new Set(), earlyPages: new Map(), awaitingAck: false, pages: 0, pending: false, done: false, requested: false, failed: false };
+    return { cursor, upperBoundMs: cursor?.timestampMs ?? 0, requestIds: new Set(), sentCursors: new Set(), earlyPages: new Map(), awaitingAck: false, pages: 0, silentAttempts: 0, responseTimer: undefined, pending: false, done: false, requested: false, failed: false };
   }
 
   private acceptPage(groupId: string, state: GroupRequest, batch: Cursor[]) {
@@ -116,6 +121,9 @@ export class HistoryRecovery {
     // Repeated pages must not trigger a request loop, including equal timestamps.
     if (!candidates.length) return;
     const oldest = candidates.reduce((a, b) => a.timestampMs < b.timestampMs ? a : b);
+    if (state.responseTimer) clearTimeout(state.responseTimer);
+    state.responseTimer = undefined;
+    state.silentAttempts = 0;
     state.pending = false; state.cursor = oldest;
     if (oldest.timestampMs < this.startMs) state.done = true;
     else if (state.pages >= MAX_PAGES_PER_GROUP) { state.done = true; state.failed = true; }
@@ -133,7 +141,7 @@ export class HistoryRecovery {
     if (!groupId) return;
     const state = this.groups.get(groupId);
     const cursor = state?.cursor;
-    if (!state || !cursor) return;
+    if (!state || !cursor || state.pending || state.done) { void this.pump(); return; }
     if (!this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL').get(this.sessionId, groupId)) {
       state.done = true; void this.pump(); return;
     }
@@ -150,6 +158,26 @@ export class HistoryRecovery {
       if (earlyPage) this.acceptPage(groupId, state, earlyPage);
       writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'connection', action: 'supplier.history.requested', entityType: 'whatsapp_group', entityId: groupId,
         message: 'Se solicitó al teléfono un lote de historial del grupo proveedor', details: { page: state.pages, pageSize: PAGE_SIZE } });
+      if (state.pending) {
+        state.responseTimer = setTimeout(() => {
+          state.responseTimer = undefined;
+          if (!this.active || revision !== this.revision || this.groups.get(groupId) !== state || !state.pending) return;
+          state.pending = false;
+          state.silentAttempts += 1;
+          if (state.silentAttempts < MAX_SILENT_ATTEMPTS) {
+            this.enqueue(groupId);
+            const retryTimer = setTimeout(() => { void this.pump(); }, REQUEST_INTERVAL_MS);
+            retryTimer.unref();
+          } else {
+            state.done = true;
+            state.failed = true;
+            writeApplicationLog(this.db, { sessionId: this.sessionId, level: 'warning', category: 'connection', action: 'supplier.history.no.response', entityType: 'whatsapp_group', entityId: groupId,
+              message: 'El teléfono no respondió a las solicitudes de historial para este grupo proveedor', details: { attempts: state.silentAttempts } });
+            this.report();
+          }
+        }, RESPONSE_TIMEOUT_MS);
+        state.responseTimer.unref();
+      }
     } catch {
       if (!this.active || revision !== this.revision || this.groups.get(groupId) !== state) return;
       state.failed = true; state.done = true; state.pending = false;

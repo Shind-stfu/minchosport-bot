@@ -177,7 +177,7 @@ export class SupplierReceptionService {
     const previous = this.db.prepare('SELECT recovery_requested_groups as requested,recovery_status as status FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { requested: number; status: string } | undefined;
     const warnings: string[] = [];
     if (missing) warnings.push(`${missing} grupo(s) sin una referencia de mensaje dentro o después del rango de hoy. Se intentará al recibir una referencia reciente de WhatsApp o un mensaje nuevo de esos grupos.`);
-    if (failed) warnings.push(`Falló la solicitud de historial de ${failed} grupo(s). Puedes volver a intentar la recuperación.`);
+    if (failed) warnings.push(`No se completó la recuperación de historial de ${failed} grupo(s). Puedes volver a intentar la recuperación.`);
     this.db.prepare(`UPDATE supplier_reception_state SET recovery_requested_groups=?,recovery_missing_anchors=?,recovery_failed_requests=?,
       recovery_warning=? WHERE session_id=?`).run(requested, missing, failed, warnings.length ? warnings.join(' ') : RECOVERY_WARNING, sessionId);
     if (previous?.status === 'unavailable' && requested > previous.requested) {
@@ -229,7 +229,7 @@ export class SupplierReceptionService {
   private recoveryWarning(sessionId: string, fallback: string) {
     const counts = this.db.prepare('SELECT recovery_missing_anchors as missing,recovery_failed_requests as failed FROM supplier_reception_state WHERE session_id=?').get(sessionId) as { missing: number; failed: number } | undefined;
     return [counts?.missing ? `${counts.missing} grupo(s) sin referencia de mensaje dentro o después del rango de hoy; se intentará al recibir una referencia reciente o un mensaje nuevo.` : '',
-      counts?.failed ? `Falló la solicitud de historial de ${counts.failed} grupo(s). Puedes volver a intentar.` : '', fallback].filter(Boolean).join(' ');
+      counts?.failed ? `No se completó la recuperación de historial de ${counts.failed} grupo(s). Puedes volver a intentar.` : '', fallback].filter(Boolean).join(' ');
   }
 
   private async drainSession(sessionId: string) {
@@ -299,7 +299,7 @@ export class SupplierReceptionService {
       writeApplicationLog(this.db, { sessionId, level: 'warning', category: 'connection', action: 'supplier.history.attempt.finished', entityType: 'whatsapp_session', entityId: sessionId,
         message: warning, details: { deliveredSupplierMessages: state.count, requestedGroups: state.requested, missingReferences: state.missing, failedRequests: state.failed }, createdAt: finishedAt });
       this.recoveryTimers.delete(sessionId);
-    }, 35_000);
+    }, 150_000);
     timer.unref();
     this.recoveryTimers.set(sessionId, timer);
   }

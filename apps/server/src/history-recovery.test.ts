@@ -90,7 +90,7 @@ describe('explicit supplier history requests', () => {
 
   it('does not blame the phone for no response when no request could be made, and starts after a real reference arrives', async () => {
     const { history, reception, fetchHistory, message } = setup();
-    history.start(); await vi.advanceTimersByTimeAsync(36_000);
+    history.start(); await vi.advanceTimersByTimeAsync(151_000);
     expect(fetchHistory).not.toHaveBeenCalled();
     expect(reception.snapshot('main').recoveryWarning).toContain('No se pudo solicitar historial');
     expect(reception.snapshot('main').recoveryWarning).not.toContain('El teléfono no entregó');
@@ -141,6 +141,44 @@ describe('explicit supplier history requests', () => {
     expect(fetchHistory.mock.calls[1]?.[1]).toMatchObject({ id: 'early-page' });
   });
 
+  it('retries a silent phone twice, then reports that no history was delivered', async () => {
+    const { history, fetchHistory, reception, message, db } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(138_000);
+    expect(fetchHistory).toHaveBeenCalledTimes(3);
+    expect(fetchHistory.mock.calls.map((call) => call[1])).toEqual([
+      expect.objectContaining({ id: 'latest' }),
+      expect.objectContaining({ id: 'latest' }),
+      expect.objectContaining({ id: 'latest' }),
+    ]);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryMessageCount: 0, recoveryFailedRequests: 1 });
+    expect(db.prepare("SELECT COUNT(*) as count FROM application_logs WHERE action='supplier.history.no.response'").get()).toEqual({ count: 1 });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(fetchHistory).toHaveBeenCalledTimes(3);
+  });
+
+  it('accepts a late Baileys page after a timeout and stops retrying the old cursor', async () => {
+    const { history, fetchHistory, message } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(45_000);
+    history.observe([message('late-page', '16:59:59')], true, 'request-1');
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fetchHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses a fresh group message to retry after the phone ignored all requests', async () => {
+    const { history, fetchHistory, message } = setup();
+    history.observe([message('first-anchor', '20:10:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(138_000);
+    expect(fetchHistory).toHaveBeenCalledTimes(3);
+    history.observe([message('fresh-anchor', '20:22:00')]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchHistory.mock.calls[3]?.[1]).toMatchObject({ id: 'fresh-anchor' });
+  });
+
   it('does not loop on repeated pages or let an old request paginate a new attempt', async () => {
     const { history, fetchHistory, message } = setup();
     history.observe([message('latest', '20:10:00')]); history.start();
@@ -169,8 +207,8 @@ describe('explicit supplier history requests', () => {
     fetchHistory.mockRejectedValueOnce(new Error('Phone unavailable'));
     history.start(); await vi.advanceTimersByTimeAsync(0);
     expect(reception.snapshot('main')).toMatchObject({ recoveryFailedRequests: 1, recoveryRequestedGroups: 0, recoveryMessageCount: 0 });
-    await vi.advanceTimersByTimeAsync(36_000);
-    expect(reception.snapshot('main').recoveryWarning).toContain('Falló la solicitud');
+    await vi.advanceTimersByTimeAsync(151_000);
+    expect(reception.snapshot('main').recoveryWarning).toContain('No se completó la recuperación');
     history.start(); await vi.advanceTimersByTimeAsync(0);
     expect(fetchHistory).toHaveBeenCalledTimes(2);
     expect(reception.snapshot('main')).toMatchObject({ recoveryFailedRequests: 0, recoveryRequestedGroups: 1, recoveryStatus: 'waiting' });

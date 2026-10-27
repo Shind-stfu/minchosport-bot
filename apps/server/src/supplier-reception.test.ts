@@ -30,12 +30,12 @@ describe('durable supplier reception queue', () => {
     reception.beginRecovery('main');
     expect(reception.snapshot('main').recoveryStatus).toBe('waiting');
     setNow('2026-10-21T21:10:36.000Z');
-    await vi.advanceTimersByTimeAsync(36_000);
+    await vi.advanceTimersByTimeAsync(151_000);
     expect(reception.snapshot('main').recoveryStatus).toBe('unavailable');
     await reception.recordHistoryBatch('main', 3);
     expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'received', recoveryMessageCount: 3 });
     await reception.recordHistoryBatch('main', 0);
-    await vi.advanceTimersByTimeAsync(36_000);
+    await vi.advanceTimersByTimeAsync(151_000);
     expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'received', recoveryMessageCount: 3 });
     await reception.close(); db.close();
   });
