@@ -338,6 +338,8 @@ describe('Baileys QR pairing lifecycle', () => {
       { key: { remoteJid: 'provider@g.us', id: 'recovered-message', participant: 'vendor@s.whatsapp.net', fromMe: false }, messageTimestamp: Math.floor(nowMs / 1000), message: { conversation: 'COD 143 PRECIO $60.000' } },
     ] } as any);
     await vi.waitFor(() => expect(db.prepare('SELECT COUNT(*) as count FROM supplier_inbox_messages').get()).toEqual({ count: 1 }));
+    const historyBatch = db.prepare("SELECT details_json FROM application_logs WHERE action='supplier.history.batch.delivered'").get() as { details_json: string };
+    expect(JSON.parse(historyBatch.details_json)).toMatchObject({ messageCount: 3, supplierMessageCount: 2, inRecoveryWindow: 1 });
     expect(db.prepare('SELECT group_jid,message_id,status FROM supplier_inbox_messages').get()).toMatchObject({ group_jid: 'provider@g.us', message_id: 'recovered-message' });
     expect(db.prepare("SELECT recovery_message_count FROM supplier_reception_state WHERE session_id='main'").get()).toEqual({ recovery_message_count: 1 });
     await connector.disconnect();
@@ -362,7 +364,7 @@ describe('Baileys QR pairing lifecycle', () => {
     await connector.connect();
     const syncType = kind === 'initial' ? proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP : kind === 'full' ? proto.HistorySync.HistorySyncType.FULL : kind === 'on-demand' ? proto.HistorySync.HistorySyncType.ON_DEMAND : proto.HistorySync.HistorySyncType.RECENT;
     const options = mocks.makeWASocket.mock.calls.at(-1)?.[0];
-    expect(options.syncFullHistory).toBe(true);
+    expect(options.syncFullHistory).toBe(false);
     expect(options).not.toHaveProperty('browser');
     expect(options.shouldSyncHistoryMessage({ syncType })).toBe(true);
     const photo = (id: string, date: string) => ({ key: { remoteJid: 'provider@g.us', id, participant: 'vendor@s.whatsapp.net', fromMe: false }, messageTimestamp: Date.parse(date) / 1000, message: { imageMessage: { mimetype: 'image/jpeg', caption: 'COD 143 PRECIO $60.000' } } });

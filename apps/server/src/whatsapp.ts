@@ -108,13 +108,10 @@ export class BaileysConnector implements WhatsAppConnector {
       const { state, saveCreds } = await auth.state();
       const skippedHistoryTypes = new Set<number>();
       const hasSuppliers = () => Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId));
-      // A saved identity can remain present even if Baileys reports a stale
-      // registered flag after a failed reconnect. Keep its original profile.
-      const newPairing = !state.creds.me;
       const socket = makeWASocket({ auth: state, logger: baileysLogger, printQRInTerminal: false, markOnlineOnConnect: false,
-        // The macOS Desktop preset triggers 428 before a QR is issued on the
-        // current WhatsApp Web connection. Keep the working default profile.
-        syncFullHistory: newPairing && Boolean(this.supplierIngestion),
+        // Use the profile that received recent history on earlier pairings.
+        // Full desktop sync currently closes before QR with status 428.
+        syncFullHistory: false,
         shouldSyncHistoryMessage: (notification) => {
           if (notification.syncType == null || !this.supplierIngestion) return false;
           const accepted = ACCEPTED_HISTORY_TYPES.has(notification.syncType);
@@ -248,6 +245,14 @@ export class BaileysConnector implements WhatsAppConnector {
       socket.ev.on('messaging-history.set', (event) => {
         // Mirror the download filter for directly emitted / replayed history events.
         if (event.syncType != null && !ACCEPTED_HISTORY_TYPES.has(event.syncType)) return;
+        const supplierGroups = new Set((this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
+        const supplierMessages = event.messages.filter((message) => !message.key.fromMe && supplierGroups.has(message.key.remoteJid ?? ''));
+        const schedule = readReceptionSchedule(this.db, this.sessionId);
+        const nowMs = Date.now();
+        writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'connection', action: 'supplier.history.batch.delivered', entityType: 'whatsapp_session', entityId: this.sessionId,
+          message: 'WhatsApp entregó un lote de historial para evaluar', details: { syncType: event.syncType ?? null, messageCount: event.messages.length,
+            supplierMessageCount: supplierMessages.length, inRecoveryWindow: supplierMessages.filter((message) => shouldIngestSupplierMessage('history', Number(message.messageTimestamp) * 1000, nowMs, schedule, this.liveSinceMs)).length,
+            chatCount: event.chats?.length ?? 0 } });
         observeChatReferences(event.chats ?? []);
         enqueueMessages(event.messages, 'history', event.syncType === proto.HistorySync.HistorySyncType.ON_DEMAND, event.peerDataRequestSessionId);
       });
