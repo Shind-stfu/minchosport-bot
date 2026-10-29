@@ -1,18 +1,17 @@
 import { config as loadEnv } from 'dotenv';
-import { mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import pino from 'pino';
 import { createApp } from './app.js';
 import { openDatabase } from './database.js';
-import { BaileysSessionRegistry } from './whatsapp.js';
+import { WhatsmeowSessionRegistry } from './whatsmeow-connector.js';
 import { SupplierIngestionService } from './supplier-ingestion.js';
 import { SupplierReceptionService } from './supplier-reception.js';
 import { OutboundDistributionRegistry } from './outbound-distribution.js';
 import { ImageInspectorPool } from './image-inspector-pool.js';
 import { ImageInspectionCoordinator } from './image-inspection-coordinator.js';
+import { prepareDataDirectory } from './data-directory.js';
 
 loadEnv({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) });
 
@@ -29,21 +28,15 @@ const Environment = z.object({
 });
 
 const config = Environment.parse(process.env);
-const fallbackDataDirectory = process.platform === 'win32'
-  ? resolve(process.env.LOCALAPPDATA ?? joinPath(homedir(), 'AppData', 'Local'), 'BotDistribuidorTenis', 'simulation')
-  : resolve(homedir(), 'Library', 'Application Support', 'BotDistribuidorTenis', 'simulation');
-const dataDirectory = resolve(config.DATA_DIR ?? fallbackDataDirectory);
-if (config.DATA_DIR && !isAbsolute(config.DATA_DIR)) {
-  throw new Error('DATA_DIR debe ser una ruta absoluta para evitar guardar datos en una carpeta inesperada.');
-}
-mkdirSync(dataDirectory, { recursive: true });
+const preparedData = prepareDataDirectory({ appMode: config.APP_MODE, ...(config.DATA_DIR ? { dataDir: config.DATA_DIR } : {}) });
+const dataDirectory = preparedData.dataDirectory;
 const database = openDatabase(resolve(dataDirectory, 'business.sqlite'), config.DEFAULT_MARGIN_COP);
 const messagingEnabled = config.APP_MODE === 'experimental' && config.WHATSAPP_ENABLED;
 const whatsappLogger = pino({ level: config.LOG_LEVEL, redact: { paths: ['*.qr', '*.token', '*.password'], censor: '[REDACTED]' } });
 const imageInspections = new ImageInspectionCoordinator(database, dataDirectory, new ImageInspectorPool(join(dataDirectory, 'ocr-cache'), config.IMAGE_ANALYSIS_WORKERS));
 const supplierIngestion = new SupplierIngestionService(database, dataDirectory, whatsappLogger, (assetId) => { void imageInspections.schedule(assetId); });
 const supplierReception = new SupplierReceptionService(database, dataDirectory, supplierIngestion, whatsappLogger);
-const sessions = new BaileysSessionRegistry(database, whatsappLogger, messagingEnabled, supplierIngestion, supplierReception);
+const sessions = new WhatsmeowSessionRegistry(database, dataDirectory, whatsappLogger, messagingEnabled, supplierIngestion, supplierReception);
 const distributions = new OutboundDistributionRegistry(database, dataDirectory, (sessionId) => sessions.get(sessionId), whatsappLogger, messagingEnabled && config.WHATSAPP_SEND_ENABLED);
 for (const row of database.prepare('SELECT id FROM whatsapp_sessions WHERE archived_at IS NULL').all() as Array<{ id: string }>) distributions.get(row.id);
 const app = createApp({ db: database, dataDirectory, logLevel: config.LOG_LEVEL, port: config.PORT, sessionRegistry: sessions, messagingEnabled, distributionRegistry: distributions, realSendsEnabled: messagingEnabled && config.WHATSAPP_SEND_ENABLED, imageInspections, supplierReception });
@@ -63,6 +56,7 @@ process.once('SIGTERM', () => void stop('SIGTERM'));
 
 try {
   await app.listen({ host: config.HOST, port: config.PORT });
+  if (preparedData.migratedLegacyData) logger.info({ dataDirectory }, 'Se copiaron los datos existentes al directorio aislado del modo actual; el original se conservó');
   logger.info({ host: config.HOST, port: config.PORT, mode: config.APP_MODE, dataDirectory }, 'Panel local iniciado');
   supplierReception.start();
   void sessions.connectSavedSessions();
@@ -73,5 +67,3 @@ try {
   await app.close();
   process.exitCode = 1;
 }
-
-function joinPath(...parts: string[]) { return join(...parts); }

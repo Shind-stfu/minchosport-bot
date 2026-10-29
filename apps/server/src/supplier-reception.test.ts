@@ -24,19 +24,18 @@ function setup(initialTime = '2026-10-20T07:00:00.000Z') {
 }
 
 describe('durable supplier reception queue', () => {
-  it('updates recovery when history arrives after the timeout and preserves a received status on empty batches', async () => {
-    vi.useFakeTimers();
-    const { db, reception, setNow } = setup('2026-10-21T21:10:00.000Z');
+  it('finishes only when the recovery requester settles and counts unique delivered messages', async () => {
+    const { db, reception } = setup('2026-10-21T21:10:00.000Z');
     reception.beginRecovery('main');
     expect(reception.snapshot('main').recoveryStatus).toBe('waiting');
-    setNow('2026-10-21T21:10:36.000Z');
-    await vi.advanceTimersByTimeAsync(151_000);
-    expect(reception.snapshot('main').recoveryStatus).toBe('unavailable');
-    await reception.recordHistoryBatch('main', 3);
-    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'received', recoveryMessageCount: 3 });
-    await reception.recordHistoryBatch('main', 0);
-    await vi.advanceTimersByTimeAsync(151_000);
-    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'received', recoveryMessageCount: 3 });
+    await reception.recordHistoryBatch('main', [
+      { groupId: 'provider@g.us', messageId: 'message-1' },
+      { groupId: 'provider@g.us', messageId: 'message-1' },
+      { groupId: 'provider@g.us', messageId: 'message-2' },
+    ]);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'waiting', recoveryMessageCount: 2 });
+    reception.finishRecovery('main');
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'received', recoveryMessageCount: 2, recoveryPendingGroups: 0 });
     await reception.close(); db.close();
   });
   it('stores live publications immediately outside the recovery range and deduplicates replays', async () => {
@@ -78,11 +77,24 @@ describe('durable supplier reception queue', () => {
 
   it('surfaces failed downloads and discards pending messages from an archived provider', async () => {
     const { db, reception } = setup();
-    reception.recordUnsupported('main', 'provider@g.us', 'failed-photo', Date.now(), 'No se pudo descargar el archivo');
-    expect(reception.snapshot('main').failedCount).toBe(1);
+    reception.recordUnsupported('main', 'provider@g.us', 'failed-photo', Date.now(), 'media_download_failed');
+    reception.recordUnsupported('main', 'provider@g.us', 'failed-decrypt', Date.now(), 'decrypt_pending');
+    expect(reception.snapshot('main')).toMatchObject({ failedCount: 2, mediaFailureCount: 1, decryptFailureCount: 1 });
     reception.archiveProvider('main', 'provider@g.us');
     expect(db.prepare('SELECT status FROM supplier_inbox_messages WHERE message_id=?').get('failed-photo')).toEqual({ status: 'ignored' });
+    expect(reception.snapshot('main')).toMatchObject({ failedCount: 0, mediaFailureCount: 0, decryptFailureCount: 0 });
     db.close();
+  });
+
+  it('counts saved products separately from recovery messages delivered', async () => {
+    const { db, reception } = setup('2026-10-20T18:00:00.000Z');
+    db.prepare("UPDATE whatsapp_session_settings SET reception_start_time='12:00',reception_end_time='18:00' WHERE session_id='main'").run();
+    reception.beginRecovery('main');
+    await reception.capture({ sessionId: 'main', groupId: 'provider@g.us', messageId: 'recovered-product', participantId: 'vendor@s.whatsapp.net',
+      timestampMs: Date.parse('2026-10-20T17:00:00.000Z'), text: 'COD 143 TENIS PRECIO $60.000', receptionMode: 'recovery' });
+    await reception.recordHistoryBatch('main', [{ groupId: 'provider@g.us', messageId: 'recovered-product' }]);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryMessageCount: 1, recoverySavedCount: 1 });
+    await reception.close(); db.close();
   });
 
   it.each(['18:00', '19:00'])('recovers only original timestamps in the selected range ending %s, even when opened at 7 p.m.', async (endTime) => {

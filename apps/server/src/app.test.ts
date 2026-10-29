@@ -90,6 +90,22 @@ describe('local simulation API', () => {
     await app.close();
   });
 
+  it('exposes a pending WhatsApp reconnect so the operator can cancel it', async () => {
+    const connector: WhatsAppConnector = {
+      status: () => ({ status: 'disconnected', qr: null, lastError: 'Reintentando conexión.', reconnectScheduled: true }),
+      connect: async () => {}, disconnect: async () => {}, resetSession: async () => {}, listGroups: async () => [],
+      sendImage: async () => ({ messageId: 'unused' }),
+    };
+    const { app } = setup(connector);
+    const headers = { host: '127.0.0.1:3210' };
+    const response = await app.inject({ method: 'GET', url: '/api/sessions/main', headers });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ status: 'disconnected', reconnectScheduled: true });
+    const sessions = await app.inject({ method: 'GET', url: '/api/sessions', headers });
+    expect(sessions.json()).toMatchObject([{ id: 'main', status: 'disconnected', reconnectScheduled: true }]);
+    await app.close();
+  });
+
   it('persists local image inspection results and returns them with the catalog photo', async () => {
     const inspection: ImageInspection = {
       ocrText: 'COD 001 · NIKE', ocrConfidence: 0.91, ocrError: null,

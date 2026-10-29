@@ -390,6 +390,10 @@ export const MIGRATIONS = [
     DELETE FROM image_analysis_cache WHERE sha256=OLD.sha256
       AND NOT EXISTS (SELECT 1 FROM media_assets WHERE sha256=OLD.sha256);
   END;`,
+  `ALTER TABLE supplier_inbox_messages ADD COLUMN error_code TEXT;
+  ALTER TABLE supplier_reception_state ADD COLUMN recovery_pending_groups INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE supplier_reception_state ADD COLUMN recovery_responded_groups INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE supplier_reception_state ADD COLUMN recovery_interrupted_groups INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export type AppDatabase = InstanceType<typeof Database>;

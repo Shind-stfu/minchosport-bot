@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { ApprovalSchema, ProductImageOptionsSchema, ProductUploadSchema, SettingsSchema, SupplierProfileSchema, WhatsAppGroupSelectionSchema, WhatsAppSessionSchema, addMargin, analyzePrices, extractShoeCode, formatCop, prepareOutgoingDescription, replacePriceCandidates } from '@tenis/core';
 import type { AppDatabase } from './database.js';
-import type { BaileysConnector, BaileysSessionRegistry, WhatsAppConnector } from './whatsapp.js';
+import type { WhatsAppConnector } from './whatsapp.js';
 import type { OutboundDistributionRegistry, OutboundDistributionService } from './outbound-distribution.js';
 import { genderIndicatorFromDescription, saveMarkedImage } from './image-marking.js';
 import { LocalImageInspector, type ImageInspection } from './image-inspection.js';
@@ -75,6 +75,8 @@ function audit(db: AppDatabase, action: string, type: string, id: string, detail
     'whatsapp.session.created': 'Se creó una cuenta de WhatsApp',
     'whatsapp.session.renamed': 'Se cambió el nombre de la cuenta',
     'whatsapp.session.connection.requested': 'Se solicitó conectar la cuenta de WhatsApp',
+    'whatsapp.qr.regenerated': 'Se solicitó un nuevo QR sin borrar la cuenta',
+    'whatsapp.qr.expired': 'El QR de vinculación venció',
     'whatsapp.session.disconnect.requested': 'Se solicitó desconectar la cuenta de WhatsApp',
     'whatsapp.session.pairing.reset': 'Se reinició la vinculación de esta cuenta',
     'whatsapp.session.connect.failed': 'No se pudo iniciar la conexión de WhatsApp',
@@ -148,7 +150,7 @@ function publicProduct(db: AppDatabase, assetsDirectory: string, product: Record
   };
 }
 
-export function createApp(options: { db: AppDatabase; dataDirectory: string; logLevel?: string; port?: number; whatsapp?: WhatsAppConnector; sessionRegistry?: BaileysSessionRegistry; messagingEnabled?: boolean; outboundDistribution?: OutboundDistributionService; distributionRegistry?: OutboundDistributionRegistry; realSendsEnabled?: boolean; imageInspector?: Pick<LocalImageInspector, 'inspect'> & Partial<Pick<LocalImageInspector, 'close'>>; imageInspections?: ImageInspectionCoordinator; supplierReception?: SupplierReceptionService }): FastifyInstance {
+export function createApp(options: { db: AppDatabase; dataDirectory: string; logLevel?: string; port?: number; whatsapp?: WhatsAppConnector; sessionRegistry?: { get(sessionId: string): WhatsAppConnector | undefined; close?(): Promise<void> }; messagingEnabled?: boolean; outboundDistribution?: OutboundDistributionService; distributionRegistry?: OutboundDistributionRegistry; realSendsEnabled?: boolean; imageInspector?: Pick<LocalImageInspector, 'inspect'> & Partial<Pick<LocalImageInspector, 'close'>>; imageInspections?: ImageInspectionCoordinator; supplierReception?: SupplierReceptionService }): FastifyInstance {
   const { db, dataDirectory, logLevel = 'info', port = 3210, whatsapp, sessionRegistry, messagingEnabled = false, outboundDistribution, distributionRegistry, realSendsEnabled = false, supplierReception } = options;
   const mediaDirectory = join(dataDirectory, 'media');
   mkdirSync(mediaDirectory, { recursive: true });
@@ -185,13 +187,23 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
   const distributionFor = (sessionId: string): OutboundDistributionService | undefined => distributionRegistry?.get(sessionId) ?? (sessionId === 'main' ? outboundDistribution : undefined);
   const sessionRow = (id: string) => db.prepare('SELECT id,name FROM whatsapp_sessions WHERE id=? AND archived_at IS NULL').get(id) as { id: string; name: string } | undefined;
   const receptionFor = (sessionId: string) => supplierReception?.snapshot(sessionId) ?? (() => {
-    const counts = db.prepare(`SELECT SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pendingCount,SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failedCount FROM supplier_inbox_messages WHERE session_id=?`).get(sessionId) as { pendingCount: number | null; failedCount: number | null };
+    const counts = db.prepare(`SELECT SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pendingCount,SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failedCount,
+      SUM(CASE WHEN status='failed' AND error_code='decrypt_pending' THEN 1 ELSE 0 END) as decryptFailureCount,
+      SUM(CASE WHEN status='failed' AND error_code='media_download_failed' THEN 1 ELSE 0 END) as mediaFailureCount FROM supplier_inbox_messages WHERE session_id=?`).get(sessionId) as { pendingCount: number | null; failedCount: number | null; decryptFailureCount: number | null; mediaFailureCount: number | null };
     const state = db.prepare(`SELECT recovery_status as recoveryStatus,recovery_started_at as recoveryStartedAt,recovery_finished_at as recoveryFinishedAt,recovery_message_count as recoveryMessageCount,
       recovery_warning as recoveryWarning,last_supplier_message_at as lastSupplierMessageAt,last_supplier_group_jid as lastSupplierGroupJid,last_supplier_result as lastSupplierResult,
-      recovery_requested_groups as recoveryRequestedGroups,recovery_missing_anchors as recoveryMissingAnchors,recovery_failed_requests as recoveryFailedRequests FROM supplier_reception_state WHERE session_id=?`).get(sessionId) as Record<string, unknown> | undefined;
-    return { pendingCount: counts.pendingCount ?? 0, failedCount: counts.failedCount ?? 0, recoveryStatus: state?.recoveryStatus ?? 'idle', recoveryStartedAt: state?.recoveryStartedAt ?? null,
-      recoveryFinishedAt: state?.recoveryFinishedAt ?? null, recoveryMessageCount: state?.recoveryMessageCount ?? 0, recoveryWarning: state?.recoveryWarning ?? null,
-      recoveryRequestedGroups: state?.recoveryRequestedGroups ?? 0, recoveryMissingAnchors: state?.recoveryMissingAnchors ?? 0, recoveryFailedRequests: state?.recoveryFailedRequests ?? 0,
+      recovery_requested_groups as recoveryRequestedGroups,recovery_pending_groups as recoveryPendingGroups,recovery_responded_groups as recoveryRespondedGroups,
+      recovery_interrupted_groups as recoveryInterruptedGroups,recovery_missing_anchors as recoveryMissingAnchors,recovery_failed_requests as recoveryFailedRequests FROM supplier_reception_state WHERE session_id=?`).get(sessionId) as Record<string, unknown> | undefined;
+    const saved = db.prepare(`SELECT COUNT(DISTINCT m.product_id) as count FROM supplier_inbox_messages i JOIN whatsapp_source_messages m
+      ON m.session_id=i.session_id AND m.group_jid=i.group_jid AND m.message_id=i.message_id AND m.product_id IS NOT NULL
+      JOIN supplier_reception_state s ON s.session_id=i.session_id
+      WHERE i.session_id=? AND i.status='processed' AND i.reception_mode='recovery' AND s.recovery_started_at IS NOT NULL AND i.received_at>=s.recovery_started_at`).get(sessionId) as { count: number };
+    return { pendingCount: counts.pendingCount ?? 0, failedCount: counts.failedCount ?? 0, decryptFailureCount: counts.decryptFailureCount ?? 0, mediaFailureCount: counts.mediaFailureCount ?? 0,
+      recoveryStatus: state?.recoveryStatus ?? 'idle', recoveryStartedAt: state?.recoveryStartedAt ?? null,
+      recoveryFinishedAt: state?.recoveryFinishedAt ?? null, recoveryMessageCount: state?.recoveryMessageCount ?? 0, recoverySavedCount: saved.count ?? 0, recoveryWarning: state?.recoveryWarning ?? null,
+      recoveryRequestedGroups: state?.recoveryRequestedGroups ?? 0, recoveryPendingGroups: state?.recoveryPendingGroups ?? 0,
+      recoveryRespondedGroups: state?.recoveryRespondedGroups ?? 0, recoveryInterruptedGroups: state?.recoveryInterruptedGroups ?? 0,
+      recoveryMissingAnchors: state?.recoveryMissingAnchors ?? 0, recoveryFailedRequests: state?.recoveryFailedRequests ?? 0,
       lastSupplierMessageAt: state?.lastSupplierMessageAt ?? null, lastSupplierGroupJid: state?.lastSupplierGroupJid ?? null, lastSupplierResult: state?.lastSupplierResult ?? null };
   })();
 
@@ -233,7 +245,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       const state = connector?.status() ?? { status: 'disabled' as const, qr: null, lastError: null };
       const selection = db.prepare('SELECT target_group_ids,send_interval_ms,reception_start_time,reception_end_time,reception_timezone FROM whatsapp_session_settings WHERE session_id=?').get(row.id) as { target_group_ids: string; send_interval_ms: number; reception_start_time: string; reception_end_time: string; reception_timezone: string };
       const control = db.prepare('SELECT status FROM session_distribution_control WHERE session_id=?').get(row.id) as { status: string };
-      return { ...row, status: state.status, qrDataUrl: state.qr ? await QRCode.toDataURL(state.qr, { width: 260, margin: 1 }) : null, lastError: state.lastError, reception: state.reception ?? null, receptionQueue: receptionFor(row.id), receptionSchedule: { startTime: selection.reception_start_time, endTime: selection.reception_end_time, timeZone: selection.reception_timezone }, targetGroupIds: JSON.parse(selection.target_group_ids) as string[], sendIntervalMs: selection.send_interval_ms, enabled: messagingEnabled, distributionStatus: control.status };
+      return { ...row, status: state.status, qrDataUrl: state.qr ? await QRCode.toDataURL(state.qr, { width: 260, margin: 1 }) : null, lastError: state.lastError, reconnectScheduled: state.reconnectScheduled ?? false, reception: state.reception ?? null, receptionQueue: receptionFor(row.id), receptionSchedule: { startTime: selection.reception_start_time, endTime: selection.reception_end_time, timeZone: selection.reception_timezone }, targetGroupIds: JSON.parse(selection.target_group_ids) as string[], sendIntervalMs: selection.send_interval_ms, enabled: messagingEnabled, distributionStatus: control.status };
     }));
   });
 
@@ -258,7 +270,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     const state = connector?.status() ?? { status: 'disabled' as const, qr: null, lastError: null };
     const selection = db.prepare('SELECT target_group_ids,send_interval_ms,reception_start_time,reception_end_time,reception_timezone FROM whatsapp_session_settings WHERE session_id=?').get(account.id) as { target_group_ids: string; send_interval_ms: number; reception_start_time: string; reception_end_time: string; reception_timezone: string };
     const control = db.prepare('SELECT status FROM session_distribution_control WHERE session_id=?').get(account.id) as { status: string };
-    return { ...account, status: state.status, qrDataUrl: state.qr ? await QRCode.toDataURL(state.qr, { width: 260, margin: 1 }) : null, lastError: state.lastError, reception: state.reception ?? null, receptionQueue: receptionFor(account.id), receptionSchedule: { startTime: selection.reception_start_time, endTime: selection.reception_end_time, timeZone: selection.reception_timezone }, targetGroupIds: JSON.parse(selection.target_group_ids), sendIntervalMs: selection.send_interval_ms, enabled: messagingEnabled, distributionStatus: control.status };
+    return { ...account, status: state.status, qrDataUrl: state.qr ? await QRCode.toDataURL(state.qr, { width: 260, margin: 1 }) : null, lastError: state.lastError, reconnectScheduled: state.reconnectScheduled ?? false, reception: state.reception ?? null, receptionQueue: receptionFor(account.id), receptionSchedule: { startTime: selection.reception_start_time, endTime: selection.reception_end_time, timeZone: selection.reception_timezone }, targetGroupIds: JSON.parse(selection.target_group_ids), sendIntervalMs: selection.send_interval_ms, enabled: messagingEnabled, distributionStatus: control.status };
   });
 
   app.put<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/reception-schedule', async (request, reply) => {
@@ -336,6 +348,20 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     });
   }
 
+  app.post<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/regenerate-qr', async (request, reply) => {
+    const connector = connectorFor(request.params.sessionId);
+    if (!messagingEnabled || !connector?.regenerateQr) return reply.code(409).send({ error: 'La renovación del QR no está disponible para esta cuenta.' });
+    if (connector.status().status !== 'qr') return reply.code(409).send({ error: 'No hay un QR activo para renovar.' });
+    try {
+      await connector.regenerateQr();
+      audit(db, 'whatsapp.qr.regenerated', 'whatsapp_session', request.params.sessionId, {});
+      return reply.code(202).send({ ok: true });
+    } catch (error) {
+      audit(db, 'whatsapp.qr.regenerated.failed', 'whatsapp_session', request.params.sessionId, {});
+      return reply.code(503).send({ error: error instanceof Error ? error.message : 'No se pudo generar otro QR.' });
+    }
+  });
+
   app.get<{ Params: { sessionId: string }; Querystring: { cached?: string } }>('/api/sessions/:sessionId/groups', async (request, reply) => {
     const account = sessionRow(request.params.sessionId); const connector = account && connectorFor(account.id);
     if (!account) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
@@ -404,6 +430,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       }
       audit(db, existing ? 'supplier.restored' : 'supplier.created', 'supplier', id, input.data);
     })();
+    await connectorFor(account.id)?.syncSupplierGroups?.();
     return reply.code(201).send({ id, sessionId: account.id, ...input.data, restored: Boolean(existing) });
   });
 
@@ -426,6 +453,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
         .run(input.data.sourceGroupId,input.data.name,input.data.priceMarginCop,input.data.boxMarginCop,input.data.markerText,input.data.defaultPosition,now,provider.id);
       audit(db, 'supplier.updated', 'supplier', provider.id, input.data);
     })();
+    await connectorFor(provider.session_id)?.syncSupplierGroups?.();
     return { ok: true, id: provider.id, ...input.data };
   });
 
@@ -434,6 +462,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     if (!provider) return reply.code(404).send({ error: 'Proveedor no encontrado.' });
     db.prepare('UPDATE supplier_profiles SET archived_at=?,updated_at=? WHERE id=?').run(new Date().toISOString(),new Date().toISOString(),request.params.supplierId);
     supplierReception?.archiveProvider(provider.sessionId, provider.groupId);
+    await connectorFor(provider.sessionId)?.syncSupplierGroups?.();
     audit(db, 'supplier.archived', 'supplier', request.params.supplierId, {});
     return { ok: true };
   });
@@ -473,9 +502,9 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     const targets = db.prepare("SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id='main'").get() as { target_group_ids: string };
     return { status: state.status, qrDataUrl: state.qr ? await QRCode.toDataURL(state.qr, { width: 260, margin: 1 }) : null, lastError: state.lastError, reception: state.reception ?? null, sourceGroupId: selection.sourceGroupId, targetGroupIds: JSON.parse(targets.target_group_ids), enabled: messagingEnabled };
   });
-  app.post('/api/whatsapp/connect', async (_request, reply) => { const connector = connectorFor('main'); if (!connector || !messagingEnabled) return reply.code(409).send({ error: 'Baileys está deshabilitado.' }); await connector.connect(); return reply.code(202).send({ ok: true }); });
+  app.post('/api/whatsapp/connect', async (_request, reply) => { const connector = connectorFor('main'); if (!connector || !messagingEnabled) return reply.code(409).send({ error: 'WhatsApp está deshabilitado.' }); await connector.connect(); return reply.code(202).send({ ok: true }); });
   app.post('/api/whatsapp/disconnect', async () => { await connectorFor('main')?.disconnect(); return { ok: true }; });
-  app.post('/api/whatsapp/reset-pairing', async (_request, reply) => { const connector = connectorFor('main'); if (!connector || !messagingEnabled) return reply.code(409).send({ error: 'Baileys está deshabilitado.' }); await connector.resetSession(); await connector.connect(); return reply.code(202).send({ ok: true }); });
+  app.post('/api/whatsapp/reset-pairing', async (_request, reply) => { const connector = connectorFor('main'); if (!connector || !messagingEnabled) return reply.code(409).send({ error: 'WhatsApp está deshabilitado.' }); await connector.resetSession(); await connector.connect(); return reply.code(202).send({ ok: true }); });
   app.get('/api/whatsapp/groups', async (_request, reply) => { const response = await app.inject({ method: 'GET', url: '/api/sessions/main/groups', headers: { host: `127.0.0.1:${port}` } }); if (response.statusCode >= 400) return reply.code(response.statusCode).send(response.json()); return response.json(); });
   app.put('/api/whatsapp/selection', async (request, reply) => {
     const parsed = WhatsAppGroupSelectionSchema.safeParse(request.body);
@@ -493,6 +522,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       else db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,marker_text,default_position,created_at,updated_at) VALUES (?,'main',?,?,(SELECT margin_cop FROM settings WHERE id=1),'🌎','bottom_right',?,?)")
         .run(randomUUID(),parsed.data.sourceGroupId,providerName,now,now);
     }
+    await connectorFor('main')?.syncSupplierGroups?.();
     audit(db, 'whatsapp.groups.selected', 'whatsapp', 'main', parsed.data);
     return { ok: true, ...parsed.data };
   });
@@ -880,7 +910,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     try {
       const result = await distribution.sendApprovedProduct(request.params.id);
       audit(db, 'product.sent.manually', 'product', request.params.id, result);
-      return { ok: true, ...result, message: `Envío solicitado a ${result.groupCount} grupos con ${result.imageCount} envíos de fotos en total. Baileys confirmó el envío al servidor; revisa WhatsApp para confirmar la entrega.` };
+      return { ok: true, ...result, message: `Envío solicitado a ${result.groupCount} grupos con ${result.imageCount} envíos de fotos en total. WhatsApp aceptó la solicitud del conector; revisa el teléfono para confirmar la entrega.` };
     } catch (error) {
       audit(db, 'product.send.failed', 'product', request.params.id, {});
       return reply.code(409).send({ error: error instanceof Error ? error.message : 'No se pudo enviar el producto.' });
@@ -941,6 +971,6 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
   app.get('/api/audit', async () => db.prepare('SELECT action, entity_type as entityType, entity_id as entityId, details_json as details, created_at as createdAt FROM audit_events ORDER BY created_at DESC LIMIT 500').all());
   const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../web/dist');
   if (existsSync(webRoot)) app.register(fastifyStatic, { root: webRoot, prefix: '/', wildcard: false });
-  app.addHook('onClose', async () => { await distributionRegistry?.stop(); await sessionRegistry?.close(); await outboundDistribution?.stop(); await whatsapp?.disconnect(); db.close(); });
+  app.addHook('onClose', async () => { await distributionRegistry?.stop(); await sessionRegistry?.close?.(); await outboundDistribution?.stop(); await whatsapp?.disconnect(); db.close(); });
   return app;
 }

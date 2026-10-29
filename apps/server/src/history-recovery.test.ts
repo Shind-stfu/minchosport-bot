@@ -42,7 +42,7 @@ describe('explicit supplier history requests', () => {
     expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'idle', recoveryMissingAnchors: 0, recoveryFinishedAt: null });
     expect(reception.snapshot('main').recoveryWarning).toContain('14:50');
     await vi.advanceTimersByTimeAsync(25_000);
-    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'waiting', recoveryMissingAnchors: 1 });
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'unavailable', recoveryMissingAnchors: 1 });
     history.observe([message('at-range-start', '14:50:00')]);
     await vi.advanceTimersByTimeAsync(0);
     expect(fetchHistory.mock.calls[0]?.[1]).toMatchObject({ id: 'at-range-start' });
@@ -92,7 +92,7 @@ describe('explicit supplier history requests', () => {
     const { history, reception, fetchHistory, message } = setup();
     history.start(); await vi.advanceTimersByTimeAsync(151_000);
     expect(fetchHistory).not.toHaveBeenCalled();
-    expect(reception.snapshot('main').recoveryWarning).toContain('No se pudo solicitar historial');
+    expect(reception.snapshot('main').recoveryWarning).toContain('sin una referencia');
     expect(reception.snapshot('main').recoveryWarning).not.toContain('El teléfono no entregó');
     history.observe([message('manual-test-from-phone', '20:22:00', true)]);
     await vi.advanceTimersByTimeAsync(0);
@@ -100,12 +100,12 @@ describe('explicit supplier history requests', () => {
     expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'waiting', recoveryRequestedGroups: 1, recoveryMissingAnchors: 0 });
   });
 
-  it('at 8:22 p.m. requests pages from a known 8:10 message until reaching the 5 p.m. boundary, using milliseconds', async () => {
+  it('at 8:22 p.m. requests pages from a known 8:10 message until reaching the 5 p.m. boundary, using Unix milliseconds', async () => {
     const { history, reception, fetchHistory, message } = setup();
     history.observe([message('latest', '20:10:00')]);
     history.start();
     await vi.advanceTimersByTimeAsync(0);
-    expect(fetchHistory).toHaveBeenCalledWith(50, { id: 'latest', remoteJid: 'provider@g.us', fromMe: false, participant: 'vendor@s.whatsapp.net' }, Date.parse('2026-10-22T20:10:00-05:00'));
+    expect(fetchHistory).toHaveBeenCalledWith(50, { id: 'latest', remoteJid: 'provider@g.us', fromMe: false, participant: 'vendor@s.whatsapp.net' }, Date.parse('2026-10-22T20:10:00-05:00'), 1);
     expect(reception.snapshot('main')).toMatchObject({ recoveryRequestedGroups: 1, recoveryMissingAnchors: 0, recoveryMessageCount: 0, recoveryStatus: 'waiting' });
     history.observe([message('page-one-newer', '19:50:00'), message('page-one-oldest', '19:30:00')], true, 'request-1');
     await vi.advanceTimersByTimeAsync(1000);
@@ -118,15 +118,29 @@ describe('explicit supplier history requests', () => {
     expect(reception.snapshot('main').recoveryMessageCount).toBe(0);
   });
 
+  it('waits at least one second between pages from the same group', async () => {
+    const { history, fetchHistory, message } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(0);
+    history.observe([message('older', '19:30:00')], true, 'request-1');
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchHistory).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchHistory).toHaveBeenCalledTimes(2);
+  });
+
   it('reports a missing anchor and requests history when the next real supplier message arrives', async () => {
-    const { history, reception, fetchHistory, message } = setup();
+    const { db, history, reception, fetchHistory, message } = setup();
     history.start();
     expect(fetchHistory).not.toHaveBeenCalled();
-    expect(reception.snapshot('main')).toMatchObject({ recoveryMissingAnchors: 1, recoveryRequestedGroups: 0 });
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'unavailable', recoveryFinishedAt: expect.any(String), recoveryMissingAnchors: 1, recoveryPendingGroups: 0, recoveryRequestedGroups: 0 });
+    expect(db.prepare("SELECT entity_id FROM application_logs WHERE action='supplier.history.missing_reference'").all()).toEqual([{ entity_id: 'provider@g.us' }]);
     history.observe([message('new-live-message', '20:22:00')]);
     await vi.advanceTimersByTimeAsync(0);
     expect(fetchHistory).toHaveBeenCalledTimes(1);
-    expect(reception.snapshot('main')).toMatchObject({ recoveryMissingAnchors: 0, recoveryRequestedGroups: 1 });
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'waiting', recoveryMissingAnchors: 0, recoveryRequestedGroups: 1 });
+    expect(db.prepare("SELECT entity_id FROM application_logs WHERE action='supplier.history.reference.available'").all()).toEqual([{ entity_id: 'provider@g.us' }]);
   });
 
   it('paginates a phone response that arrives before the request acknowledgement', async () => {
@@ -139,6 +153,21 @@ describe('explicit supplier history requests', () => {
     history.start(); await vi.advanceTimersByTimeAsync(1000);
     expect(fetchHistory).toHaveBeenCalledTimes(2);
     expect(fetchHistory.mock.calls[1]?.[1]).toMatchObject({ id: 'early-page' });
+  });
+
+  it('does not reset a later page when its response arrives before the request acknowledgement', async () => {
+    const { history, fetchHistory, message } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(0);
+    fetchHistory.mockImplementationOnce(async () => {
+      history.observe([message('page-two-oldest', '19:00:00')], true, 'early-page-two');
+      return 'early-page-two';
+    });
+    history.observe([message('page-one-oldest', '19:30:00')], true, 'request-1');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(fetchHistory).toHaveBeenCalledTimes(3);
+    expect(fetchHistory.mock.calls[2]?.[1]).toMatchObject({ id: 'page-two-oldest' });
   });
 
   it('retries a silent phone twice, then reports that no history was delivered', async () => {
@@ -158,14 +187,96 @@ describe('explicit supplier history requests', () => {
     expect(fetchHistory).toHaveBeenCalledTimes(3);
   });
 
-  it('accepts a late Baileys page after a timeout and stops retrying the old cursor', async () => {
+  it('treats an empty on-demand response as a response and ends without blaming the phone for silence', async () => {
+    const { history, fetchHistory, reception, message, db } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchHistory).toHaveBeenCalledTimes(1);
+    history.observe([], true, 'request-1');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'unavailable', recoveryRequestedGroups: 1, recoveryPendingGroups: 0, recoveryRespondedGroups: 1, recoveryFailedRequests: 0 });
+    expect(reception.snapshot('main').recoveryWarning).toContain('respondió las solicitudes');
+    expect(db.prepare("SELECT COUNT(*) as count FROM application_logs WHERE action='supplier.history.response'").get()).toEqual({ count: 1 });
+    expect(db.prepare("SELECT COUNT(*) as count FROM application_logs WHERE action='supplier.history.no.response'").get()).toEqual({ count: 0 });
+  });
+
+  it('accepts an empty response that arrives before the request acknowledgement', async () => {
+    const { history, fetchHistory, reception, message } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    fetchHistory.mockImplementationOnce(async () => {
+      history.observe([], true, 'early-empty-response');
+      return 'early-empty-response';
+    });
+    history.start();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'unavailable', recoveryPendingGroups: 0, recoveryRespondedGroups: 1, recoveryFailedRequests: 0 });
+  });
+
+  it('does not finish the whole attempt while later groups are still retrying', async () => {
+    const { db, history, fetchHistory, reception, message } = setup();
+    const now = new Date().toISOString();
+    for (let index = 1; index <= 20; index += 1) {
+      const groupId = `provider-${index}@g.us`;
+      db.prepare("INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,created_at,updated_at) VALUES (?,'main',?,'Proveedor',0,?,?)")
+        .run(`provider-${index}`, groupId, now, now);
+      history.observe([{ ...message(`anchor-${index}`, '20:10:00'), key: { remoteJid: groupId, id: `anchor-${index}`, fromMe: false } }]);
+    }
+    history.start();
+    await vi.advanceTimersByTimeAsync(151_000);
+    expect(fetchHistory.mock.calls.length).toBeGreaterThan(20);
+    expect(reception.snapshot('main').recoveryStatus).toBe('waiting');
+    expect(reception.snapshot('main').recoveryPendingGroups).toBeGreaterThan(0);
+  });
+
+  it('marks outstanding groups as interrupted when the socket closes', async () => {
+    const { db, history, fetchHistory, reception, message } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchHistory).toHaveBeenCalledTimes(1);
+    history.stop(true);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'unavailable', recoveryPendingGroups: 0, recoveryInterruptedGroups: 1 });
+    expect(reception.snapshot('main').recoveryWarning).toContain('La conexión se interrumpió');
+    expect(db.prepare("SELECT entity_id FROM application_logs WHERE action='supplier.history.interrupted'").all()).toEqual([{ entity_id: 'provider@g.us' }]);
+  });
+
+  it('retries boundedly when the phone never acknowledges sending a request', async () => {
+    const { history, fetchHistory, reception, message } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    fetchHistory.mockImplementation(() => new Promise<string>(() => {}));
+    history.start();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(fetchHistory).toHaveBeenCalledTimes(2);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'waiting', recoveryRequestedGroups: 0, recoveryPendingGroups: 1, recoveryFailedRequests: 0 });
+    await vi.advanceTimersByTimeAsync(42_000);
+    expect(fetchHistory).toHaveBeenCalledTimes(3);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'unavailable', recoveryRequestedGroups: 0, recoveryPendingGroups: 0, recoveryFailedRequests: 1 });
+  });
+
+  it('accepts a late history page after a timeout and stops retrying the old cursor', async () => {
     const { history, fetchHistory, message } = setup();
     history.observe([message('latest', '20:10:00')]);
     history.start();
     await vi.advanceTimersByTimeAsync(45_000);
     history.observe([message('late-page', '16:59:59')], true, 'request-1');
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(fetchHistory).toHaveBeenCalledTimes(1);
+    expect(fetchHistory).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores a duplicate late response after a retry already advanced to its next cursor', async () => {
+    const { history, fetchHistory, message } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(46_000);
+    expect(fetchHistory).toHaveBeenCalledTimes(2);
+    history.observe([message('late-page', '19:30:00')], true, 'request-1');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetchHistory).toHaveBeenCalledTimes(3);
+    expect(fetchHistory.mock.calls[2]?.[1]).toMatchObject({ id: 'late-page' });
+    history.observe([message('duplicate-page', '19:30:00')], true, 'request-2');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchHistory).toHaveBeenCalledTimes(3);
   });
 
   it('uses a fresh group message to retry after the phone ignored all requests', async () => {
@@ -203,17 +314,38 @@ describe('explicit supplier history requests', () => {
     expect(fetchHistory.mock.calls[1]?.[1]).toMatchObject({ id: 'latest' });
   });
 
-  it('reports request failures and allows an explicit retry without reporting success before a response', async () => {
+  it('retries failed sends to exhaustion and allows an explicit retry without reporting success before a response', async () => {
     const { history, reception, fetchHistory, message } = setup();
     history.observe([message('latest', '20:10:00')]);
-    fetchHistory.mockRejectedValueOnce(new Error('Phone unavailable'));
-    history.start(); await vi.advanceTimersByTimeAsync(0);
-    expect(reception.snapshot('main')).toMatchObject({ recoveryFailedRequests: 1, recoveryRequestedGroups: 0, recoveryMessageCount: 0 });
-    await vi.advanceTimersByTimeAsync(151_000);
+    fetchHistory.mockRejectedValueOnce(new Error('Phone unavailable'))
+      .mockRejectedValueOnce(new Error('Phone unavailable'))
+      .mockRejectedValueOnce(new Error('Phone unavailable'));
+    history.start(); await vi.advanceTimersByTimeAsync(2000);
+    expect(fetchHistory).toHaveBeenCalledTimes(3);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'unavailable', recoveryFailedRequests: 1, recoveryRequestedGroups: 0, recoveryMessageCount: 0 });
     expect(reception.snapshot('main').recoveryWarning).toContain('No se completó la recuperación');
     history.start(); await vi.advanceTimersByTimeAsync(0);
-    expect(fetchHistory).toHaveBeenCalledTimes(2);
+    expect(fetchHistory).toHaveBeenCalledTimes(4);
     expect(reception.snapshot('main')).toMatchObject({ recoveryFailedRequests: 0, recoveryRequestedGroups: 1, recoveryStatus: 'waiting' });
+  });
+
+  it('allows 20 successful pages even when one page needed a silent retry', async () => {
+    const { history, fetchHistory, reception, message } = setup();
+    history.observe([message('latest', '20:10:00')]);
+    history.start();
+    await vi.advanceTimersByTimeAsync(46_000);
+    expect(fetchHistory).toHaveBeenCalledTimes(2);
+
+    for (let page = 1; page <= 20; page += 1) {
+      const request = page === 1 ? 'request-2' : `request-${page + 1}`;
+      const minutes = 20 * 60 + 10 - page;
+      const time = `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}:00`;
+      history.observe([message(`page-${page}`, time)], true, request);
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+
+    expect(fetchHistory).toHaveBeenCalledTimes(21);
+    expect(reception.snapshot('main')).toMatchObject({ recoveryStatus: 'unavailable', recoveryRequestedGroups: 1, recoveryRespondedGroups: 1, recoveryFailedRequests: 1, recoveryPendingGroups: 0 });
   });
 
   it('preserves the fromMe flag in real anchors and cancels queued requests when stopped', async () => {

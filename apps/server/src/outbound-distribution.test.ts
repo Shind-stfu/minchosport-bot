@@ -39,6 +39,22 @@ function analyzedPhotos(db: ReturnType<typeof openDatabase>, productId?: string)
 }
 
 describe('manual outbound distribution', () => {
+  it('never publishes simulated products through the real WhatsApp connector', async () => {
+    let sendCount = 0;
+    const { db, distribution } = setup(async () => { sendCount += 1; return { messageId: 'must-not-send' }; });
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO products(id,title,raw_text,analysis_json,output_text,status,created_at,updated_at,session_id,supplier_id)
+      VALUES ('simulation-only','Producto de prueba','Tenis $70.000','{}','Tenis $70.000','simulated',?,?,'main','supplier-test')`).run(now, now);
+
+    await expect(distribution.sendApprovedProduct('simulation-only')).rejects.toThrow('Solo se pueden enviar productos aprobados');
+    await expect(distribution.approveAndSendAll(undefined, ['simulation-only'])).resolves.toMatchObject({ sentProducts: 0, sentGroups: 0, sentImages: 0, skipped: 1 });
+    expect(sendCount).toBe(0);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM outbound_publications').get()).toEqual({ count: 0 });
+
+    await distribution.stop();
+    db.close();
+  });
+
   it.each(['individual', 'batch'] as const)('completes only the missing community destination through an explicit %s send', async (mode) => {
     const sent: string[] = [];
     const { db, ingestion, distribution } = setup(async (groupId) => { sent.push(groupId); return { messageId: `wa-${sent.length}` }; });

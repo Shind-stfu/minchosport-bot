@@ -128,7 +128,7 @@ export class OutboundDistributionService {
       const product = this.db.prepare('SELECT status,output_text,session_id,supplier_id FROM products WHERE id=?').get(productId) as { status: string; output_text: string | null; session_id: string; supplier_id: string | null } | undefined;
       if (!product) throw new Error('Producto no encontrado.');
       if (product.session_id !== this.sessionId || !product.supplier_id) throw new Error('El producto no pertenece a esta cuenta o proveedor.');
-      if (!['approved', 'simulated'].includes(product.status) || !product.output_text) throw new Error('Revisa y aprueba el precio y el texto antes de enviar.');
+      if (product.status !== 'approved' || !product.output_text) throw new Error('Solo se pueden enviar productos aprobados; los resultados simulados no se publican en WhatsApp.');
 
       const existing = this.db.prepare(`SELECT p.group_id,p.status,
           EXISTS(SELECT 1 FROM outbound_units u WHERE u.publication_id=p.id AND u.session_id=p.session_id AND u.status IN ('transmitting','uncertain')) as unresolved
@@ -182,11 +182,11 @@ export class OutboundDistributionService {
       WHERE p.session_id=? AND p.supplier_id IS NOT NULL ${supplierId ? 'AND p.supplier_id=?' : ''} ${productFilter} ORDER BY p.created_at,p.id`)
       .all(...queryParameters) as Array<{ id: string; title: string; status: string }>;
     const reviewRequired = products.filter((product) => product.status === 'needs_review').length;
-    const ready = products.filter((product) => ['approved', 'simulated'].includes(product.status));
+    const ready = products.filter((product) => product.status === 'approved');
     let sentProducts = 0;
     let sentGroups = 0;
     let sentImages = 0;
-    let skipped = 0;
+    let skipped = products.filter((product) => !['approved', 'needs_review'].includes(product.status)).length;
     let uncertainError: string | undefined;
     const skippedErrors: string[] = [];
 
@@ -273,7 +273,7 @@ export class OutboundDistributionService {
   private async enqueueProduct(productId: string, targets: string[]): Promise<number> {
     if (!this.enabled) return 0;
     const product = this.db.prepare('SELECT output_text,status,session_id,supplier_id,raw_text,shoe_code,shoe_code_override,marker_text_applied,image_position FROM products WHERE id=?').get(productId) as { output_text: string | null; status: string; session_id: string; supplier_id: string | null; raw_text: string; shoe_code: string | null; shoe_code_override: number; marker_text_applied: string | null; image_position: 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right' | null } | undefined;
-    if (!product || product.session_id !== this.sessionId || !product.supplier_id || !['approved', 'simulated'].includes(product.status) || !product.output_text) return 0;
+    if (!product || product.session_id !== this.sessionId || !product.supplier_id || product.status !== 'approved' || !product.output_text) return 0;
     const shoeCode = product.shoe_code_override === 1 ? product.shoe_code : product.shoe_code ?? extractShoeCode(product.raw_text).code;
     const outgoingText = prepareOutgoingDescription(product.output_text);
     const sources = new Set((this.db.prepare("SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL").all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
@@ -359,9 +359,9 @@ export class OutboundDistributionService {
       this.db.prepare("UPDATE outbound_units SET status='submitted',remote_message_id=?,completed_at=? WHERE id=? AND session_id=? AND status='transmitting'").run(result.messageId, completedAt, unit.id, this.sessionId);
       const pending = (this.db.prepare("SELECT COUNT(*) as count FROM outbound_units WHERE publication_id=? AND session_id=? AND status!='submitted'").get(unit.publication_id, this.sessionId) as { count: number }).count;
         if (pending === 0) this.db.prepare("UPDATE outbound_publications SET status='submitted',updated_at=? WHERE id=?").run(completedAt, unit.publication_id);
-        writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'distribution', action: 'product.publication.submitted', entityType: 'product', entityId: unit.product_id, message: 'Baileys aceptó una fotografía para el grupo de destino; confirma la entrega en WhatsApp', details: { groupId: unit.group_id, groupName: unit.group_name, imageNumber: unit.position + 1, remoteMessageId: result.messageId }, createdAt: completedAt });
+        writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'distribution', action: 'product.publication.submitted', entityType: 'product', entityId: unit.product_id, message: 'WhatsApp aceptó una fotografía para el grupo de destino; confirma la entrega en el teléfono', details: { groupId: unit.group_id, groupName: unit.group_name, imageNumber: unit.position + 1, remoteMessageId: result.messageId }, createdAt: completedAt });
       })();
-      this.logger.info({ productId: unit.product_id, groupId: unit.group_id, unitPosition: unit.position }, 'Baileys devolvió el identificador de la unidad publicada');
+      this.logger.info({ productId: unit.product_id, groupId: unit.group_id, unitPosition: unit.position }, 'WhatsApp devolvió el identificador de la unidad publicada');
       return true;
     } catch (error) {
       signal.throwIfAborted();

@@ -8,8 +8,11 @@ import { currentUserProtector, EncryptedWhatsAppAuth } from './encrypted-auth.js
 import type { IncomingSupplierMessage, SupplierIngestionService } from './supplier-ingestion.js';
 import { writeApplicationLog } from './application-log.js';
 import type { SupplierReceptionService } from './supplier-reception.js';
-import { DEFAULT_RECOVERY_SCHEDULE, isInRecoveryWindow, readReceptionSchedule, type ReceptionSchedule } from './reception-schedule.js';
+import { readReceptionSchedule } from './reception-schedule.js';
 import { HistoryRecovery } from './history-recovery.js';
+import { shouldIngestSupplierMessage, type WhatsAppConnector, type WhatsAppGroup, type WhatsAppReceptionDiagnostics, type WhatsAppReceptionResult, type WhatsAppStatus } from './whatsapp-shared.js';
+export { shouldIngestSupplierMessage } from './whatsapp-shared.js';
+export type { WhatsAppConnector, WhatsAppGroup, WhatsAppReceptionDiagnostics, WhatsAppReceptionResult, WhatsAppStatus } from './whatsapp-shared.js';
 
 const baileysLogger = pino({ level: 'silent' });
 const DOCUMENT_IMAGE_EXTENSIONS: Record<string, string> = {
@@ -23,22 +26,9 @@ function documentImageMimeType(document: { mimetype?: string | null; fileName?: 
   return extension ? DOCUMENT_IMAGE_EXTENSIONS[extension] : undefined;
 }
 
-export type WhatsAppStatus = 'disabled' | 'disconnected' | 'connecting' | 'qr' | 'connected' | 'logged_out';
-export type WhatsAppGroup = { id: string; name: string };
-export type WhatsAppReceptionResult = 'processing' | 'stored' | 'duplicate' | 'pending' | 'older_message_skipped' | 'outside_recovery_window' | 'unsupported_message' | 'error';
-export type WhatsAppReceptionDiagnostics = {
-  lastUpsertAt: string | null;
-  lastUpsertType: 'notify' | 'append' | null;
-  lastUpsertMessageCount: number;
-  lastGroupMessageAt: string | null;
-  lastGroupName: string | null;
-  lastSupplierMessageAt: string | null;
-  lastSupplierName: string | null;
-  lastSupplierResult: WhatsAppReceptionResult | null;
-};
-
 const MAX_APPENDED_SUPPLIER_MESSAGE_AGE_MS = 24 * 60 * 60 * 1000;
 const DECRYPTION_PENDING = 'WhatsApp no pudo descifrar este mensaje. Se espera una nueva entrega antes de incorporarlo al catálogo.';
+const DECRYPTION_PENDING_CODE = 'decrypt_pending';
 const ACCEPTED_HISTORY_TYPES = new Set<number>([
   proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP,
   proto.HistorySync.HistorySyncType.FULL,
@@ -48,24 +38,6 @@ const ACCEPTED_HISTORY_TYPES = new Set<number>([
 
 function isLiveMessage(upsertType: 'notify' | 'append' | 'history', timestampMs: number, liveSinceMs: number): boolean {
   return upsertType !== 'history' && timestampMs >= liveSinceMs;
-}
-
-/** Old notify/append events are recovery too; only new messages bypass the time range. */
-export function shouldIngestSupplierMessage(upsertType: 'notify' | 'append' | 'history', messageTimestampMs: number, nowMs = Date.now(), schedule: ReceptionSchedule = DEFAULT_RECOVERY_SCHEDULE, liveSinceMs = nowMs): boolean {
-  const valid = Number.isFinite(messageTimestampMs)
-    && messageTimestampMs <= nowMs + 5 * 60 * 1000
-    && nowMs - messageTimestampMs <= MAX_APPENDED_SUPPLIER_MESSAGE_AGE_MS;
-  return valid && (isLiveMessage(upsertType, messageTimestampMs, liveSinceMs) || isInRecoveryWindow(messageTimestampMs, schedule, nowMs));
-}
-
-export interface WhatsAppConnector {
-  status(): { status: WhatsAppStatus; qr: string | null; lastError: string | null; reception?: WhatsAppReceptionDiagnostics };
-  connect(): Promise<void>;
-  disconnect(): Promise<void>;
-  resetSession(): Promise<void>;
-  listGroups(): Promise<WhatsAppGroup[]>;
-  requestHistory?(): Promise<void>;
-  sendImage(groupId: string, bytes: Buffer, mimeType: string, caption?: string): Promise<{ messageId: string }>;
 }
 
 /** Experimental WhatsApp Web adapter. Real sends are restricted to explicitly selected targets. */
@@ -109,9 +81,9 @@ export class BaileysConnector implements WhatsAppConnector {
       const skippedHistoryTypes = new Set<number>();
       const hasSuppliers = () => Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId));
       const socket = makeWASocket({ auth: state, logger: baileysLogger, printQRInTerminal: false, markOnlineOnConnect: false,
-        // Use the profile that received recent history on earlier pairings.
-        // Full desktop sync currently closes before QR with status 428.
-        syncFullHistory: false,
+        // Ask for history at registration while keeping the compatible Web
+        // browser profile. Advertising a native desktop currently closes with 428.
+        syncFullHistory: true,
         shouldSyncHistoryMessage: (notification) => {
           if (notification.syncType == null || !this.supplierIngestion) return false;
           const accepted = ACCEPTED_HISTORY_TYPES.has(notification.syncType);
@@ -123,7 +95,11 @@ export class BaileysConnector implements WhatsAppConnector {
           return accepted;
         } });
       this.socket = socket;
-      if (this.supplierIngestion) this.historyRecovery = new HistoryRecovery(this.db, this.sessionId, (count, key, timestampMs) => socket.fetchMessageHistory(count, key, timestampMs), this.supplierReception);
+      // Despite the protocol field name (oldestMsgTimestampMs), it expects
+      // HistoryRecovery passes Unix milliseconds, matching Baileys' oldestMsgTimestampMs field.
+      if (this.supplierIngestion) this.historyRecovery = new HistoryRecovery(this.db, this.sessionId, (count, key, timestampMs) => socket.fetchMessageHistory(count, {
+        remoteJid: key.remoteJid ?? null, id: key.id ?? null, fromMe: Boolean(key.fromMe), ...(key.participant ? { participant: key.participant } : {}),
+      }, timestampMs), this.supplierReception);
       let eventQueue = Promise.resolve();
       let messageQueue = Promise.resolve();
       let credentialSaveFailed = false;
@@ -173,7 +149,7 @@ export class BaileysConnector implements WhatsAppConnector {
           const status = (disconnectError as Boom | undefined)?.output?.statusCode;
           this.qr = null;
           this.socket = undefined;
-          this.historyRecovery?.stop(); this.historyRecovery = undefined;
+          this.historyRecovery?.stop(true); this.historyRecovery = undefined;
           if (status === DisconnectReason.restartRequired && !credentialSaveFailed) {
             this.currentStatus = 'connecting';
             this.lastError = null;
@@ -207,17 +183,16 @@ export class BaileysConnector implements WhatsAppConnector {
           this.historyRecovery?.observe(messages, onDemand, requestId);
           const ordered = [...messages].sort((a, b) => Number(a.messageTimestamp ?? 0) - Number(b.messageTimestamp ?? 0));
           if (this.supplierReception) {
-            const eligibleCount = ordered.filter((message) => {
+            const supplierGroupIds = new Set((this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
+            const recoveryMessages = ordered.filter((message) => {
               const groupId = message.key.remoteJid;
               const timestampMs = Number(message.messageTimestamp ?? 0) * 1000;
-              if (message.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT || message.key.fromMe || !groupId?.endsWith('@g.us') || !message.key.id || !this.supplierIngestion?.isSupplierGroup(groupId, this.sessionId)
-                || isLiveMessage(type, timestampMs, this.liveSinceMs) || !this.acceptsMessage(type, timestampMs)) return false;
-              const seen = this.db.prepare('SELECT 1 FROM whatsapp_source_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(this.sessionId, groupId, message.key.id)
-                ?? this.db.prepare("SELECT 1 FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=? AND status<>'failed'").get(this.sessionId, groupId, message.key.id);
-              return !seen;
-            }).length;
-            if (type !== 'notify' || eligibleCount > 0) beginRecovery();
-            await this.supplierReception.recordHistoryBatch(this.sessionId, eligibleCount);
+              return !message.key.fromMe && Boolean(groupId && supplierGroupIds.has(groupId)) && Boolean(message.key.id)
+                && !isLiveMessage(type, timestampMs, this.liveSinceMs) && this.acceptsMessage(type, timestampMs);
+            });
+            if (type !== 'notify' || recoveryMessages.length > 0) beginRecovery();
+            await this.supplierReception.recordHistoryBatch(this.sessionId, recoveryMessages.flatMap((message) => message.key.remoteJid && message.key.id
+              ? [{ groupId: message.key.remoteJid, messageId: message.key.id }] : []));
           }
           this.reception = { ...this.reception, lastUpsertAt: new Date().toISOString(), lastUpsertType: type === 'history' ? 'append' : type, lastUpsertMessageCount: messages.length };
           for (const message of ordered) await this.handleSupplierMessage(socket, message, type);
@@ -272,7 +247,7 @@ export class BaileysConnector implements WhatsAppConnector {
     this.clearReconnectTimer();
     const socket = this.socket;
     this.socket = undefined;
-    this.historyRecovery?.stop(); this.historyRecovery = undefined;
+    this.historyRecovery?.stop(true); this.historyRecovery = undefined;
     this.qr = null;
     this.currentStatus = 'disconnected';
     this.groups = [];
@@ -356,9 +331,9 @@ export class BaileysConnector implements WhatsAppConnector {
     if (message.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT) {
       this.reception = { ...this.reception, lastSupplierResult: 'error' };
       if (inbox?.error !== DECRYPTION_PENDING) {
-        this.supplierReception?.recordUnsupported(this.sessionId, groupId, messageId, messageTimestampMs, DECRYPTION_PENDING);
+        this.supplierReception?.recordUnsupported(this.sessionId, groupId, messageId, messageTimestampMs, DECRYPTION_PENDING_CODE);
         writeApplicationLog(this.db, { sessionId: this.sessionId, level: 'warning', category: 'connection', action: 'supplier.message.decrypt.failed', entityType: 'whatsapp_group', entityId: groupId,
-          message: 'No se pudo descifrar una publicación del proveedor. Se espera un reintento de WhatsApp; si persiste, vuelve a conectar esta cuenta.', details: { supplierName, messageId } });
+          message: 'No se pudo descifrar una publicación del proveedor. Se espera un reintento de WhatsApp; si persiste, vuelve a conectar esta cuenta.', details: { messageId } });
         this.logger.warn({ sessionId: this.sessionId, groupId, messageId }, 'Publicación del proveedor pendiente de descifrado');
       }
       return;
@@ -380,28 +355,33 @@ export class BaileysConnector implements WhatsAppConnector {
     let payload: IncomingSupplierMessage = { sessionId: this.sessionId, groupId, messageId, timestampMs: messageTimestampMs, text,
       receptionMode: isLiveMessage(upsertType, messageTimestampMs, this.liveSinceMs) ? 'live' : 'recovery',
       ...(message.key.participant === undefined ? {} : { participantId: message.key.participant }) };
+    let failureStage: 'media_download' | 'processing' = 'processing';
     try {
       if (image) {
+        failureStage = 'media_download';
         const bytes = await downloadMediaMessage(message, 'buffer', {}, { logger: baileysLogger, reuploadRequest: (failedMessage) => socket.updateMediaMessage(failedMessage) });
         const expectedAlbumImages = content.albumMessage?.expectedImageCount;
         const mimeType = image.mimetype?.startsWith('image/') ? image.mimetype
           : documentImage && image === documentImage ? documentImageMimeType(documentImage) : undefined;
         payload = { ...payload, image: { bytes, mimeType: mimeType ?? 'image/jpeg', ...(expectedAlbumImages == null ? {} : { expectedAlbumImages }) } };
       }
+      failureStage = 'processing';
       if (this.supplierReception) {
         const outcome = await this.supplierReception.capture(payload, upsertType === 'history');
         this.reception = { ...this.reception, lastSupplierResult: outcome === 'stored' ? 'stored' : outcome === 'failed' ? 'error' : outcome === 'pending' ? 'pending' : outcome === 'outside_window' ? 'outside_recovery_window' : 'duplicate' };
         if (outcome === 'stored' && inbox?.error === DECRYPTION_PENDING) writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'connection', action: 'supplier.message.decrypt.recovered', entityType: 'whatsapp_group', entityId: groupId,
-          message: 'WhatsApp volvió a entregar la publicación descifrada y se incorporó al catálogo', details: { supplierName, messageId } });
+          message: 'WhatsApp volvió a entregar la publicación descifrada y se incorporó al catálogo', details: { messageId } });
       } else {
         await this.supplierIngestion.receive(payload);
         this.reception = { ...this.reception, lastSupplierResult: 'stored' };
       }
     } catch (error) {
       this.reception = { ...this.reception, lastSupplierResult: 'error' };
-      this.supplierReception?.recordUnsupported(this.sessionId, groupId, messageId, messageTimestampMs, error instanceof Error ? error.message : 'Error desconocido al descargar la publicación.');
-      writeApplicationLog(this.db, { sessionId: this.sessionId, level: 'error', category: 'products', action: 'product.received.failed', entityType: 'whatsapp_group', entityId: groupId, message: 'No se pudo descargar o guardar el mensaje del proveedor', details: { supplierName, errorType: error instanceof Error ? error.name : 'UnknownError' } });
-      this.logger.error({ sessionId: this.sessionId, groupId, messageId, err: error }, 'Falló la recepción de un mensaje seleccionado de proveedor');
+      const errorType = error instanceof Error ? error.name : 'UnknownError';
+      const errorCode = failureStage === 'media_download' ? 'media_download_failed' : 'processing_failed';
+      this.supplierReception?.recordUnsupported(this.sessionId, groupId, messageId, messageTimestampMs, errorCode);
+      writeApplicationLog(this.db, { sessionId: this.sessionId, level: 'error', category: 'products', action: 'product.received.failed', entityType: 'whatsapp_group', entityId: groupId, message: 'No se pudo descargar o guardar el mensaje del proveedor', details: { messageId, errorType, stage: failureStage } });
+      this.logger.error({ sessionId: this.sessionId, groupId, messageId, errorType, stage: failureStage }, 'Falló la recepción de un mensaje seleccionado de proveedor');
     }
   }
 

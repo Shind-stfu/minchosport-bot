@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { proto } from '@whiskeysockets/baileys';
 import { openDatabase } from './database.js';
 import { EncryptedWhatsAppAuth, macOSKeychainProtector } from './encrypted-auth.js';
+import { EncryptedWhatsmeowStorage } from './whatsmeow-storage.js';
 
 const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
@@ -25,6 +27,8 @@ describe('encrypted WhatsApp authentication store', () => {
     const initial = await EncryptedWhatsAppAuth.create(db, protector);
     const { state, saveCreds } = await initial.state();
     await state.keys.set({ 'pre-key': { '42': { public: Buffer.from('public-key'), private: Buffer.from('private-key') } } });
+    const appStateKey = proto.Message.AppStateSyncKeyData.fromObject({ keyData: Buffer.from('app-state-key-data') });
+    await state.keys.set({ 'app-state-sync-key': { 'key-1': appStateKey } });
     state.creds.advSecretKey = 'credential-secret-for-test';
     await saveCreds();
     const stored = db.prepare('SELECT ciphertext FROM whatsapp_auth_records ORDER BY record_type').all() as Array<{ ciphertext: string }>;
@@ -34,8 +38,11 @@ describe('encrypted WhatsApp authentication store', () => {
     const restored = await EncryptedWhatsAppAuth.create(db, protector);
     const savedState = await restored.state();
     const key = await savedState.state.keys.get('pre-key', ['42']);
+    const restoredAppStateKey = await savedState.state.keys.get('app-state-sync-key', ['key-1']);
     expect(Buffer.from(key['42']!.public)).toEqual(Buffer.from('public-key'));
     expect(Buffer.from(key['42']!.private)).toEqual(Buffer.from('private-key'));
+    expect(restoredAppStateKey['key-1']).toBeInstanceOf(proto.Message.AppStateSyncKeyData);
+    expect(Buffer.from(restoredAppStateKey['key-1']!.keyData!)).toEqual(Buffer.from('app-state-key-data'));
     expect(savedState.state.creds.advSecretKey).toBe('credential-secret-for-test');
     db.close();
   });
@@ -51,6 +58,24 @@ describe('encrypted WhatsApp authentication store', () => {
     expect(marker.toString()).toBe('macos-keychain-v1');
     expect(marker).not.toContain(masterKey.toString());
     expect(await protector.unprotect(marker)).toEqual(masterKey);
+  });
+
+  it('derives independent whatsmeow keys per account and encrypts its pairing marker', async () => {
+    const { db, protector } = setup();
+    const [main, secondary] = await Promise.all([
+      EncryptedWhatsmeowStorage.create(db, protector, 'main'),
+      EncryptedWhatsmeowStorage.create(db, protector, 'secondary'),
+    ]);
+    const marker = main.encrypt({ engine: 'whatsmeow', paired: true });
+    expect(main.keyHex()).toMatch(/^[a-f0-9]{64}$/);
+    expect(marker).not.toContain('whatsmeow');
+    expect(marker).not.toContain('paired');
+
+    const restored = await EncryptedWhatsmeowStorage.create(db, protector, 'main');
+    expect(restored.keyHex()).toBe(main.keyHex());
+    expect(secondary.keyHex()).not.toBe(main.keyHex());
+    expect(restored.decrypt(marker)).toEqual({ engine: 'whatsmeow', paired: true });
+    db.close();
   });
 
   it('isolates authentication stores and reset scope between account sessions', async () => {

@@ -22,7 +22,15 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: apps/server/whatsmeow/go.mod
+          cache-dependency-path: apps/server/whatsmeow/go.sum
       - run: pnpm install --frozen-lockfile
+      - run: go test ./...
+        working-directory: apps/server/whatsmeow
+      - run: go vet ./...
+        working-directory: apps/server/whatsmeow
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build

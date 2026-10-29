@@ -2,7 +2,7 @@
 
 **Fecha:** 12 de octubre de 2026.
 
-**Estado:** plan aprobado; se implementan sesiones múltiples, perfiles por proveedor, catálogo de entrada, revisión de precios, fotografía marcada y envío manual individual o masivo. El envío permanece apagado de forma predeterminada y requiere activación local y confirmación del operador.
+**Estado:** plan aprobado; la integración activa se migró de Baileys a whatsmeow. Se implementan sesiones múltiples, perfiles por proveedor, catálogo de entrada, revisión de precios, fotografía marcada, recuperación ON_DEMAND y envío manual individual o masivo. El envío permanece apagado de forma predeterminada y requiere activación local y confirmación del operador.
 **Plataforma inicial:** computador local Windows 11 o macOS, un operador y varias sesiones independientes de WhatsApp.
 **Carga prevista:** 20–60 referencias diarias, varios grupos proveedor por cuenta y hasta cinco grupos destino compartidos por los proveedores de cada cuenta.
 **Moneda y presentación:** pesos colombianos enteros; interfaz en español; zona horaria `America/Bogota`.
@@ -15,9 +15,9 @@
 | SQLite local con migración versionada, checksum, productos, fotos, auditoría, configuración y simulaciones | Implementado; la migración v8 conserva la instalación de una cuenta y crea el perfil “Cuenta principal”. |
 | Catálogo de publicaciones y fotos recibidas desde el grupo proveedor, conservación de bytes, detección de importes y margen COP | Implementado; productos ambiguos requieren revisión antes de enviarse. El catálogo no solicita agregar productos manualmente. |
 | Etiquetas locales de hasta cinco grupos, revisión, cola simulada e historial por grupo | Implementado; se mantiene separado de los JID reales de WhatsApp. |
-| Baileys 6.7.24 estable, conexión QR y consulta/selección de grupos | Implementado detrás de un adaptador y un registro de conectores por cuenta. Habilitado en macOS y Windows con modo `experimental` y `WHATSAPP_ENABLED=true`. |
+| whatsmeow, conexión QR y consulta/selección de grupos | Implementado como puente Go/TypeScript por cuenta; compila en la plataforma de desarrollo. La conexión WebSocket y la generación del QR ya se comprobaron en macOS; el escaneo y el piloto en grupos reales siguen pendientes. |
 | Credenciales cifradas | AES-256-GCM con registros por sesión; clave maestra en Llavero de macOS o protegida con DPAPI CurrentUser en Windows. La primera vinculación de cada cuenta real queda por validar en el equipo del operador. |
-| Recepción programada y recuperación reciente por cuenta | Ventana diaria editable por cuenta (09:00–21:00 `America/Bogota` inicialmente), bandeja persistente fuera del horario, liberación cronológica, recuperación reciente de Baileys limitada a 24 horas y filtrada por proveedor activo. El catálogo persiste entre reinicios y la recuperación se muestra como intento parcial, nunca como garantía. |
+| Recepción programada y recuperación por cuenta | Ventana diaria editable por cuenta (09:00–21:00 `America/Bogota` inicialmente), bandeja persistente fuera del horario, liberación cronológica, historial ON_DEMAND por anclas reales de mensaje y límite de 24 horas, filtrado por proveedor activo. El catálogo persiste entre reinicios y la recuperación se muestra como intento parcial, nunca como garantía. |
 | Agrupación de fotos y descripción por referencia | El flujo nuevo crea un producto por fotografía. Caption en la misma imagen queda asociado. Un mensaje de texto cercano solo se adjunta si hay una única foto compatible del mismo remitente; cuando compiten varias fotos no se adivina y el producto/texto requiere revisión. |
 | Precio, margen y código | Reglas explícitas por proveedor con márgenes independientes para PRECIO y CAJA (ambos desde $0), parser determinista para `$`, `💲`, COP, miles y k; reemplaza cada importe según su etiqueta y conserva el texto restante. Los renglones independientes de precio por DOCENA se omiten de la descripción publicada sin modificar el original recibido. Proveedores que ya incluyan la ganancia configuran $0 en ambos campos. En el texto, se extraen códigos con prefijos COD/CÓDIGO/REF/SKU, respetando ceros iniciales; como formato adicional acordado, se aceptan códigos numéricos `NNN-NN` y `NNN-NNN` inmediatamente después de HOMBRE/MUJER/DAMA/CABALLERO cuando no haya un código explícito con prefijo. Códigos contradictorios requieren revisión; `MUJER 40-44` y “RETRO 40” no producen código. El OCR local opcional puede sugerir códigos de la foto, pero requiere selección manual; nunca reconoce ni modifica precios de la imagen. |
 | Marca sobre copia local de la fotografía | Sharp genera una copia desde el original, con orientación EXIF aplicada, código/emoji del proveedor, esquina predeterminada o ajustada por producto y vista previa. Original inmutable; fuente y gráficos Twemoji se incluyen con atribuciones. |
@@ -29,13 +29,13 @@ La aprobación del plan autorizó implementar el alcance y subirlo a un reposito
 
 ## Resumen de la decisión
 
-Construir un monolito modular local en Node.js y TypeScript, con panel React, API local y procesamiento orientado a eventos persistidos en SQLite. Las imágenes se guardarán como archivos locales. Baileys quedará detrás de un adaptador experimental reemplazable. No se necesitan Redis, microservicios, nube, servicios pagos ni modelos de IA.
+Construir un monolito modular local en Node.js y TypeScript, con panel React, API local y procesamiento orientado a eventos persistidos en SQLite. Las imágenes se guardarán como archivos locales. whatsmeow opera detrás de un adaptador reemplazable y un puente Go experimental; no se necesitan Redis, microservicios, nube, servicios pagos ni modelos de IA.
 
 El sistema prepara referencias cuya asociación de foto y precio es suficientemente explícita; lo ambiguo queda en revisión. La salida conserva el texto y cambia exclusivamente los importes aprobados. Cada proveedor tiene márgenes independientes para PRECIO y CAJA, ambos desde **$0 COP**, con accesos de $0, $5.000 y $10.000. Los importes identificados con cada etiqueta usan su regla propia.
 
 Hay dos límites que deben quedar visibles desde el principio:
 
-1. Baileys no convierte la automatización en una actividad autorizada por WhatsApp. Existe riesgo de suspensión, cambios incompatibles e interrupciones; trabajar con grupos propios y autorizados no elimina ese riesgo.
+1. whatsmeow es una biblioteca comunitaria del protocolo de WhatsApp Web; no convierte la automatización en una actividad autorizada por WhatsApp. Existe riesgo de suspensión, cambios incompatibles e interrupciones; trabajar con grupos propios y autorizados no elimina ese riesgo.
 2. No se puede prometer entrega externa exactamente una vez. Si el proveedor acepta un envío y el equipo falla antes de persistir la confirmación, el resultado es incierto. El sistema no lo reenviará automáticamente: solicitará reconciliación.
 
 ## 0. Investigación previa y alcance verificable
@@ -46,14 +46,14 @@ Hay dos límites que deben quedar visibles desde el principio:
 | --- | --- | --- |
 | Los términos de WhatsApp restringen comunicaciones no permitidas, incluida mensajería masiva y automática, y contemplan suspensión de cuentas. | Integración experimental explícita; mantener una alternativa de publicación manual. | [Términos de WhatsApp](https://www.whatsapp.com/legal/terms-of-service?channel=null&lang=en) |
 | El centro de ayuda advierte que mensajes automáticos o masivos pueden causar bloqueos y que intervienen reportes de usuarios. | No afirmar que cierto volumen, intervalo o consentimiento evita restricciones. | [Uso responsable de WhatsApp](https://faq.whatsapp.com/361005896189245/?eea=0&locale=en_US) |
-| Baileys usa WhatsApp Web, no está afiliado ni autorizado por WhatsApp; su repositorio desaconseja mensajería automática o masiva y anuncia cambios incompatibles en v7. | Aislarlo, fijar versiones y validar cada actualización antes de usarla. | [Repositorio oficial de Baileys](https://github.com/WhiskeySockets/Baileys) |
+| Baileys usa WhatsApp Web, no está afiliado ni autorizado por WhatsApp; su repositorio desaconseja mensajería automática o masiva y anuncia cambios incompatibles en v7. | Este hallazgo motivó la primera capa de adaptador; el conector activo se migró a whatsmeow y mantiene el mismo límite de biblioteca no oficial. | [Repositorio oficial de Baileys](https://github.com/WhiskeySockets/Baileys) |
 | `messages.upsert` contiene un arreglo y puede incluir sincronización offline o mensajes en tiempo real. `notify` y `append` no son una frontera suficiente para toda la lógica del negocio. | Recorrer todos los mensajes; persistir y deduplicar antes de decidir qué procesar. | [Recepción de actualizaciones](https://github.com/WhiskeySockets/baileys.wiki-site/blob/main/docs/socket/receiving-updates.md) |
 | La conexión emite QR y cambios de credenciales; la documentación desaconseja `useMultiFileAuthState` para producción. | Implementar almacenamiento transaccional protegido de credenciales y claves, no copiar el ejemplo de archivos sin protección. | [Conexión y autenticación](https://github.com/WhiskeySockets/baileys.wiki-site/blob/main/docs/socket/connecting.md) |
 | La migración v7 incorpora identificadores LID y categorías adicionales de claves de autenticación. | Tratar identificadores como opacos; no usar el teléfono como identidad obligatoria ni asumir un esquema fijo de claves. | [Migración v7](https://github.com/WhiskeySockets/baileys.wiki-site/blob/main/docs/migration/to-v7.0.0.md) |
 | El esquema del repositorio contiene `albumMessage`, conteos esperados y asociaciones `MEDIA_ALBUM` con padre e índice. | Aprovechar relaciones explícitas cuando lleguen; su presencia en el esquema no garantiza soporte completo de recepción o envío. | [Esquema WAProto](https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/WAProto/WAProto.proto) |
 | La documentación de tratamiento de mensajes contempla contenido multimedia y recuperación de medios faltantes; la guía de envío tiene apartados incompletos. | Probar descargas, estados y capacidades con la versión elegida; no deducir capacidades de ejemplos de terceros. | [Tratamiento de mensajes](https://github.com/WhiskeySockets/baileys.wiki-site/blob/main/docs/socket/handling-messages.md), [guía de envío](https://github.com/WhiskeySockets/baileys.wiki-site/blob/main/docs/socket/sending-messages.md) |
 
-Las decisiones siguientes son propuestas de ingeniería para este negocio, no garantías ofrecidas por WhatsApp o Baileys. Las fuentes se consultaron en la fecha de este documento; algunas rutas del sitio de Baileys devolvieron 404, por lo que se consultó su repositorio oficial de documentación.
+Los hallazgos sobre Baileys de esta sección documentan la decisión inicial y se conservan como antecedente; el conector activo es whatsmeow desde la actualización del 28 de octubre de 2026. Las decisiones son propuestas de ingeniería para este negocio, no garantías ofrecidas por WhatsApp ni por una biblioteca de protocolo. Las fuentes se consultaron en la fecha de este documento; algunas rutas del sitio de Baileys devolvieron 404, por lo que se consultó su repositorio oficial de documentación.
 
 ### 0.2 API oficial: verificación pendiente, sin asumir equivalencia
 
@@ -100,11 +100,11 @@ El bus en memoria solo avisará que hay trabajo. **SQLite será la fuente de ver
 - Añadir [Fastify](https://fastify.dev/docs/latest/) para la API local y SSE para actualizaciones del panel; no se necesita un servidor WebSocket adicional para esta interfaz.
 - SQLite mediante [better-sqlite3](https://github.com/WiseLibs/better-sqlite3), con consultas parametrizadas y migraciones SQL versionadas. Su dependencia nativa obliga a comprobar binarios para Windows y la versión fijada de Node. No se añadirá ORM inicialmente.
 - Usar pnpm workspaces y un único archivo de bloqueo. El repositorio actual usa pnpm 11; no se requiere Docker, WSL, Electron ni un servidor de base de datos.
-- Solo utilizar el upstream de WhiskeySockets validado. El primer conector fija Baileys `6.7.24` estable y sustituye su URL Git transitiva `libsignal` con el paquete `libsignal@6.0.0` del mismo repositorio para cumplir la instalación reproducible de pnpm. No se usa la línea 7 prerelease.
+- El conector activo fija la revisión de whatsmeow en `apps/server/whatsmeow/go.mod`, compila un puente Go con CGO y SQLCipher y conserva el contrato TypeScript independiente del protocolo. El desarrollo y la compilación requieren Go y un compilador C; la matriz Windows debe validarse en ese sistema.
 
 ### 1.3 Adaptador de mensajería
 
-Contrato conceptual, sin exponer tipos de Baileys al dominio:
+Contrato conceptual, sin exponer tipos de whatsmeow al dominio:
 
 | Operación/capacidad | Resultado esperado |
 | --- | --- |
@@ -116,13 +116,13 @@ Contrato conceptual, sin exponer tipos de Baileys al dominio:
 | Transmitir unidad | Resultado clasificado: rechazado inequívocamente, presentado al adaptador o aceptación comprobada. |
 | Capacidades | Álbum nativo, límites conocidos de contenido, confirmaciones disponibles y posibilidades de reconciliación. |
 
-Implementaciones previstas: **Baileys experimental**, **simulador sin red**, **adaptador falso para pruebas**. El contrato aceptará capacidades ausentes. Si no existe un método fiable para consultar un envío anterior, no fingirá que la reconciliación es automática.
+Implementaciones previstas: **whatsmeow experimental**, **simulador sin red**, **adaptador falso para pruebas**. El contrato aceptará capacidades ausentes. Si no existe un método fiable para consultar un envío anterior, no fingirá que la reconciliación es automática.
 
 ### 1.4 Modos y controles operativos
 
 El modo de ejecución y el estado de distribución serán independientes.
 
-- **Simulación, predeterminada:** datos sintéticos o archivos importados autorizados; no instancia Baileys, no abre una sesión WhatsApp, no carga sus credenciales y no dispone de transporte real. Registra publicaciones simuladas en una base y directorio distintos. Cambiar a real exige reiniciar con configuración explícita y crear publicaciones nuevas.
+- **Simulación, predeterminada:** datos sintéticos o archivos importados autorizados; no instancia whatsmeow, no abre una sesión WhatsApp, no carga sus credenciales y no dispone de transporte real. Registra publicaciones simuladas en una base y directorio distintos. Cambiar a real exige reiniciar con configuración explícita y crear publicaciones nuevas.
 - **Experimental real:** conexión QR, recepción del grupo proveedor y envío individual o masivo por decisión manual. Un precio textual único con etiqueta inequívoca y asociación de medios comprobable se prepara automáticamente; la publicación espera que el operador pulse enviar. Precios ambiguos, precios dentro de fotos y asociaciones inciertas requieren revisión.
 - **Enviar productos:** cada referencia se puede enviar individualmente. La acción masiva aprueba y envía solo las referencias preparadas con precio claro, muestra una confirmación previa, informa cuántas quedan por revisar y se detiene ante una transmisión incierta.
 - **Pausar / detener:** no se aplica una cola automática global en este flujo manual. Un envío ya iniciado termina unidad por unidad; los resultados inciertos requieren conciliación manual.
@@ -139,7 +139,7 @@ Variables previstas, no creadas todavía:
 | `APP_MODE` | `simulation` por defecto; `experimental` habilita integración real. |
 | `ALLOW_REAL_SENDS` | `false` por defecto; bloqueo adicional del publicador. |
 | `HOST`, `PORT` | `127.0.0.1`, `3210`; nunca exposición a la red por defecto. |
-| `DATA_DIR` | Ruta absoluta en `%LOCALAPPDATA%\BotDistribuidorTenis`, con subdirectorio por modo. |
+| `DATA_DIR` | Ruta absoluta raíz en `%LOCALAPPDATA%\BotDistribuidorTenis`; el servidor usa un subdirectorio por modo y copia los datos anteriores una sola vez al modo activo, sin borrar el original. El directorio predeterminado añade `modes/` para separar el legado. |
 | `LOG_LEVEL`, `TZ` | Nivel de Pino y `America/Bogota`. |
 | `DEFAULT_MARGIN_COP` | `10000`, permitido inicialmente `5000` o `10000`. |
 | `ASSEMBLY_IDLE_MS`, `ASSEMBLY_MAX_MS` | `15000` y `90000`; parámetros de ensamblado, no reglas de WhatsApp. |
@@ -165,7 +165,7 @@ Seguridad prevista:
 
 ```mermaid
 flowchart TD
-    W[Grupo proveedor autorizado] --> B[Adaptador Baileys experimental]
+    W[Grupo proveedor autorizado] --> B[Adaptador whatsmeow experimental]
     F[Datos sintéticos o importados] --> S[Adaptador simulador sin red]
     B --> I[Entrada normalizada y deduplicada]
     S --> I
@@ -195,7 +195,7 @@ Las bases y archivos de cada modo son independientes aunque compartan el mismo f
 
 ## 3. Estructura de carpetas prevista
 
-Árbol de diseño; estas carpetas y archivos no se han creado:
+Árbol de diseño original; el repositorio evolucionó a `apps/server/src/whatsmeow-connector.ts` y `apps/server/whatsmeow/cmd/bridge`. Este árbol no representa el inventario actual:
 
 ```text
 bot-distribuidor-tenis/
@@ -218,7 +218,7 @@ bot-distribuidor-tenis/
 │   ├── domain/src/             # Referencias, dinero, estados e invariantes
 │   ├── application/src/        # Casos de uso y contratos de puertos
 │   ├── messaging/src/
-│   │   ├── baileys/            # Único lugar que importa Baileys
+│   │   ├── whatsmeow/          # Adaptador TypeScript y puente Go
 │   │   ├── simulator/
 │   │   └── testing/
 │   ├── persistence/src/        # Repositorios y transacciones SQLite
@@ -242,7 +242,7 @@ bot-distribuidor-tenis/
 Datos de ejecución fuera del repositorio:
 
 ```text
-%LOCALAPPDATA%\BotDistribuidorTenis\
+%LOCALAPPDATA%\BotDistribuidorTenis\modes\
 ├── simulation\               # business.sqlite, media, logs, exports
 └── experimental\
     ├── business.sqlite
@@ -255,7 +255,7 @@ Datos de ejecución fuera del repositorio:
     └── backups\
 ```
 
-Dependencias permitidas: dominio sin infraestructura; aplicación depende del dominio y puertos; adaptadores implementan puertos; bootstrap compone todo; panel usa contratos de API. El dominio no conocerá React, SQLite, Baileys ni rutas de Windows.
+Dependencias permitidas: dominio sin infraestructura; aplicación depende del dominio y puertos; adaptadores implementan puertos; bootstrap compone todo; panel usa contratos de API. El dominio no conocerá React, SQLite, whatsmeow ni rutas de Windows.
 
 ## 4. Diseño de la base de datos
 
@@ -311,7 +311,7 @@ No se guardarán fotos grandes como BLOB en SQLite. Se conservará el original d
 
 ### 4.4 Credenciales, migraciones y respaldo
 
-`auth.sqlite` tendrá migraciones propias, un registro cifrado de credenciales por sesión y registros cifrados de claves por sesión/categoría/ID, con versión de cifrado y actualización. Un adaptador de serialización preservará buffers y tipos que requiera Baileys. Se verificarán escrituras, eliminaciones y categorías nuevas de claves; no habrá claves en logs de depuración.
+El diseño vigente conserva SQLite comercial para la configuración y usa un archivo SQLCipher por cuenta para el almacén de sesión Signal de whatsmeow. La llave del archivo se deriva por cuenta desde una clave maestra protegida por Llavero de macOS o DPAPI CurrentUser. El almacén de Baileys queda como compatibilidad histórica, no se importa a whatsmeow y no se elimina automáticamente al migrar; una revinculación manual crea la nueva sesión.
 
 Antes de migrar: detener publicaciones, respaldo verificable y bloqueo exclusivo de migración. Aplicar migraciones ordenadas dentro de transacciones cuando sea compatible; rechazar bases de una versión posterior a la aplicación. No ejecutar un rollback destructivo automáticamente.
 
@@ -330,7 +330,7 @@ Retención propuesta: medios y payloads originales 90 días; logs 14 días; audi
 3. **Código comercial explícito:** puede servir como evidencia adicional, pero no basta si el proveedor reutiliza códigos o tiene productos abiertos con el mismo código.
 4. **Proximidad temporal:** propone una agrupación para revisión; nunca constituye por sí sola autorización para enviar automáticamente.
 
-La presencia de campos de álbum en [WAProto](https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/WAProto/WAProto.proto) justifica comprobar esa ruta primero. Se validará con muestras reales de Android/iPhone/WhatsApp Web utilizadas por el proveedor; no se inventará un `albumId` si no llega.
+La presencia de campos de álbum en [WAProto](https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/WAProto/WAProto.proto) justifica comprobar esa ruta primero. El conector conserva el conteo esperado cuando whatsmeow lo expone, pero no inventa un `albumId`; todavía se debe validar la asociación con muestras reales autorizadas.
 
 ### 5.2 Ventanas persistidas y reglas de separación
 
@@ -348,11 +348,13 @@ La presencia de campos de álbum en [WAProto](https://raw.githubusercontent.com/
 
 Descargar pronto a archivo temporal, limitar bytes durante el streaming, validar MIME y archivo, calcular hash, sincronizar y renombrar atómicamente dentro del mismo volumen antes de marcar disponible en la base. Al reiniciar, eliminar temporales incompletos y reconciliar archivos huérfanos o faltantes. Si falta espacio, pausar descargas/publicación afectadas y mostrar error; no enviar referencias incompletas.
 
+El puente whatsmeow comprueba el tamaño declarado antes de descargar y limita el flujo de bytes cifrados en un temporal privado por cuenta; al acabar verifica que los bytes descifrados no superen 20 MiB antes de pasarlos al servidor. El temporal se elimina al terminar y se limpian restos de una caída al reiniciar el puente.
+
 Se conservarán **los bytes disponibles recibidos a través de WhatsApp**, que pueden diferir del archivo original de cámara por procesamiento previo de WhatsApp. El original guardado nunca cambia. El flujo acordado genera una copia derivada con código/marca; la copia se corrige por orientación EXIF y se recomprime según el formato de salida, por lo que sus bytes no son idénticos a los originales. La publicación como foto podría experimentar procesamiento adicional de la plataforma: no se promete identidad binaria en el dispositivo destinatario. Si se exige preservar los bytes originales de extremo a extremo, evaluar envío como documento por separado.
 
 Salida del flujo vigente: cada fotografía de entrada crea un producto publicable independiente; cada destino recibe una fotografía marcada con la descripción completa y su precio ajustado en el caption. Los registros históricos que ya contienen varias fotos permanecen en SQLite. La UI compara el original y la copia de salida antes de enviar.
 
-**Agrupación implementada:** una foto con caption conserva ambos en el mismo producto. Un mensaje de texto posterior se asocia solo cuando existe una única foto reciente compatible del mismo grupo/remitente/cuenta, dentro de tres segundos. Si llegan varias fotos candidatas, el texto no se asigna a ninguna automáticamente. No se trata el conteo de álbum de Baileys como unión de referencias porque cada foto es un producto según la regla comercial acordada.
+**Agrupación implementada:** una foto con caption conserva ambos en el mismo producto. Un mensaje de texto posterior se asocia solo cuando existe una única foto reciente compatible del mismo grupo/remitente/cuenta, dentro de tres segundos. Si llegan varias fotos candidatas, el texto no se asigna a ninguna automáticamente. No se trata el conteo esperado de un álbum como unión de referencias porque cada foto es un producto según la regla comercial acordada.
 
 ## 6. Reconocimiento y modificación de precios
 
@@ -484,7 +486,7 @@ No ofrecer “reintentar todo” sobre resultados inciertos o confirmados. En el
 | Riesgo | Efecto | Tratamiento y límite residual |
 | --- | --- | --- |
 | Políticas de automatización | Restricción o pérdida de cuenta. | Integración experimental, grupos propios/autorizados y alternativa manual; no existe garantía de compatibilidad con políticas. |
-| Cambios de protocolo/Baileys | Fallos repentinos o nuevas migraciones. | Versión estable fija `6.7.24`, pruebas de contrato y posibilidad de deshabilitar adaptador. |
+| Cambios de protocolo/whatsmeow | Fallos repentinos o nuevas migraciones. | Revisión fijada en `go.mod`, pruebas del puente y posibilidad de deshabilitar el adaptador; actualizarla requiere repetir el piloto. |
 | Historial/medios incompletos | Referencias faltantes o fotos irrecuperables. | Descarga temprana, indicadores de incompletitud y revisión; no garantizar recuperación retroactiva. |
 | Álbum sin relación explícita | Mezclar referencias y vender datos equivocados. | Agrupación conservadora; revisión de asociaciones inferidas. |
 | Precios ambiguos o incrustados en fotos | Precio erróneo o divulgación del costo. | Parser explicable para texto, revisión visual y bloqueo por ambigüedad; OCR no procesa importes de las fotos. |
@@ -506,11 +508,11 @@ Si el adaptador deja de funcionar, el sistema seguirá permitiendo revisar refer
 
 ## 10. Implementación por fases y criterios de aceptación
 
-Las comprobaciones con cuentas/grupos reales requieren un piloto supervisado en macOS o Windows 11 y grupos de prueba propios/autorizados. La consulta de términos oficiales advierte que WhatsApp prohíbe mensajes automáticos o masivos y puede restringir cuentas; Baileys también desaconseja esos usos. El conector se mantiene experimental y no incorpora evasión.
+Las comprobaciones con cuentas/grupos reales requieren un piloto supervisado en macOS o Windows 11 y grupos de prueba propios/autorizados. La consulta de términos oficiales advierte que WhatsApp prohíbe mensajes automáticos o masivos y puede restringir cuentas; las bibliotecas de protocolo no oficiales también conllevan cambios e interrupciones. El conector se mantiene experimental y no incorpora evasión.
 
 | Fase | Entregable | Criterios de aceptación |
 | --- | --- | --- |
-| 0. Viabilidad y compatibilidad | Base de sesión QR y selector de grupos implementados; piloto en el Mac del operador pendiente. | Probar QR, persistencia cifrada, listado de grupos y desconexión en macOS y Windows; después validar eventos de mensajes, fotos/álbumes e identidades con ejemplos autorizados. |
+| 0. Viabilidad y compatibilidad | Puente whatsmeow con almacén SQLCipher, QR, grupos y envío implementados; QR generado en macOS y vinculación real pendiente de escaneo. | Probar QR, restauración del almacén cifrado, listado y actualización de grupos, desconexión y reconexión en macOS y Windows; validar mensajes, fotos, medios vencidos e historial ON_DEMAND en grupos autorizados. |
 | 1. Núcleo local y simulación | Dominio, configuración, migraciones, repositorios, API básica, logs y simulador. | Arranque offline; simulador sin transporte real; entradas repetidas no duplican trabajo; migraciones y respaldo/restauración comerciales comprobados. |
 | 2. Recepción y medios | Adaptador experimental de entrada, auth protegida, almacenamiento de fotos e historial bruto. | Capturar cada elemento de lotes; reinicio conserva claves; historial inicial no se distribuye; hashes locales verificables; incompletos visibles; solo grupo proveedor seleccionado. |
 | 3. Ensamblado y precios | Referencias, reglas de precio y revisión. | Resolver todas las pruebas de la sección 6; no mezclar referencias intercaladas; cualquier asociación temporal ambigua queda en revisión; precio $60.000 se convierte a $65.000/$70.000 según margen sin alterar tallas. |
@@ -566,7 +568,7 @@ Pruebas con [Vitest](https://vitest.dev/guide/) para dominio, aplicación, API e
 - Medir cobertura de ramas en parser y estados, objetivo inicial 90% en esos módulos, con revisión de escenarios omitidos.
 - Suite sin red reproducible; pruebas Windows obligatorias para SQLite nativo, rutas, bloqueo de archivos, DPAPI y suspensión.
 - Carga sintética de 60 referencias × 5 destinos × 4 fotos y ráfagas de entrada, con tamaños de imagen declarados: cero pérdida de entradas confirmadas localmente, memoria acotada por streaming y paginación, y consultas locales habituales con p95 objetivo inferior a 500 ms en el equipo del piloto. Las esperas deliberadas de red/cola se miden por separado.
-- CI sin credenciales, QR ni publicaciones reales. Actualizaciones de Baileys requieren volver a ejecutar contrato y un piloto pequeño supervisado.
+- CI sin credenciales, QR ni publicaciones reales. Actualizaciones de whatsmeow requieren volver a ejecutar las pruebas del puente y un piloto pequeño supervisado.
 
 ## 12. Instalación prevista en Windows 11
 
@@ -603,14 +605,14 @@ El repositorio se ejecuta actualmente con Node.js y pnpm; aún no se entrega un 
 - Al pausar o cerrar: no reclamar nuevas unidades, esperar brevemente operaciones activas y conservar las inciertas. Si Windows fuerza el cierre, aplicar reconciliación al volver.
 - Actualizar con distribución detenida, respaldo verificado y versión compatible. Si una migración falla, conservar base y diagnóstico; no recrearla silenciosamente.
 - Restaurar con la aplicación cerrada, verificar base y manifiesto, volver a vincular por QR si corresponde y revisar el intervalo posterior al respaldo antes de iniciar.
-- Incluir diagnósticos de versión Node/Baileys/SQLite, protección de secretos, rutas, espacio libre, migraciones y última conectividad; exportación redactada para soporte.
+- Incluir diagnósticos de versión Node/Go/whatsmeow/SQLCipher, protección de secretos, rutas, espacio libre, migraciones y última conectividad; exportación redactada para soporte.
 - Desinstalar la aplicación no borrará datos por defecto. La eliminación de sesión y de datos comerciales serán acciones separadas con alcance explícito.
 
 ## Aprobación y estado de implementación
 
 El plan fue aprobado para implementar un monolito modular local, SQLite, margen por proveedor, varias cuentas, fotografía de salida marcada, envío individual y envío por lotes solicitado por el operador. Los precios o asociaciones no confiables quedan para revisión. El código se sube al repositorio privado solicitado.
 
-La implementación vigente usa Baileys 6.7.24 detrás de adaptadores por cuenta, autenticación cifrada por sesión, migraciones incrementales hasta v11, recepción de fotos/descripciones, parser de COP, reglas por proveedor, generación de copia marcada con Sharp/Twemoji, previsualización y cola durable por destino. Las pruebas automatizadas usan adaptadores de WhatsApp falsos y cubren migración, separación de sesiones, aislamiento de credenciales, reconocimiento de precios/códigos, esquinas y marcas de imagen, recepción, pausas de envío y cola. Envíos reales y sesiones reales aún requieren validación supervisada en el equipo del operador. Un estado incierto detiene el lote y no se reintenta automáticamente.
+La implementación vigente usa whatsmeow mediante un puente Go/TypeScript por cuenta, sesión Signal en SQLCipher con llave protegida por el sistema, migraciones incrementales hasta v11, recepción de fotos/descripciones con normalización de envolturas anidadas y descarga limitada a 20 MiB, recuperación ON_DEMAND con páginas correlacionadas, reintento de medios vencidos y limpieza de respuestas parciales en las descargas reintentadas, parser COP, reglas por proveedor, copia marcada con Sharp/Twemoji, previsualización y cola durable por destino. La recuperación limita cada lote a 50 mensajes, hasta 20 páginas respondidas por grupo y tres intentos por página, con al menos un segundo entre solicitudes; los reintentos no consumen el límite de páginas. El puente conserva correlaciones sin respuesta hasta 24 horas y como máximo 4.096 entradas; el rastreador descarta identificadores de cursores sustituidos y limpia respuestas tempranas no coincidentes. Al iniciar, se detectan almacenes nativos emparejados aunque una caída haya ocurrido antes de guardar la marca SQLite; los almacenes aún no emparejados se cierran sin mostrar un QR. Una salida inesperada del puente marca los grupos pendientes como interrumpidos y programa reconexión cuando la sesión ya está emparejada. Las pruebas locales cubren el cursor en segundos, asociación de respuestas, reintentos, paginación, parseo de lotes protobuf con varias publicaciones fuera de orden, truncado de descargas parciales antes de reintentar, reconexión y persistencia cifrada de sesión Signal, además de la suite TypeScript existente. La cuenta y los grupos reales siguen pendientes de piloto: el puente ya estableció el WebSocket y mostró un QR, pero aún falta escanearlo y comparar la recepción con el teléfono. Un estado incierto detiene el lote y no se reintenta automáticamente.
 
 **Actualización de alcance acordado (13 de octubre de 2026):** las descripciones conservan texto, saltos de línea y formato, y cambian solo los rangos de precio aprobados. La marca por bodega se compone de código opcional + mundo/estrella, con esquina seleccionable por producto. Las cuatro muestras acordadas y los márgenes $0/$5.000/$10.000 tienen pruebas unitarias; las fotos originales se verifican intactas.
 
@@ -623,3 +625,5 @@ La implementación vigente usa Baileys 6.7.24 detrás de adaptadores por cuenta,
 **Ajuste implementado (17 de octubre de 2026):** la etiqueta generada añade `H` después del código cuando la descripción identifica HOMBRE/CABALLERO y `D` cuando identifica MUJER/DAMA; ambos indicadores van antes de la marca del proveedor. Las etiquetas existentes en la foto se siguen conservando sin duplicarlas. Si aparecen categorías masculinas y femeninas a la vez, no se adivina el indicador.
 
 **Ajuste implementado (17 de octubre de 2026):** los precios escritos con dígitos emoji de teclado, por ejemplo `💲8️⃣0️⃣.0️⃣0️⃣0️⃣`, se leen como importes numéricos y admiten palabras pegadas al final (`Cuadre`). La descripción que se envía elimina emojis decorativos y líneas DOCENA, convierte cifras emoji a dígitos normales y aplica un formato consistente de MAYÚSCULAS con negrita en cada línea, preservando el precio y el contenido comercial.
+
+**Ajuste implementado (28 de octubre de 2026):** los errores transitorios del primer enlace, incluso antes de que una cuenta nueva reciba un QR, se clasifican en el puente y programan reintentos con pausa creciente. Los errores permanentes no activan el ciclo de reintentos; Desconectar lo cancela. Una traza con Go 1.27.3 mostró que la ruta cortaba el handshake TLS 1.3 antes de HTTP; al limitar a TLS 1.2 los clientes WebSocket y de medios de WhatsApp, una conexión real obtuvo respuesta 101 y el panel mostró el QR. El canal conserva los códigos hasta su rotación o vencimiento; “Generar otro QR” reinicia el enlace sin borrar credenciales y el vencimiento deja de mostrar un código viejo. El piloto real vinculó la cuenta y detectó 122 grupos, incluidos los ocho proveedores configurados. La primera recuperación pidió historial a seis grupos con referencia reciente: los seis respondieron, llegaron 254 mensajes de proveedor y se guardaron 254 publicaciones dentro del rango de 09:00–12:00 de Colombia, sin errores de descarga ni descifrado. Dos grupos carecen de referencia reciente. Un segundo intento tras una recarga del servidor registró la interrupción y reanudó las solicitudes; recibió 253 mensajes de proveedor ya conocidos sin duplicar publicaciones. Las incorporaciones posteriores fueron mensajes nuevos recibidos en vivo fuera del rango de recuperación. Falta cotejar un grupo y sus publicaciones con el teléfono para verificar la cobertura que WhatsApp entregó.
