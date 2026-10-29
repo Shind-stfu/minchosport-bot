@@ -109,9 +109,9 @@ export class BaileysConnector implements WhatsAppConnector {
       const skippedHistoryTypes = new Set<number>();
       const hasSuppliers = () => Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId));
       const socket = makeWASocket({ auth: state, logger: baileysLogger, printQRInTerminal: false, markOnlineOnConnect: false,
-        // Use the profile that received recent history on earlier pairings.
-        // Full desktop sync currently closes before QR with status 428.
-        syncFullHistory: false,
+        // Ask for history at registration while keeping the compatible Web
+        // browser profile. Advertising a native desktop currently closes with 428.
+        syncFullHistory: true,
         shouldSyncHistoryMessage: (notification) => {
           if (notification.syncType == null || !this.supplierIngestion) return false;
           const accepted = ACCEPTED_HISTORY_TYPES.has(notification.syncType);
@@ -123,7 +123,9 @@ export class BaileysConnector implements WhatsAppConnector {
           return accepted;
         } });
       this.socket = socket;
-      if (this.supplierIngestion) this.historyRecovery = new HistoryRecovery(this.db, this.sessionId, (count, key, timestampMs) => socket.fetchMessageHistory(count, key, timestampMs), this.supplierReception);
+      // Despite the protocol field name (oldestMsgTimestampMs), it expects
+      // Unix seconds, as does Baileys' own fetchMessageHistory example.
+      if (this.supplierIngestion) this.historyRecovery = new HistoryRecovery(this.db, this.sessionId, (count, key, timestampMs) => socket.fetchMessageHistory(count, key, Math.floor(timestampMs / 1000)), this.supplierReception);
       let eventQueue = Promise.resolve();
       let messageQueue = Promise.resolve();
       let credentialSaveFailed = false;
