@@ -669,8 +669,8 @@ export class WhatsmeowConnector implements WhatsAppConnector {
     return { key: { remoteJid: message.groupId, id: message.messageId, fromMe: message.fromMe, ...(message.participantId ? { participant: message.participantId } : {}) }, messageTimestamp: Math.floor(message.timestampMs / 1000) };
   }
 
-  private resultFor(outcome: 'stored' | 'failed' | 'pending' | 'outside_window' | 'duplicate'): WhatsAppReceptionResult {
-    return outcome === 'stored' ? 'stored' : outcome === 'failed' ? 'error' : outcome === 'pending' ? 'pending' : outcome === 'outside_window' ? 'outside_recovery_window' : 'duplicate';
+  private resultFor(outcome: 'stored' | 'ignored' | 'failed' | 'pending' | 'outside_window' | 'duplicate'): WhatsAppReceptionResult {
+    return outcome === 'stored' ? 'stored' : outcome === 'ignored' ? 'filtered' : outcome === 'failed' ? 'error' : outcome === 'pending' ? 'pending' : outcome === 'outside_window' ? 'outside_recovery_window' : 'duplicate';
   }
 
   private savePairedMarker(auth: EncryptedWhatsmeowStorage) {

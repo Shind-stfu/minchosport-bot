@@ -25,3 +25,34 @@
 .delete-product-button{border-color:#ead7d2;color:#9c5041;background:#fffafa}
 
 .reception-counters>span{flex:1 1 125px}.reception-window .secondary-button+.secondary-button{margin-left:8px}
+
+.image-brand-results{display:flex;flex-direction:column;gap:8px;margin:10px 0}.image-brand-results>strong{font-size:10px;color:#506153}.image-brand-review{display:flex;flex-direction:column;gap:6px;padding:10px;border:1px solid #e7ece6;border-radius:6px;background:#fafbf9}.image-brand-heading{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:10px;color:#526256}.image-brand-heading>span{font-weight:700;color:#426949}.image-brand-heading>small,.image-brand-review>small{font-size:9px;color:#89958b}.image-brand-review>p{margin:0;color:#777f78;font-size:9px;line-height:1.45}.image-brand-review .field-label{margin:2px 0 0;font-size:9px}.image-brand-actions{display:flex;gap:6px;flex-wrap:wrap}.image-brand-actions .secondary-button{margin:0;padding:7px 9px;font-size:10px}.image-brand-review details{font-size:9px;color:#758278}.image-brand-review details summary{cursor:pointer}.image-brand-review details ul{margin:5px 0 0;padding-left:18px}
+.brand-evaluation{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:10px 0;padding:11px 14px;border:1px solid #e7ece6;border-radius:7px;background:#fafbf9;color:#526256;font-size:10px}.brand-evaluation>div{display:flex;flex-direction:column;gap:3px}.brand-evaluation>div:first-child{min-width:210px;flex:1}.brand-evaluation>div>span,.brand-evaluation small{color:#89958b;font-size:9px}.brand-evaluation>div>strong{font-size:13px}.brand-evaluation>p{flex:1 1 100%;margin:0;color:#777f78;line-height:1.45}
+
+/* Compact brand review and progressive disclosure of diagnostics. */
+.product-distribution,.photo-analysis-tools{margin:8px 0;padding:9px 11px;border:1px solid #e7e9e3;border-radius:6px;background:#fafbf9;color:#68736b;font-size:10px}
+.product-distribution>summary,.photo-analysis-tools>summary,.brand-evaluation>summary{cursor:pointer;font-weight:600;color:#526256;list-style-position:inside}
+.product-distribution ul{margin:8px 0 2px;padding-left:20px;line-height:1.6}
+.product-distribution>span{display:block;margin-top:6px;color:#78827b}
+.photo-analysis-tools[open]{background:#fff}
+.photo-analysis-tools>.image-brand-results{margin-top:10px}
+.image-brand-heading .brand-status-confirmed{font-weight:600;color:#347247}
+.image-brand-heading .brand-status-review{font-weight:600;color:#8b6c3a}
+.image-brand-edit,.image-brand-diagnostics{padding-top:5px;border-top:1px solid #ecefe9;color:#778178;font-size:10px}
+.image-brand-edit>summary,.image-brand-diagnostics>summary{cursor:pointer}
+.image-brand-edit .text-input{width:100%;margin-bottom:7px}
+.image-brand-edit>small,.image-brand-diagnostics>small{display:block;margin-top:5px;font-size:9px;line-height:1.45;color:#89958b}
+.brand-applied-note,.brand-review-note{margin:5px 0;color:#56725b;font-size:10px;line-height:1.4}
+.brand-review-note{color:#8b6c3a}
+.brand-evaluation{display:block;margin:8px 0;padding:0;border:0;background:transparent}
+.brand-evaluation>summary{color:#758178;font-size:10px}
+.brand-evaluation[open]{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:10px 0;padding:11px 14px;border:1px solid #e7ece6;border-radius:7px;background:#fafbf9}
+.brand-evaluation[open]>div{display:flex;flex-direction:column;gap:3px}
+.brand-evaluation[open]>div>span{color:#89958b;font-size:9px}
+.brand-evaluation[open]>div>strong{font-size:13px}
+.brand-evaluation[open]>p{flex:1 1 100%;margin:0;color:#777f78;line-height:1.45}
+.brand-evaluation[open]>.brand-calibration-list{display:flex;flex:1 1 100%;flex-direction:column;gap:5px;padding-top:6px;border-top:1px solid #e7ece6}
+.brand-calibration-list>strong{font-size:11px}
+.brand-calibration-list>small{color:#758178;font-size:9px;line-height:1.45}
+.brand-unknown-action{align-self:flex-start;margin:2px 0 0;padding:3px 0;border:0;background:transparent;color:#879187;font-size:9px;text-decoration:underline;text-underline-offset:2px}
+.brand-unknown-action:hover:not(:disabled){color:#536b58}

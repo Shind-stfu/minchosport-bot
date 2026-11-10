@@ -10,6 +10,7 @@ import { renderMarkedImage } from './image-marking.js';
 import sharp from 'sharp';
 import type { WhatsAppConnector } from './whatsapp.js';
 import type { ImageInspection } from './image-inspection.js';
+import { BRAND_MODEL_ID } from './image-brand-inspection.js';
 
 const temporaryDirectories: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
@@ -729,6 +730,38 @@ describe('manual corrections and approval of all products', () => {
       .run(`${id}-photo`, JSON.stringify([{ corner: 'top_left', text: '960 🌎', code: '960', hasWorld: true, worldUncertain: false }]), now);
     return image;
   }
+
+  it('persists confirmed brands, aliases, and photo references and returns them in the catalog', async () => {
+    const { app, db } = setup();
+    await seed(db, 'brand-reference');
+    db.prepare(`INSERT INTO image_brand_inspections(media_asset_id,model_id,status,suggested_brand,score,reason,inspected_at) VALUES (?,?, 'review','New Balance',0.72,'Sugerencia de prueba',?)`)
+      .run('brand-reference-photo', BRAND_MODEL_ID, new Date().toISOString());
+    const saved = await app.inject({ method: 'PUT', url: '/api/products/brand-reference/images/brand-reference-photo/brand', headers, payload: { brand: 'New Balance', aliases: ['NB'] } });
+    expect(saved.statusCode, saved.body).toBe(200);
+    expect(db.prepare('SELECT normalized_name,display_name,aliases_json FROM shoe_brand_registry').get()).toEqual({ normalized_name: 'new balance', display_name: 'New Balance', aliases_json: '["NB"]' });
+    expect(db.prepare('SELECT normalized_brand,media_asset_id FROM shoe_brand_references').get()).toEqual({ normalized_brand: 'new balance', media_asset_id: 'brand-reference-photo' });
+    expect(db.prepare('SELECT predicted_brand,expected_brand FROM shoe_brand_evaluation_samples').get()).toEqual({ predicted_brand: 'New Balance', expected_brand: 'New Balance' });
+    const metrics = await app.inject({ method: 'GET', url: '/api/image-brand-metrics', headers });
+    expect(metrics.json()).toMatchObject({ evaluationCount: 0, predictionCount: 0, precision: null, coverage: null, reviewedLabelCount: 1, holdoutLabelCount: 0, referenceLabelCount: 1, minimumPredictionsPerBrand: 20, autoEligibleBrands: [] });
+    const catalog = await app.inject({ method: 'GET', url: '/api/products', headers });
+    expect(catalog.json()[0].images[0].brand).toMatchObject({ status: 'confirmed', confirmedBrand: 'New Balance', referenceCount: 1, autoEligible: false });
+
+    await app.close(); db.close();
+    const directory = temporaryDirectories.at(-1)!;
+    const reopened = openDatabase(join(directory, 'business.sqlite'));
+    expect(reopened.prepare('SELECT display_name,aliases_json FROM shoe_brand_registry').get()).toEqual({ display_name: 'New Balance', aliases_json: '["NB"]' });
+    expect(reopened.prepare('SELECT COUNT(*) as count FROM shoe_brand_references').get()).toEqual({ count: 1 });
+    reopened.close();
+  });
+
+  it('rejects a brand correction for a photo owned by another product', async () => {
+    const { app, db } = setup();
+    await seed(db, 'brand-owner');
+    const response = await app.inject({ method: 'PUT', url: '/api/products/different-product/images/brand-owner-photo/brand', headers, payload: { brand: 'Nike' } });
+    expect(response.statusCode).toBe(404);
+    expect(db.prepare('SELECT COUNT(*) as count FROM shoe_brand_registry').get()).toEqual({ count: 0 });
+    await app.close();
+  });
 
   it('lets every manual choice replace a ready false positive and restores automatic detection', async () => {
     const { app, db } = setup();

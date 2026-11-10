@@ -16,3 +16,12 @@ auth_info_baileys/
 coverage/
 .DS_Store
 Thumbs.db
+
+# Entornos, cachés y catálogos locales de imágenes
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+referencias/
+
+.venv-marcas/

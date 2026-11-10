@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { addMargin, analyzePrices, extractShoeCode, formatCop, prepareOutgoingDescription, replacePriceCandidates, type OverlayPosition } from '@tenis/core';
+import { addMargin, analyzePrices, descriptionContainsBrand, extractShoeCode, formatCop, prepareOutgoingDescription, prependBrandBeforeShoeCode, replacePriceCandidates, type OverlayPosition } from '@tenis/core';
 import type { Settings } from '@tenis/core';
 import { api } from './api.js';
 
 type ImageCodeCandidate = { code: string; confidence: number; evidence: 'label' | 'mixed-code' | 'number-only' };
 type ImageInspection = { ocrText: string; ocrConfidence: number; ocrError: string | null; codeCandidates: ImageCodeCandidate[]; detectedCode: string | null; codeConfidence: number; world: { detected: boolean; variant: string | null; confidence: number }; inspectedAt: string; engineVersion?: string | null; durationMs?: number | null; ocrPasses?: number | null; cacheHit?: boolean };
+type ImageBrand = { modelId: string | null; status: 'pending' | 'review' | 'confirmed' | 'unknown' | 'failed'; suggestedBrand: string | null; confirmedBrand: string | null; score: number; candidates: Array<{ brand: string; score: number }>; evidence: { captionCandidates?: string[]; ocrCandidates?: string[]; unknownScore?: number; noShoeScore?: number; mixedBrandsScore?: number; brandConflict?: boolean; referenceMatches?: Array<{ brand: string; score: number; supportCount?: number }>; visualBrand?: string | null; visualAnswer?: string; visualLogoText?: string; visualEvidence?: string; visualConfidence?: number; visualModel?: string; visualError?: string; sneakerCandidates?: Array<{ brand: string; score: number }>; sneakerError?: string }; autoEligible: boolean; manualOverride: boolean; reason: string; error: string | null; inspectedAt: string | null; referenceCount: number };
+type BrandMetricRow = { brand: string; predictionCount: number; correctCount: number; precision: number; coverage: number };
+type BrandMetrics = { modelId: string; evaluationCount: number; predictionCount: number; correctCount: number; precision: number | null; coverage: number | null; precisionThreshold: number; minimumPredictionsPerBrand: number; autoEligibleBrands: string[]; perBrand: BrandMetricRow[]; bySource: Array<{ source: string; evaluationCount: number; predictionCount: number; correctCount: number; precision: number | null; coverage: number | null; perBrand: BrandMetricRow[] }>; reviewedLabelCount: number; holdoutLabelCount: number; referenceLabelCount: number; brands: Array<{ brand: string; referenceCount: number; reviewedCount: number; holdoutLabelCount: number; evaluatedCount: number }> };
 type MarkMode = 'original' | 'mark_all' | 'mark_code' | 'mark_world';
 type Marking = { status: 'pending' | 'ready' | 'review'; mode: MarkMode | null; reason: string; manual: boolean };
-type Image = { id: string; fileName: string; mimeType: string; sizeBytes: number; position: number; url: string; inspection: ImageInspection | null; marking: Marking };
+type Image = { id: string; fileName: string; mimeType: string; sizeBytes: number; position: number; url: string; inspection: ImageInspection | null; brand: ImageBrand; marking: Marking };
 type Publication = { groupId: string; groupName: string; status: 'queued' | 'in_progress' | 'submitted' | 'needs_review' | 'failed' | 'canceled'; updatedAt: string };
 type Product = {
   id: string; title: string; raw_text: string; source_price_cop: number | null; final_price_cop: number | null;
@@ -18,7 +21,7 @@ type Product = {
   image_position: OverlayPosition | null; markedImageUrl: string;
 };
 type WhatsAppGroup = { id: string; name: string };
-type ReceptionDiagnostics = { lastUpsertAt: string | null; lastUpsertType: 'notify' | 'append' | null; lastUpsertMessageCount: number; lastGroupMessageAt: string | null; lastGroupName: string | null; lastSupplierMessageAt: string | null; lastSupplierName: string | null; lastSupplierResult: 'processing' | 'stored' | 'duplicate' | 'pending' | 'older_message_skipped' | 'outside_recovery_window' | 'unsupported_message' | 'error' | null };
+type ReceptionDiagnostics = { lastUpsertAt: string | null; lastUpsertType: 'notify' | 'append' | null; lastUpsertMessageCount: number; lastGroupMessageAt: string | null; lastGroupName: string | null; lastSupplierMessageAt: string | null; lastSupplierName: string | null; lastSupplierResult: 'processing' | 'stored' | 'filtered' | 'duplicate' | 'pending' | 'older_message_skipped' | 'outside_recovery_window' | 'unsupported_message' | 'error' | null };
 type ReceptionQueue = { recoveryRequestedGroups: number; recoveryPendingGroups: number; recoveryRespondedGroups: number; recoveryInterruptedGroups: number; recoveryMissingAnchors: number; recoveryFailedRequests: number; pendingCount: number; failedCount: number; decryptFailureCount: number; mediaFailureCount: number; recoveryStatus: 'idle' | 'waiting' | 'received' | 'unavailable'; recoveryStartedAt: string | null; recoveryFinishedAt: string | null; recoveryMessageCount: number; recoverySavedCount: number; recoveryWarning: string | null; lastSupplierMessageAt: string | null; lastSupplierGroupJid: string | null; lastSupplierResult: string | null };
 type ReceptionSchedule = { startTime: string; endTime: string; timeZone: string };
 type Session = { id: string; name: string; status: 'disabled' | 'disconnected' | 'connecting' | 'qr' | 'connected' | 'logged_out'; qrDataUrl: string | null; lastError: string | null; reconnectScheduled: boolean; reception?: ReceptionDiagnostics | null; receptionQueue: ReceptionQueue; receptionSchedule: ReceptionSchedule; targetGroupIds: string[]; sendIntervalMs: number; enabled: boolean; distributionStatus: 'stopped' | 'paused' | 'running' };
@@ -48,6 +51,34 @@ function canSelectProduct(product: Product, targets: string[]) {
     && (!product.analysis.candidates.some((candidate) => candidate.kind === 'box') || product.box_margin_cop_applied !== null);
 }
 
+function brandForProductCaption(product: Product) {
+  if (product.publications.some((publication) => ['submitted', 'queued', 'in_progress', 'needs_review'].includes(publication.status))) return null;
+  const options = product.images.map((image) => image.brand.confirmedBrand?.trim()
+    || (image.brand.status === 'review' ? image.brand.evidence.visualBrand?.trim() : null))
+    .filter((brand): brand is string => Boolean(brand));
+  if (!options.length) return null;
+  const normalize = (brand: string) => brand.normalize('NFD').replace(/[\u0300-\u036f]/gu, '').replace(/[^\p{L}\p{N}]+/gu, '').toLocaleLowerCase('es-CO');
+  const unique = new Map(options.map((brand) => [normalize(brand), brand]));
+  if (unique.size !== 1) return null;
+  const [brandKey, brand] = [...unique.entries()][0]!;
+  if (product.images.some((image) => image.brand.evidence.brandConflict && !image.brand.manualOverride
+    && normalize(image.brand.evidence.visualBrand ?? '') !== brandKey
+    || image.brand.status === 'pending' || image.brand.status === 'failed'
+    || image.brand.status === 'review' && image.brand.suggestedBrand && normalize(image.brand.suggestedBrand) !== brandKey)) return null;
+  const recognizedBrands = new Set(product.images.flatMap((image) => image.brand.manualOverride
+    ? [image.brand.confirmedBrand]
+    : [image.brand.suggestedBrand, image.brand.confirmedBrand, ...(image.brand.evidence.referenceMatches ?? []).map((match) => match.brand)])
+    .filter((name): name is string => Boolean(name?.trim())));
+  const captionDisagrees = [...recognizedBrands].some((name) => descriptionContainsBrand(product.raw_text, name) && normalize(name) !== brandKey);
+  return captionDisagrees ? null : brand;
+}
+
+function productCaption(product: Product, text: string) {
+  const brand = brandForProductCaption(product);
+  const code = product.shoe_code ?? extractShoeCode(product.raw_text).code;
+  return prepareOutgoingDescription(brand ? prependBrandBeforeShoeCode(text, brand, code) : text);
+}
+
 export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sessionId, setSessionId] = useState('main');
@@ -61,6 +92,7 @@ export function App() {
   const [sendingBatch, setSendingBatch] = useState(false);
   const [sendingBatchIds, setSendingBatchIds] = useState<string[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
+  const [brandMetrics, setBrandMetrics] = useState<BrandMetrics>({ modelId: '', evaluationCount: 0, predictionCount: 0, correctCount: 0, precision: null, coverage: null, precisionThreshold: 0.95, minimumPredictionsPerBrand: 20, autoEligibleBrands: [], perBrand: [], bySource: [], reviewedLabelCount: 0, holdoutLabelCount: 0, referenceLabelCount: 0, brands: [] });
   const [settings, setSettings] = useState<Settings>({ marginCop: 10000, targetGroups: [] });
   const [logs, setLogs] = useState<ApplicationLog[]>([]);
   const [distribution, setDistribution] = useState<Distribution>({ realSendsEnabled: false, connected: false, status: 'stopped', queue: {} });
@@ -89,16 +121,17 @@ export function App() {
     const activeId = nextSessions.some((account) => account.id === sessionId) ? sessionId : nextSessions[0]?.id ?? 'main';
     if (activeId !== sessionId) setSessionId(activeId);
     const suffix = `?sessionId=${encodeURIComponent(activeId)}`;
-    const [account, nextGroups, nextSuppliers, nextProducts, nextDistribution, nextLogs] = await Promise.all([
+    const [account, nextGroups, nextSuppliers, nextProducts, nextDistribution, nextLogs, nextBrandMetrics] = await Promise.all([
       api<Session>(`/sessions/${encodeURIComponent(activeId)}`),
       api<WhatsAppGroup[]>(`/sessions/${encodeURIComponent(activeId)}/groups?cached=true`),
       api<Supplier[]>(`/sessions/${encodeURIComponent(activeId)}/providers`),
       api<Product[]>(`/products${suffix}`),
       api<Distribution>(`/distribution${suffix}`),
       api<ApplicationLog[]>(`/logs?sessionId=${encodeURIComponent(activeId)}&limit=300`),
+      api<BrandMetrics>('/image-brand-metrics'),
     ]);
     setWhatsApp(account); setGroups(nextGroups); setSuppliers(nextSuppliers); setProducts(nextProducts); setDistribution(nextDistribution);
-    setSettings(nextSettings); setLogs(nextLogs);
+    setSettings(nextSettings); setLogs(nextLogs); setBrandMetrics(nextBrandMetrics);
   }
   useEffect(() => { refresh().catch((error) => setMessage(error.message)); }, [sessionId]);
   useEffect(() => {
@@ -110,7 +143,7 @@ export function App() {
       }
       if (tab === 'products') {
         api<Session[]>(`/sessions`).then((items) => setSessions(items));
-        Promise.all([api<Product[]>(`/products?sessionId=${encodeURIComponent(sessionId)}`), api<Distribution>(`/distribution?sessionId=${encodeURIComponent(sessionId)}`)]).then(([items, state]) => { setProducts(items); setDistribution(state); }).catch(() => undefined);
+        Promise.all([api<Product[]>(`/products?sessionId=${encodeURIComponent(sessionId)}`), api<Distribution>(`/distribution?sessionId=${encodeURIComponent(sessionId)}`), api<BrandMetrics>('/image-brand-metrics')]).then(([items, state, metrics]) => { setProducts(items); setDistribution(state); setBrandMetrics(metrics); }).catch(() => undefined);
       }
       if (tab === 'activity') api<ApplicationLog[]>(`/logs?sessionId=${encodeURIComponent(sessionId)}&limit=300`).then(setLogs).catch(() => undefined);
     }, delay);
@@ -322,6 +355,7 @@ export function App() {
           <div className="destination-chips"><span className="destination-label">DESTINOS</span>{destinationNames.length ? destinationNames.map((name) => <span className="destination-chip" key={name}>{name}</span>) : <span className="destination-empty">Aún no hay grupos seleccionados</span>}</div>
           <button className="secondary-button context-edit" disabled={sendingBatch} onClick={() => setTab('connection')}>{destinationNames.length ? 'Editar destinos' : 'Configurar destinos'} <span>→</span></button>
         </section>
+        <details className="brand-evaluation" aria-label="Precisión y cobertura de marcas"><summary>{brandMetrics.autoEligibleBrands.length ? `Marcas automáticas: ${brandMetrics.autoEligibleBrands.join(', ')}` : 'Reconocimiento de marcas · en calibración'}</summary><div><strong>{brandMetrics.reviewedLabelCount} fotos etiquetadas</strong></div><div><span>Evaluación independiente</span><strong>{brandMetrics.evaluationCount} / {brandMetrics.holdoutLabelCount}</strong></div><div><span>Precisión en evaluación</span><strong>{brandMetrics.precision === null ? '—' : Math.round(brandMetrics.precision * 100) + '%'}</strong></div><div><span>Cobertura</span><strong>{brandMetrics.coverage === null ? '—' : Math.round(brandMetrics.coverage * 100) + '%'}</strong></div><div><span>Referencias de entrenamiento</span><strong>{brandMetrics.referenceLabelCount} · {brandMetrics.brands.reduce((sum, item) => sum + item.referenceCount, 0)} fotos</strong></div><p>{brandMetrics.autoEligibleBrands.length ? 'La asignación automática exige 20 o más predicciones independientes por marca, al menos 95 % de precisión y acuerdo de Florence + Qwen sobre el logo.' : brandMetrics.reviewedLabelCount === 0 ? 'Corrige las marcas en las fotos; cada quinta etiqueta por marca se reserva para evaluación y no se usa como referencia.' : `Cada marca necesita ${brandMetrics.minimumPredictionsPerBrand} predicciones del conjunto reservado y al menos ${Math.round(brandMetrics.precisionThreshold * 100)} % de precisión para asignarse automáticamente. Las referencias y el clasificador de zapatillas solo aportan señales secundarias.`}</p>{brandMetrics.brands.length > 0 && <div className="brand-calibration-list"><strong>Progreso por marca</strong>{brandMetrics.brands.map((item) => { const metric = brandMetrics.perBrand.find((row) => normalizeBrandForInput(row.brand) === normalizeBrandForInput(item.brand)); return <small key={item.brand}>{item.brand}: {item.reviewedCount} etiquetas · {item.referenceCount} referencias · {item.holdoutLabelCount} reservadas · {item.evaluatedCount} evaluadas · {metric ? `${metric.correctCount}/${metric.predictionCount} aciertos · precisión ${Math.round(metric.precision * 100)}% · cobertura ${Math.round(metric.coverage * 100)}%` : item.evaluatedCount ? 'sin marcas detectadas' : 'sin inferencias evaluadas'}</small>; })}</div>}{brandMetrics.bySource.length > 0 && <div className="brand-calibration-list"><strong>Señales por modelo</strong>{brandMetrics.bySource.map((item) => <small key={item.source}>{item.source}: {item.precision === null ? 'sin predicciones' : `${Math.round(item.precision * 100)}% de precisión`} · {Math.round((item.coverage ?? 0) * 100)}% de cobertura · {item.predictionCount}/{item.evaluationCount}{item.perBrand.length ? ` · ${item.perBrand.map((row) => `${row.brand} ${row.correctCount}/${row.predictionCount} (${Math.round(row.precision * 100)}%)`).join(', ')}` : ''}</small>)}</div>}</details>
         {activeSession?.receptionQueue.pendingCount ? <div className="inbox-pending" role="status"><strong>{activeSession.receptionQueue.pendingCount} publicación(es) pendientes de procesar</strong><span>Se están incorporando al catálogo. La recepción en vivo permanece activa a cualquier hora.</span><button className="secondary-button" onClick={() => setTab('connection')}>Ver recepción</button></div> : null}
         {activeSession?.receptionQueue.failedCount ? <div className="inbox-failed" role="alert"><strong>{activeSession.receptionQueue.failedCount} publicación(es) con error de recepción</strong><span>Abre Cuentas para revisar el estado y consulta Actividad para ver el detalle.</span><button className="secondary-button" onClick={() => setTab('activity')}>Ver actividad</button></div> : null}
         {(sendingBatch || counts.queued > 0 || counts.inProgress > 0 || counts.uncertain > 0) && <div className={`send-progress ${counts.uncertain ? 'has-uncertain' : ''}`} role="status"><span className="progress-pulse" /><span><strong>{sendingBatch ? `Envío en curso · ${publicationProgress.done} de ${progressTotal} publicaciones aceptadas` : counts.inProgress ? `${counts.inProgress} referencias enviándose` : counts.queued ? `${counts.queued} referencias en cola` : `${counts.uncertain} referencias requieren conciliación`}</strong><small>{counts.uncertain ? 'Revisa esos grupos antes de volver a intentar.' : `Los estados se actualizan automáticamente. “Aceptado” indica que WhatsApp recibió la solicitud de envío; no confirma entrega al destinatario.`}</small></span>{!sendingBatch && progressTotal > 0 && <span className="progress-count">{publicationProgress.done} / {progressTotal}</span>}</div>}
@@ -356,7 +390,7 @@ function BulkApprovalDialog({ products, busy, onClose, onApprove }: { products: 
     const sourcePrices = (amounts[product.id] ?? []).map(Number);
     if (sourcePrices.some((value) => !Number.isSafeInteger(value) || value <= 0 || value > 1_000_000)) return '';
     const finals = sourcePrices.map((value, index) => addMargin(value, product.analysis.candidates[index]?.kind === 'box' ? product.box_margin_cop_applied ?? 0 : product.margin_cop_applied ?? 0));
-    return prepareOutgoingDescription(product.analysis.candidates.length ? replacePriceCandidates(product.raw_text, product.analysis.candidates, finals) : `${product.raw_text}\nPRECIO ${formatCop(finals[0]!)}`);
+    return productCaption(product, product.analysis.candidates.length ? replacePriceCandidates(product.raw_text, product.analysis.candidates, finals) : `${product.raw_text}\nPRECIO ${formatCop(finals[0]!)}`);
   }
   const incomplete = products.some((product) => !product.images.length || product.margin_cop_applied === null || product.analysis.candidates.some((candidate) => candidate.kind === 'box') && product.box_margin_cop_applied === null || product.status === 'needs_review' && !preparedText(product));
   async function confirm() {
@@ -439,7 +473,7 @@ function WhatsAppView({ session, groups, supplierSourceIds, busy, onConnect, onR
       {session?.qrDataUrl ? <div className="qr-box"><img src={session.qrDataUrl} alt="Código QR temporal para vincular WhatsApp" /><strong>Escanea desde WhatsApp → Dispositivos vinculados</strong><small>El QR se renueva automáticamente al vencer; también puedes pulsar “Generar otro QR”.</small></div> : <div className="wa-placeholder"><span>{connected ? '✓' : '◉'}</span><strong>{connected ? 'Sesión activa' : session?.status === 'disabled' ? 'Integración deshabilitada' : 'Vincula tu cuenta'}</strong><small>{qrPlaceholder}</small></div>}
       {session?.lastError && <p className="wa-error">{session.lastError === 'rate-overlimit' ? 'WhatsApp limitó temporalmente la consulta de grupos. La aplicación hará una pausa antes de volver a consultarlos.' : session.lastError}</p>}
       {session?.reception && <div className="reception-diagnostics" aria-live="polite"><span className="panel-kicker">DIAGNÓSTICO DE RECEPCIÓN</span>
-        {!session.reception.lastUpsertAt ? <p>Esta conexión aún no ha recibido eventos de mensajes. Verifica que este número esté vinculado al WhatsApp que participa en el grupo proveedor.</p> : session.reception.lastSupplierMessageAt ? <p>Último mensaje del proveedor <strong>{session.reception.lastSupplierName}</strong> · {timeLabel(session.reception.lastSupplierMessageAt)}. <b>{({ processing: 'procesando', stored: 'guardado en el catálogo', pending: 'pendiente de procesar', duplicate: 'ya estaba procesado', older_message_skipped: 'omitido por tener más de 24 horas o una fecha inválida', outside_recovery_window: 'omitido por estar fuera del día o rango de recuperación', unsupported_message: 'sin texto o foto compatible', error: 'falló la descarga o el guardado' } as Record<NonNullable<ReceptionDiagnostics['lastSupplierResult']>, string>)[session.reception.lastSupplierResult ?? 'processing']}</b></p> : session.reception.lastGroupMessageAt ? <p>WhatsApp reportó actividad en <strong>{session.reception.lastGroupName}</strong>, pero no en un grupo proveedor configurado.</p> : <p>WhatsApp recibió eventos ({session.reception.lastUpsertType}, {session.reception.lastUpsertMessageCount} mensaje(s)), pero no reportó mensajes de grupos proveedor.</p>}
+        {!session.reception.lastUpsertAt ? <p>Esta conexión aún no ha recibido eventos de mensajes. Verifica que este número esté vinculado al WhatsApp que participa en el grupo proveedor.</p> : session.reception.lastSupplierMessageAt ? <p>Último mensaje del proveedor <strong>{session.reception.lastSupplierName}</strong> · {timeLabel(session.reception.lastSupplierMessageAt)}. <b>{({ processing: 'procesando', stored: 'guardado en el catálogo', filtered: 'omitido por filtro de avisos o promociones', pending: 'pendiente de procesar', duplicate: 'ya estaba procesado', older_message_skipped: 'omitido por tener más de 24 horas o una fecha inválida', outside_recovery_window: 'omitido por estar fuera del día o rango de recuperación', unsupported_message: 'sin texto o foto compatible', error: 'falló la descarga o el guardado' } as Record<NonNullable<ReceptionDiagnostics['lastSupplierResult']>, string>)[session.reception.lastSupplierResult ?? 'processing']}</b></p> : session.reception.lastGroupMessageAt ? <p>WhatsApp reportó actividad en <strong>{session.reception.lastGroupName}</strong>, pero no en un grupo proveedor configurado.</p> : <p>WhatsApp recibió eventos ({session.reception.lastUpsertType}, {session.reception.lastUpsertMessageCount} mensaje(s)), pero no reportó mensajes de grupos proveedor.</p>}
         <small>{session.reception.lastUpsertAt ? `Último evento: ${timeLabel(session.reception.lastUpsertAt)} · ${session.reception.lastUpsertType}.` : 'El diagnóstico empieza al conectar y se reinicia cuando se reinicia el servidor.'}</small>
       </div>}
       {recovery && <div className="reception-history" aria-live="polite"><span className="panel-kicker">RECUPERACIÓN DE HOY · {session.receptionSchedule.startTime}–{session.receptionSchedule.endTime}</span><p>{recoveryMessage}</p>{recovery.recoveryWarning && (recovery.recoveryMissingAnchors > 0 || recovery.recoveryFailedRequests > 0 || recovery.recoveryInterruptedGroups > 0) && <small>{recovery.recoveryWarning}</small>}<div className="reception-counters"><span><strong>{recovery.recoveryRequestedGroups}</strong> grupos solicitados</span><span><strong>{recovery.recoveryRespondedGroups}</strong> respondieron</span><span><strong>{recovery.recoveryPendingGroups}</strong> pendientes de respuesta</span><span><strong>{recovery.recoveryMissingAnchors}</strong> sin referencia</span><span><strong>{recovery.recoveryFailedRequests}</strong> sin respuesta o solicitud fallida</span><span><strong>{recovery.recoveryMessageCount}</strong> mensajes recibidos</span><span><strong>{recovery.recoverySavedCount}</strong> publicaciones guardadas</span><span><strong>{recovery.decryptFailureCount}</strong> sin descifrar</span><span><strong>{recovery.mediaFailureCount}</strong> con error de descarga</span><span><strong>{recovery.pendingCount}</strong> pendientes de procesar</span><span><strong>{recovery.failedCount}</strong> con error</span></div>{recovery.decryptFailureCount > 0 && <small>{recovery.decryptFailureCount} publicación(es) de proveedor siguen sin descifrar. Si el error persiste tras reconectar, desconecta y usa “Borrar credenciales y revincular” para revincular manualmente la cuenta.</small>}{recovery.recoveryFinishedAt && <small>Último intento: {timeLabel(recovery.recoveryFinishedAt)}</small>}</div>}
@@ -490,9 +524,16 @@ function ProductCard({ product, busy, realSendsEnabled, connected, targetGroups,
   const boxMargin = product.box_margin_cop_applied ?? 0;
   const candidates = product.analysis.candidates;
   const candidate = product.analysis.candidates.length === 1 ? product.analysis.candidates[0] : undefined;
+  const reviewDefault = productCaption(product, candidates.length ? replacePriceCandidates(product.raw_text, candidates, candidates.map((item) => addMargin(item.amountCop, item.kind === 'box' ? boxMargin : margin))) : product.raw_text);
+  const approvedBrand = brandForProductCaption(product);
+  const modelAddedBrand = approvedBrand && product.images.some((image) => !image.brand.confirmedBrand
+    && normalizeBrandForInput(image.brand.evidence.visualBrand ?? '') === normalizeBrandForInput(approvedBrand));
+  const brandToReview = product.images.find((image) => image.brand.status === 'review' || image.brand.status === 'failed');
+  const defaultOutput = product.status === 'needs_review' ? reviewDefault : prepareOutgoingDescription(product.output_text ?? '');
+  const generatedOutput = useRef(defaultOutput);
   const [price, setPrice] = useState(candidate?.amountCop ? String(candidate.amountCop) : '');
   const [sourcePrices, setSourcePrices] = useState(() => candidates.map((item) => String(item.amountCop)));
-  const [output, setOutput] = useState(product.output_text ? prepareOutgoingDescription(product.output_text) : prepareOutgoingDescription(candidates.length ? replacePriceCandidates(product.raw_text, candidates, candidates.map((item) => addMargin(item.amountCop, item.kind === 'box' ? boxMargin : margin))) : product.raw_text));
+  const [output, setOutput] = useState(defaultOutput);
   const [expanded, setExpanded] = useState(product.status === 'needs_review');
   const [shoeCode, setShoeCode] = useState(product.shoe_code ?? '');
   const [position, setPosition] = useState<OverlayPosition>(product.image_position ?? 'bottom_right');
@@ -520,12 +561,15 @@ function ProductCard({ product, busy, realSendsEnabled, connected, targetGroups,
       const found = product.analysis.candidates.length === 1 ? product.analysis.candidates[0] : undefined;
       setSourcePrices(product.analysis.candidates.map((item) => String(item.amountCop)));
       setPrice(found ? String(found.amountCop) : '');
-      setOutput(prepareOutgoingDescription(product.analysis.candidates.length ? replacePriceCandidates(product.raw_text, product.analysis.candidates, product.analysis.candidates.map((item) => addMargin(item.amountCop, item.kind === 'box' ? boxMargin : margin))) : product.raw_text));
     } else {
-      setOutput(prepareOutgoingDescription(product.output_text ?? ''));
       if (!product.analysis.candidates.length) setPrice(product.source_price_cop === null ? '' : String(product.source_price_cop));
     }
-  }, [product.id, product.status, product.output_text]);
+    setOutput((current) => {
+      const untouchedDraft = current === generatedOutput.current;
+      generatedOutput.current = defaultOutput;
+      return untouchedDraft ? defaultOutput : current;
+    });
+  }, [product.id, product.status, product.output_text, product.raw_text, product.shoe_code, defaultOutput]);
   useEffect(() => { setShoeCode(product.shoe_code ?? ''); setPosition(product.image_position ?? 'bottom_right'); }, [product.id, product.shoe_code, product.image_position]);
   useEffect(() => {
     const dialog = lightboxRef.current;
@@ -540,7 +584,6 @@ function ProductCard({ product, busy, realSendsEnabled, connected, targetGroups,
     ? numericSourcePrices.map((value, index) => addMargin(value, candidates[index]?.kind === 'box' ? boxMargin : margin)) : null;
   const canEdit = !product.publications.some((publication) => ['submitted', 'queued', 'in_progress', 'needs_review'].includes(publication.status));
   const canSend = hasPendingDistribution(product, targetGroups.map((group) => group.id));
-  const reviewDefault = prepareOutgoingDescription(candidates.length ? replacePriceCandidates(product.raw_text, candidates, candidates.map((item) => addMargin(item.amountCop, item.kind === 'box' ? boxMargin : margin))) : product.raw_text);
   const reviewDirty = product.status === 'needs_review' && (output !== reviewDefault || sourcePrices.some((value, index) => value !== String(candidates[index]?.amountCop ?? '')) || (!candidates.length && price !== ''));
   const descriptionDirty = product.status !== 'needs_review' && output !== prepareOutgoingDescription(product.output_text ?? '');
   const imageOptionsDirty = shoeCode.trim() !== (product.shoe_code ?? '') || position !== (product.image_position ?? 'bottom_right');
@@ -557,7 +600,7 @@ function ProductCard({ product, busy, realSendsEnabled, connected, targetGroups,
     setSourcePrices(next);
     const amounts = next.map(Number);
     if (amounts.every((amount) => Number.isSafeInteger(amount) && amount > 0 && amount <= 1_000_000)) {
-      setOutput(prepareOutgoingDescription(replacePriceCandidates(product.raw_text, candidates, amounts.map((amount, currentIndex) => addMargin(amount, candidates[currentIndex]?.kind === 'box' ? boxMargin : margin)))));
+      setOutput(productCaption(product, replacePriceCandidates(product.raw_text, candidates, amounts.map((amount, currentIndex) => addMargin(amount, candidates[currentIndex]?.kind === 'box' ? boxMargin : margin)))));
     }
   }
   async function approve() {
@@ -612,12 +655,14 @@ function ProductCard({ product, busy, realSendsEnabled, connected, targetGroups,
     <div className="product-summary-row"><label className={`product-select ${imageIds.length ? '' : 'not-selectable'}`} title="Seleccionar las fotos de esta referencia"><input type="checkbox" aria-label={`Seleccionar fotos de ${product.title || 'producto'}`} checked={selected} ref={(input) => { if (input) input.indeterminate = partiallySelected; }} disabled={!imageIds.length || deleting} onChange={(event) => onSelectImages(imageIds, event.target.checked)} /><span /></label><button className="product-summary" onClick={() => setExpanded(!expanded)} aria-expanded={expanded}><span className="product-thumb">{product.images[0] ? <img src={product.images[0].url} alt="" /> : <span>▱</span>}</span><span className="product-summary-main"><strong>{product.title || 'Sin nombre'}</strong><span>{product.supplier_name ?? 'Histórico sin proveedor'} <i>·</i> {product.images.length} {product.images.length === 1 ? 'fotografía' : 'fotografías'} <i>·</i> {timeLabel(product.created_at)}</span></span><span className={`status-tag ${statusClass}`}>{['needs_review','in_progress','queued'].includes(statusClass) && <i />}{statusLabel}</span><span className="summary-price">{product.final_price_cop !== null ? formatCop(product.final_price_cop) : '—'}</span><span className="expand-chevron">{expanded ? '⌃' : '⌄'}</span></button></div>
     {expanded && <div className="product-detail">
       <div className="product-provenance"><span><strong>Cuenta:</strong> {product.session_name}</span><span><strong>Proveedor:</strong> {product.supplier_name ?? 'No asignado'}</span><span><strong>Margen PRECIO:</strong> {product.margin_cop_applied === null ? 'Sin configurar' : formatCop(product.margin_cop_applied)}</span><span><strong>Margen CAJA:</strong> {product.box_margin_cop_applied === null ? 'Sin configurar' : formatCop(product.box_margin_cop_applied)}</span></div>
-      {(product.publications.length > 0 || targetGroups.length > 0) && <div className="candidate-note"><strong>Distribución por grupo</strong><ul>{product.publications.map((publication, index) => <li key={`${publication.groupId}-${index}`}>{publication.groupName}: {publication.status === 'submitted' ? 'aceptado por WhatsApp; entrega no confirmada' : publication.status === 'queued' ? 'en cola' : publication.status === 'in_progress' ? 'enviando' : publication.status === 'needs_review' ? 'requiere conciliación' : publication.status}</li>)}{targetGroups.filter((group) => !product.publications.some((publication) => publication.groupId === group.id)).map((group) => <li key={group.id}>{group.name}: <strong>pendiente de enviar</strong></li>)}</ul>{isPartial && <span>El siguiente envío completará únicamente los destinos pendientes.</span>}</div>}
+      {(product.publications.length > 0 || targetGroups.length > 0) && <details className="product-distribution"><summary>Distribución · {product.publications.filter((item) => item.status === 'submitted').length} de {targetGroups.length} destinos aceptaron</summary><ul>{product.publications.map((publication, index) => <li key={`${publication.groupId}-${index}`}>{publication.groupName}: {publication.status === 'submitted' ? 'aceptado por WhatsApp; entrega no confirmada' : publication.status === 'queued' ? 'en cola' : publication.status === 'in_progress' ? 'enviando' : publication.status === 'needs_review' ? 'requiere conciliación' : publication.status}</li>)}{targetGroups.filter((group) => !product.publications.some((publication) => publication.groupId === group.id)).map((group) => <li key={group.id}>{group.name}: <strong>pendiente de enviar</strong></li>)}</ul>{isPartial && <span>El siguiente envío completará únicamente los destinos pendientes.</span>}</details>}
       <div className="review-columns"><div className="product-review-column"><label className="field-label">Fotografías · pulsa para ampliar</label><div className="product-mark-previews">{product.images.map((image, index) => { const previewUrl = `${product.markedImageUrl}?assetId=${encodeURIComponent(image.id)}&v=${previewVersion}&state=${encodeURIComponent([image.marking.status, image.marking.mode, image.marking.manual, image.inspection?.inspectedAt, product.shoe_code, product.updated_at].join(':'))}`; return <div className="image-comparison" key={image.id}><div className="photo-selection"><label><input type="checkbox" aria-label={`Seleccionar foto ${index + 1} de ${product.title || 'producto'}`} checked={selectedImageIds.includes(image.id)} disabled={deleting} onChange={(event) => onSelectImages([image.id], event.target.checked)} /> Foto {index + 1}</label><button type="button" className="secondary-button delete-product-button" aria-label={`Eliminar foto ${index + 1} de ${product.title || 'producto'}`} disabled={deleting} onClick={() => onDeleteImages([image.id])}>Eliminar esta foto</button></div><figure><button type="button" className="image-open" aria-label={`Ampliar fotografía original ${index + 1}`} onClick={() => setLightbox({ url: image.url, label: `Fotografía original ${index + 1}` })}><img src={image.url} alt={`Fotografía original ${index + 1}`} /></button><figcaption>Original {index + 1} · sin cambios</figcaption></figure><figure><button type="button" className="image-open" aria-label={`Ampliar vista previa ${index + 1}`} onClick={() => setLightbox({ url: previewUrl, label: `Resultado marcado, fotografía ${index + 1}` })}><img src={previewUrl} alt={`Vista previa marcada ${index + 1}`} /></button><figcaption>{image.marking.status === 'ready' ? image.marking.mode === 'original' ? `Se enviará original ${index + 1}` : `Se enviará marcada ${index + 1}` : `Vista original · ${image.marking.status === 'pending' ? 'analizando' : 'requiere revisión'}`}</figcaption></figure><div className={image.marking.status === 'review' ? 'candidate-warning image-marking-decision' : 'candidate-note image-marking-decision'}><strong>Foto {index + 1}: {image.marking.status === 'ready' ? 'lista' : image.marking.status === 'pending' ? 'analizando' : 'por revisar'}</strong><span>{image.marking.reason}</span><small>Si el análisis se equivoca, elige qué añadir sobre la foto original. Cada elección reemplaza la anterior.</small><div className="image-marking-actions" role="group" aria-label={`Marcado de fotografía ${index + 1}`}>{([['original', 'Conservar original'], ['mark_code', 'Agregar solo código'], ['mark_world', 'Agregar solo mundo'], ['mark_all', 'Agregar ambos'], ['automatic', 'Usar detección automática']] as const).map(([mode, label]) => <button key={mode} type="button" className="secondary-button" aria-pressed={mode === 'automatic' ? !image.marking.manual : image.marking.manual && image.marking.mode === mode} disabled={busy || editing || !canEdit} title={['mark_code', 'mark_all'].includes(mode) && !shoeCode.trim() ? 'Pulsa para introducir el código y agregarlo a la foto.' : undefined} onClick={() => void resolveMarking(image.id, mode)}>{label}</button>)}</div>{codeRequest?.assetId === image.id && <form className="marking-code-request" onSubmit={(event) => { event.preventDefault(); void resolveMarking(image.id, codeRequest.mode); }}><label className="field-label" htmlFor={`marking-code-${image.id}`}>Escribe el código que quieres agregar</label><input id={`marking-code-${image.id}`} className="text-input" autoFocus required maxLength={32} value={shoeCode} disabled={busy || editing || !canEdit} onChange={(event) => setShoeCode(event.target.value)} placeholder="1059" /><small>No se reconoció un código en la descripción. Puedes escribirlo aquí; se guardará junto con el marcado.</small><div className="image-marking-actions"><button className="primary-button" type="submit" disabled={busy || editing || !canEdit || !shoeCode.trim()}>{codeRequest.mode === 'mark_all' ? 'Guardar código y agregar ambos' : 'Guardar y agregar solo código'}</button><button className="secondary-button" type="button" disabled={editing} onClick={() => setCodeRequest(null)}>Cancelar</button></div></form>}</div></div>; })}</div>
         <label className="field-label spaced">Descripción recibida</label><pre className="source-preview">{product.raw_text || 'La descripción llegó en otro mensaje; revisa que corresponda a esta fotografía.'}</pre>{product.analysis.excluded.length > 0 && <div className="candidate-note">El sistema descartó estos números como precio: {product.analysis.excluded.map((entry) => `${entry.raw} (${entry.reason})`).join(' · ')}</div>}{candidates.length > 1 && (candidates.some((item) => item.kind === 'box') && candidates.some((item) => item.kind === 'price') ? <div className="candidate-note">Se detectaron PRECIO y CAJA; cada importe usa el margen correspondiente a su proveedor.</div> : <div className="candidate-warning">Se encontraron varios precios posibles. Confirma cada importe antes de aprobar.</div>)}
         {candidates.length ? <div className="detected-price-list">{candidates.map((item, index) => { const itemMargin = item.kind === 'box' ? boxMargin : margin; const itemFinal = finalPrices?.[index]; const itemLabel = item.kind === 'box' ? 'Precio de CAJA' : item.kind === 'price' ? 'Precio' : 'Importe por clasificar'; return <section className="detected-price-item" key={`${item.start}-${index}`}><label className="field-label" htmlFor={`price-${product.id}-${index}`}>{itemLabel} <span>COP</span></label><div className="money-input"><span>$</span><input id={`price-${product.id}-${index}`} type="number" min="1" step="1" value={sourcePrices[index] ?? ''} disabled={product.status !== 'needs_review'} onChange={(event) => updateCandidatePrice(index, event.target.value)} /></div><div className="price-equation"><span>Margen de {item.kind === 'box' ? 'CAJA' : 'PRECIO'}</span><strong>+ {formatCop(itemMargin)}</strong><span>Precio de venta</span><strong className="sale-price">{itemFinal !== undefined ? formatCop(itemFinal) : '—'}</strong></div></section>; })}</div> : <><label className="field-label spaced" htmlFor={`price-${product.id}`}>Precio del proveedor <span>COP</span></label><div className="money-input"><span>$</span><input id={`price-${product.id}`} type="number" min="1" step="1" value={price} disabled={product.status !== 'needs_review'} onChange={(event) => updateSourcePrice(event.target.value)} placeholder="60000" /></div><div className="price-equation"><span>Margen del proveedor</span><strong>+ {formatCop(margin)}</strong><span>Precio de venta</span><strong className="sale-price">{finalPrice !== null ? formatCop(finalPrice) : '—'}</strong></div></>}
         <label className="field-label spaced" htmlFor={`output-${product.id}`}>Texto y descripción que se enviarán</label><textarea id={`output-${product.id}`} className="output-edit" rows={7} value={output} maxLength={12000} disabled={busy || editing || !canEdit} onChange={(event) => setOutput(event.target.value)} />
-        <p className="image-inspect-note">Puedes corregir el texto antes de enviarlo. Al guardar se eliminan todas las líneas con docena y se conserva el formato de publicación.</p>
+        {approvedBrand && <p className="brand-applied-note">{approvedBrand} · agregada automáticamente a la descripción{modelAddedBrand ? ' por Florence + Qwen' : ''}.</p>}
+        {!approvedBrand && brandToReview && <p className="brand-review-note">Marca por revisar{brandToReview.brand.suggestedBrand ? ` · posible ${brandToReview.brand.suggestedBrand}` : ''}.</p>}
+        <p className="image-inspect-note">Revisa el precio y la descripción antes de aprobar.</p>
         {product.status !== 'needs_review' && canEdit && <button className="secondary-button full-button" disabled={busy || editing || !descriptionDirty || !output.trim()} onClick={() => void saveDescription()}>{savingDescription ? 'Guardando…' : 'Guardar descripción'}</button>}
         {descriptionDirty && <div className="candidate-warning">Hay cambios en la descripción sin guardar.</div>}
         {product.status === 'needs_review' && <button className="primary-button full-button" disabled={busy || approving || (candidates.length ? finalPrices === null : !finalPrice) || product.margin_cop_applied === null || (candidates.some((item) => item.kind === 'box') && product.box_margin_cop_applied === null) || !product.images.length} onClick={() => void approve()}><span>{approving ? 'Aprobando…' : 'Aprobar precio y texto'}</span><span>{approving ? '…' : '→'}</span></button>}
@@ -625,15 +670,78 @@ function ProductCard({ product, busy, realSendsEnabled, connected, targetGroups,
         {isSending && <div className="send-inline-status" role="status"><span className="progress-pulse" /> Enviando a los grupos destino. Esta pantalla se actualizará al confirmar cada foto.</div>}
         {isQueued && <div className="send-inline-status" role="status"><span className="progress-pulse" /> En cola · se respetará la pausa configurada entre fotos.</div>}
         {isSent && <><div className="simulated-note"><span>✓</span> WhatsApp aceptó la publicación. Esta confirmación no indica si los destinatarios la recibieron.</div></>}</div><div className="product-tools-column">
-        <label className="field-label spaced" htmlFor={`code-${product.id}`}>Código para la fotografía <span>opcional</span></label><input id={`code-${product.id}`} className="text-input" value={shoeCode} disabled={busy || editing || !canEdit} maxLength={32} onChange={(event) => setShoeCode(event.target.value)} placeholder="143 o AB-123" /><p className="image-inspect-note">La etiqueta añade D para DAMA, MUJER o D; y H para HOMBRE, VARÓN, CABALLERO o H, después del código y antes del mundo.</p>
+        <label className="field-label spaced" htmlFor={`code-${product.id}`}>Código para la fotografía <span>opcional</span></label><input id={`code-${product.id}`} className="text-input" value={shoeCode} disabled={busy || editing || !canEdit} maxLength={32} onChange={(event) => setShoeCode(event.target.value)} placeholder="143 o AB-123" /><p className="image-inspect-note">Se agrega a la marca de agua de la foto.</p>
         {captionCode && captionCode.toUpperCase() !== (product.shoe_code ?? '').toUpperCase() && <div className="candidate-note">Código detectado en la descripción: <strong>{captionCode}</strong> <button className="secondary-button" disabled={busy || savingImage} onClick={() => void saveImageOptions(captionCode)}>Usar código de la descripción</button></div>}
-        <button className="secondary-button image-inspect-button" disabled={inspectingImage || busy || product.images.length === 0} onClick={() => void inspectImages()}>{inspectingImage ? 'Analizando fotos en este computador…' : 'Volver a analizar las fotos'}</button>
-        <p className="image-inspect-note">El análisis se inicia automáticamente al recibir cada foto. Se ejecuta localmente; la primera vez se descargan y guardan los datos de idioma de OCR.</p>
-        {product.images.some((image) => image.inspection) && <div className="image-inspection-results"><strong>Qué se detectó en las fotos</strong>{product.images.map((image, index) => image.inspection && <section className="image-inspection-item" key={image.id}><span>Foto {index + 1}: {image.inspection.world.detected ? 'el análisis detectó un mundo; compruébalo en el original' : 'el análisis no confirmó el mundo'}</span>{image.inspection.codeCandidates.some((item) => item.confidence >= 0.6) ? <div className="image-code-candidates">{image.inspection.codeCandidates.filter((item) => item.confidence >= 0.6).map((item) => <button className={`candidate-chip ${shoeCode.toUpperCase() === item.code.toUpperCase() ? 'selected' : ''}`} key={`${image.id}-${item.code}`} onClick={() => setShoeCode(item.code)}>Usar código {item.code} · {Math.round(item.confidence * 100)}%</button>)}</div> : <small>{image.inspection.ocrError ? `No se pudo leer el texto de la foto: ${image.inspection.ocrError}` : product.shoe_code ? `No se identificó un código claro en la foto. Código para el marcado: ${product.shoe_code}.` : 'No se identificó un código claro en la foto ni en la descripción. Puedes escribirlo o pulsar Agregar solo código / Agregar ambos.'}</small>}<details><summary>Ver texto y detalles del análisis</summary>{image.inspection.engineVersion && <small>Motor local: {image.inspection.engineVersion} · {image.inspection.durationMs === null || image.inspection.durationMs === undefined ? 'Tiempo no disponible' : `${(image.inspection.durationMs / 1000).toLocaleString('es-CO', { maximumFractionDigits: 2 })} s`} · {image.inspection.cacheHit ? 'Resultado reutilizado de una foto idéntica' : 'Análisis nuevo'}</small>}<small>Confianza de lectura: {Math.round(image.inspection.ocrConfidence * 100)}%</small><pre>{image.inspection.ocrError ? `No se pudo leer el texto: ${image.inspection.ocrError}` : image.inspection.ocrText || 'No se reconoció texto.'}</pre></details></section>)}</div>}
-        <label className="field-label spaced" htmlFor={`position-${product.id}`}>Esquina de la marca</label><select id={`position-${product.id}`} className="group-select" value={position} disabled={busy || editing || !canEdit} onChange={(event) => setPosition(event.target.value as OverlayPosition)}>{POSITIONS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select><button className="secondary-button save-image-options" disabled={editing || busy || !canEdit || !imageOptionsDirty} onClick={() => void saveImageOptions()}>Actualizar vista previa marcada</button></div></div>
+        <details className="photo-analysis-tools"><summary>Análisis y ajustes de fotografía</summary>
+          <button className="secondary-button image-inspect-button" disabled={inspectingImage || busy || product.images.length === 0} onClick={() => void inspectImages()}>{inspectingImage ? 'Analizando…' : 'Volver a analizar'}</button>
+          {product.images.some((image) => image.inspection) && <div className="image-inspection-results"><strong>Lectura de las fotos</strong>{product.images.map((image, index) => image.inspection && <section className="image-inspection-item" key={image.id}><span>Foto {index + 1}: {image.inspection.world.detected ? 'mundo detectado' : 'mundo no confirmado'}</span>{image.inspection.codeCandidates.some((item) => item.confidence >= 0.6) && <div className="image-code-candidates">{image.inspection.codeCandidates.filter((item) => item.confidence >= 0.6).map((item) => <button className={`candidate-chip ${shoeCode.toUpperCase() === item.code.toUpperCase() ? 'selected' : ''}`} key={`${image.id}-${item.code}`} onClick={() => setShoeCode(item.code)}>Usar {item.code}</button>)}</div>}<details><summary>Detalles del texto reconocido</summary>{image.inspection.engineVersion && <small>{image.inspection.engineVersion} · {image.inspection.durationMs === null || image.inspection.durationMs === undefined ? 'Tiempo no disponible' : `${(image.inspection.durationMs / 1000).toLocaleString('es-CO', { maximumFractionDigits: 2 })} s`}</small>}<pre>{image.inspection.ocrError ? `Error de lectura: ${image.inspection.ocrError}` : image.inspection.ocrText || 'No se reconoció texto.'}</pre></details></section>)}</div>}
+          <div className="image-brand-results"><strong>Marca</strong>{product.images.map((image, index) => <ImageBrandReview key={image.id} image={image} imageNumber={index + 1} productId={product.id} disabled={busy || editing || deleting} onSaved={onApproved} onError={onError} />)}</div>
+          <label className="field-label spaced" htmlFor={`position-${product.id}`}>Esquina de la marca de agua</label><select id={`position-${product.id}`} className="group-select" value={position} disabled={busy || editing || !canEdit} onChange={(event) => setPosition(event.target.value as OverlayPosition)}>{POSITIONS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select><button className="secondary-button save-image-options" disabled={editing || busy || !canEdit || !imageOptionsDirty} onClick={() => void saveImageOptions()}>Actualizar vista previa</button>
+        </details></div></div>
     </div>}
     <dialog ref={lightboxRef} className="image-lightbox" aria-label={lightbox?.label ?? 'Vista ampliada'} onClose={() => setLightbox(null)} onClick={(event) => { if (event.target === event.currentTarget) event.currentTarget.close(); }}><button type="button" className="lightbox-close" aria-label="Cerrar fotografía" onClick={() => lightboxRef.current?.close()}>×</button>{lightbox && <><img src={lightbox.url} alt={lightbox.label} /><p>{lightbox.label}</p></>}</dialog>
   </article>;
+}
+
+function ImageBrandReview({ image, imageNumber, productId, disabled, onSaved, onError }: { image: Image; imageNumber: number; productId: string; disabled: boolean; onSaved: () => Promise<void>; onError: (value: string) => void }) {
+  const editRef = useRef<HTMLDetailsElement>(null);
+  const savingRef = useRef(false);
+  const [brand, setBrand] = useState(image.brand.confirmedBrand ?? '');
+  const [aliases, setAliases] = useState('');
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { setBrand(image.brand.confirmedBrand ?? ''); }, [image.brand.confirmedBrand]);
+  const statusLabel = image.brand.status === 'confirmed'
+    ? `${image.brand.confirmedBrand ?? 'Confirmada'} · ${image.brand.autoEligible ? 'automática' : image.brand.manualOverride ? 'corregida' : 'confirmada'}`
+    : image.brand.status === 'review' ? `Por revisar${image.brand.suggestedBrand ? ` · posible ${image.brand.suggestedBrand}` : ''}`
+      : image.brand.status === 'unknown' ? 'Sin marca legible'
+        : image.brand.status === 'failed' ? 'No se pudo analizar' : 'Analizando marca…';
+  const signals = [...new Set([...(image.brand.evidence.captionCandidates ?? []), ...(image.brand.evidence.ocrCandidates ?? [])])];
+  const referenceMatches = (image.brand.evidence.referenceMatches ?? []).filter((match) => (match.supportCount ?? 0) > 0);
+
+  async function save(value: string | null) {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      await api(`/products/${productId}/images/${image.id}/brand`, {
+        method: 'PUT', ...json({ brand: value, aliases: aliases.split(',').map((alias) => alias.trim()).filter(Boolean) }),
+      });
+      await onSaved();
+      setBrand(value ?? '');
+      setAliases('');
+    } catch (error) { onError(error instanceof Error ? error.message : 'No se pudo guardar la marca.'); }
+    finally { savingRef.current = false; setSaving(false); }
+  }
+  function saveEditedBrand() {
+    const value = brand.trim();
+    const changedBrand = value.length >= 2 && normalizeBrandForInput(value) !== normalizeBrandForInput(image.brand.confirmedBrand ?? '');
+    if (changedBrand || aliases.trim() && value.length >= 2) void save(value);
+  }
+
+  return <section className="image-brand-review" aria-label={`Marca de la fotografía ${imageNumber}`}>
+    <div className="image-brand-heading"><strong>Foto {imageNumber}</strong><span className={image.brand.status === 'confirmed' ? 'brand-status-confirmed' : 'brand-status-review'}>{statusLabel}</span></div>
+    <details ref={editRef} className="image-brand-edit" onBlurCapture={(event) => { const details = event.currentTarget; window.setTimeout(() => { if (!details.contains(document.activeElement)) saveEditedBrand(); }, 0); }} onToggle={(event) => { if (!event.currentTarget.open) saveEditedBrand(); }}><summary>Corregir marca</summary>
+      <label className="field-label" htmlFor={`brand-${image.id}`}>Marca correcta</label>
+      <input id={`brand-${image.id}`} className="text-input" maxLength={80} value={brand} disabled={disabled || saving} onChange={(event) => setBrand(event.target.value)} placeholder={image.brand.suggestedBrand ? `Sugerencia: ${image.brand.suggestedBrand}` : 'Escribe la marca'} />
+      <label className="field-label" htmlFor={`brand-alias-${image.id}`}>Alias <span>opcional</span></label>
+      <input id={`brand-alias-${image.id}`} className="text-input" maxLength={240} value={aliases} disabled={disabled || saving} onChange={(event) => setAliases(event.target.value)} placeholder="Ej. NB, separados por comas" />
+      <button type="button" className="brand-unknown-action" disabled={disabled || saving} onClick={() => void save(null)}>La marca no es legible</button>
+      {saving && <small role="status">Guardando corrección…</small>}
+    </details>
+    {(image.brand.reason || image.brand.error || signals.length > 0 || image.brand.candidates.length > 0 || image.brand.evidence.visualAnswer || image.brand.evidence.referenceMatches?.length || image.brand.evidence.visualError || image.brand.evidence.sneakerError) && <details className="image-brand-diagnostics"><summary>Detalles del análisis</summary>
+      {image.brand.reason && <small>{image.brand.reason}</small>}{image.brand.error && <small role="alert">{image.brand.error}</small>}
+      {image.brand.candidates.length > 0 && <small>SigLIP · marcas candidatas (texto, catálogo y marcas conocidas; puntuaciones relativas): {image.brand.candidates.slice(0, 3).map((candidate) => `${candidate.brand} ${Math.round(candidate.score * 100)}%`).join(' · ')}</small>}
+      {referenceMatches.length > 0 && <small>Similitud con fotos verificadas: {referenceMatches.slice(0, 3).map((match) => `${match.brand} ${Math.round(match.score * 100)}% · ${match.supportCount} ${match.supportCount === 1 ? 'foto' : 'fotos'}`).join(' · ')}</small>}
+      {image.brand.evidence.visualAnswer && <small>{image.brand.evidence.visualModel ?? 'Modelo visual'}: {image.brand.evidence.visualAnswer}</small>}
+      {image.brand.evidence.visualLogoText && <small>OCR del calzado: {image.brand.evidence.visualLogoText}</small>}{image.brand.evidence.visualEvidence && <small>Evidencia visual: {image.brand.evidence.visualEvidence}</small>}
+      {image.brand.evidence.visualError && <small>Falló el análisis visual: {image.brand.evidence.visualError}</small>}{image.brand.evidence.sneakerError && <small>Falló el clasificador: {image.brand.evidence.sneakerError}</small>}
+      {signals.length > 0 && <small>Texto relacionado: {signals.slice(0, 8).join(' · ')}</small>}
+    </details>}
+  </section>;
+}
+
+function normalizeBrandForInput(value: string) {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/gu, '').replace(/[^\p{L}\p{N}]+/gu, '').toLocaleLowerCase('es-CO');
 }
 
 function ActivityView({ logs, sessionName, onRefresh }: { logs: ApplicationLog[]; sessionName: string; onRefresh: () => void }) {

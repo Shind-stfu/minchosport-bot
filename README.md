@@ -115,3 +115,52 @@ pnpm build
 ```
 
 La conexión QR, recepción del proveedor, cola por destino y envío experimental están implementados para probarse localmente. La sesión y las publicaciones requieren un piloto controlado con grupos propios; la automatización no es una integración oficial ni garantiza entrega. Revisa [`PLAN.md`](./PLAN.md) para los límites investigados y las fases futuras.
+
+### Clasificador local de zapatillas
+
+El análisis de marcas puede usar `dima806/popular_sneakers_detection` junto con las señales existentes. Para instalar su entorno local desde la raíz del proyecto:
+
+```bash
+python3 -m venv data/sneaker-model-venv
+data/sneaker-model-venv/bin/pip install 'torch==2.2.2' 'transformers==4.46.3' 'pillow>=10,<12' 'numpy<2' 'safetensors>=0.4'
+```
+
+La primera ejecución descarga los pesos desde Hugging Face; las imágenes se procesan localmente. También se puede indicar otro intérprete con `SNEAKER_MODEL_PYTHON`. El modelo clasifica modelos concretos de un conjunto cerrado; se agrupan sus puntuaciones por marca y Jordan se mantiene separado de Nike. Esas puntuaciones no son probabilidades de acierto calibradas. Las marcas desconocidas o fotos sin calzado requieren revisión. La asignación automática exige la calibración específica de esta versión; si el modelo no está disponible, se conservan las otras señales y no se asigna automáticamente.
+
+### Detección de marca con Florence-2 y Qwen3.5
+
+Florence-2-base-ft localiza hasta dos zapatillas en la imagen y Qwen3.5-0.8B analiza los recortes para leer el logo; esa respuesta es la sugerencia principal y se agrega automáticamente al borrador antes del código REF. SigLIP 2, las referencias guardadas y el clasificador de zapatillas quedan como señales de contraste. Si discrepan, la marca conserva el estado «por revisar», pero la sugerencia permanece en el borrador; esto no aprueba el producto ni inicia un envío. Las revisiones exactas de los dos modelos ONNX están fijadas; la primera inferencia descarga sus pesos y luego se ejecuta localmente.
+
+Las correcciones manuales se guardan como etiquetas verificadas. Por cada marca, cuatro de cada cinco ejemplos pueden servir como referencias; cada quinto se reserva para una evaluación independiente y se excluye del buscador de referencias. El panel muestra cobertura, precisión, avance por marca y resultados separados por señal. La confirmación automática requiere al menos 20 predicciones de evaluación independiente, 95 % de precisión para esa marca, y que Florence + Qwen concuerden en el logo. Las fotos ya revisadas con modelos anteriores se vuelven a analizar al iniciar esta versión y no se cuentan como si fueran resultados de la actual.
+
+### Comparar fotos de referencia con SigLIP 2
+
+La aplicación utiliza SigLIP 2 localmente. Al comparar una foto con referencias guardadas, promedia las tres similitudes más altas por marca. Las referencias solo se usan como señal cuando hay al menos tres fotos distintas de esa marca y una diferencia mínima frente a la siguiente; la selección distribuye hasta ocho fotos por marca entre las fechas disponibles. La similitud coseno no representa una probabilidad y el modelo de clases cerradas solo aporta evidencia secundaria.
+
+Además, `identificar_marcas.py` permite probar por separado el checkpoint oficial `google/siglip2-base-patch16-224`, sin modificar la base de datos de la aplicación. Requiere Python 3.10 o posterior:
+
+```bash
+python3 -m venv .venv-marcas
+source .venv-marcas/bin/activate
+pip install -r requirements_marcas.txt
+pip install pytest
+python -m pytest -q tests/test_identificar_marcas.py
+python identificar_marcas.py --help
+```
+
+Para un catálogo propio, organiza las fotos en carpetas como `referencias/Nike/` y `referencias/Adidas/` y ejecuta:
+
+```bash
+python identificar_marcas.py foto.jpg --referencias referencias --top-k 5
+python identificar_marcas.py foto.jpg --referencias referencias --device cpu --json
+```
+
+Para usar las referencias ya guardadas en la aplicación, indica la ruta de su `business.sqlite`. Por ejemplo, en macOS con los datos predeterminados del modo experimental:
+
+```bash
+python identificar_marcas.py foto.jpg --base-de-datos "$HOME/Library/Application Support/BotDistribuidorTenis/modes/experimental/business.sqlite" --json
+```
+
+La consulta se excluye del catálogo si su contenido es idéntico a una referencia. Las imágenes dañadas se informan y se omiten. La primera ejecución descarga el modelo; las posteriores utilizan la caché local y pueden funcionar sin internet. Las fotos nunca se envían a un servicio externo. Se selecciona CUDA, MPS o CPU automáticamente; `--device` permite elegir el dispositivo, y `--lote` controla la cantidad de imágenes procesadas a la vez.
+
+El resultado es una **marca estimada por parecido visual**, no necesariamente por un logo visible. La similitud coseno no es una probabilidad. Sin `--umbral` siempre se propone la marca más cercana; si la marca real no está en el catálogo, esta propuesta puede ser incorrecta. `--umbral` permite obtener «Desconocida», pero debe elegirse y evaluarse previamente con fotos separadas y ejemplos negativos; no hay un valor recomendado o calibrado por defecto. Las referencias que se usan para buscar coincidencias no sirven para medir por sí solas la precisión de generalización.

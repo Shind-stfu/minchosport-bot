@@ -1,5 +1,6 @@
 import { config as loadEnv } from 'dotenv';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import pino from 'pino';
@@ -11,7 +12,9 @@ import { SupplierReceptionService } from './supplier-reception.js';
 import { OutboundDistributionRegistry } from './outbound-distribution.js';
 import { ImageInspectorPool } from './image-inspector-pool.js';
 import { ImageInspectionCoordinator } from './image-inspection-coordinator.js';
+import { ImageBrandInspector } from './image-brand-inspection.js';
 import { prepareDataDirectory } from './data-directory.js';
+import { reconcileRegisteredBrandAliases } from './approved-brand-description.js';
 
 loadEnv({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) });
 
@@ -31,10 +34,19 @@ const config = Environment.parse(process.env);
 const preparedData = prepareDataDirectory({ appMode: config.APP_MODE, ...(config.DATA_DIR ? { dataDir: config.DATA_DIR } : {}) });
 const dataDirectory = preparedData.dataDirectory;
 const database = openDatabase(resolve(dataDirectory, 'business.sqlite'), config.DEFAULT_MARGIN_COP);
+reconcileRegisteredBrandAliases(database);
 const messagingEnabled = config.APP_MODE === 'experimental' && config.WHATSAPP_ENABLED;
 const whatsappLogger = pino({ level: config.LOG_LEVEL, redact: { paths: ['*.qr', '*.token', '*.password'], censor: '[REDACTED]' } });
-const imageInspections = new ImageInspectionCoordinator(database, dataDirectory, new ImageInspectorPool(join(dataDirectory, 'ocr-cache'), config.IMAGE_ANALYSIS_WORKERS));
-const supplierIngestion = new SupplierIngestionService(database, dataDirectory, whatsappLogger, (assetId) => { void imageInspections.schedule(assetId); });
+const imageInspector = new ImageInspectorPool(join(dataDirectory, 'ocr-cache'), config.IMAGE_ANALYSIS_WORKERS);
+const nearbyModelCaches = [join(dirname(dataDirectory), 'models'), join(dirname(dirname(dataDirectory)), 'models')];
+const sharedModelCache = nearbyModelCaches.find((directory) => existsSync(join(directory, 'qwen3.5')) && existsSync(join(directory, 'florence2')))
+  ?? nearbyModelCaches[0]!;
+const imageBrandInspector = new ImageBrandInspector(join(sharedModelCache, 'siglip2'));
+const imageInspections = new ImageInspectionCoordinator(database, dataDirectory, imageInspector, imageBrandInspector);
+const supplierIngestion = new SupplierIngestionService(database, dataDirectory, whatsappLogger,
+  (assetId) => { void imageInspections.schedule(assetId); },
+  async (source) => (await imageInspector.inspect(source)).ocrText,
+  async (source) => imageBrandInspector.hasFootwear(source));
 const supplierReception = new SupplierReceptionService(database, dataDirectory, supplierIngestion, whatsappLogger);
 const sessions = new WhatsmeowSessionRegistry(database, dataDirectory, whatsappLogger, messagingEnabled, supplierIngestion, supplierReception);
 const distributions = new OutboundDistributionRegistry(database, dataDirectory, (sessionId) => sessions.get(sessionId), whatsappLogger, messagingEnabled && config.WHATSAPP_SEND_ENABLED);

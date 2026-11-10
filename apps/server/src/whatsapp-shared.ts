@@ -2,7 +2,7 @@ import { DEFAULT_RECOVERY_SCHEDULE, isInRecoveryWindow, type ReceptionSchedule }
 
 export type WhatsAppStatus = 'disabled' | 'disconnected' | 'connecting' | 'qr' | 'connected' | 'logged_out';
 export type WhatsAppGroup = { id: string; name: string };
-export type WhatsAppReceptionResult = 'processing' | 'stored' | 'duplicate' | 'pending' | 'older_message_skipped' | 'outside_recovery_window' | 'unsupported_message' | 'error';
+export type WhatsAppReceptionResult = 'processing' | 'stored' | 'filtered' | 'duplicate' | 'pending' | 'older_message_skipped' | 'outside_recovery_window' | 'unsupported_message' | 'error';
 export type WhatsAppReceptionDiagnostics = {
   lastUpsertAt: string | null;
   lastUpsertType: 'notify' | 'append' | null;

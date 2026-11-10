@@ -368,7 +368,7 @@ export class BaileysConnector implements WhatsAppConnector {
       failureStage = 'processing';
       if (this.supplierReception) {
         const outcome = await this.supplierReception.capture(payload, upsertType === 'history');
-        this.reception = { ...this.reception, lastSupplierResult: outcome === 'stored' ? 'stored' : outcome === 'failed' ? 'error' : outcome === 'pending' ? 'pending' : outcome === 'outside_window' ? 'outside_recovery_window' : 'duplicate' };
+        this.reception = { ...this.reception, lastSupplierResult: outcome === 'stored' ? 'stored' : outcome === 'ignored' ? 'filtered' : outcome === 'failed' ? 'error' : outcome === 'pending' ? 'pending' : outcome === 'outside_window' ? 'outside_recovery_window' : 'duplicate' };
         if (outcome === 'stored' && inbox?.error === DECRYPTION_PENDING) writeApplicationLog(this.db, { sessionId: this.sessionId, category: 'connection', action: 'supplier.message.decrypt.recovered', entityType: 'whatsapp_group', entityId: groupId,
           message: 'WhatsApp volvió a entregar la publicación descifrada y se incorporó al catálogo', details: { messageId } });
       } else {

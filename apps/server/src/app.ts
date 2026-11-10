@@ -16,12 +16,16 @@ import { genderIndicatorFromDescription, saveMarkedImage } from './image-marking
 import { LocalImageInspector, type ImageInspection } from './image-inspection.js';
 import { ImageInspectionCoordinator } from './image-inspection-coordinator.js';
 import { ImageInspectorPool } from './image-inspector-pool.js';
+import { BRAND_MODEL_ID, type ImageBrandInspection } from './image-brand-inspection.js';
+import { normalizeBrandName } from './brand-candidates.js';
+import { brandSourcePredictions, evaluateBrandSuggestions } from './brand-evaluation.js';
 import { markOptions, readMarkDecision, type MarkMode } from './image-marking-decision.js';
 import { writeApplicationLog } from './application-log.js';
 import { removeProductImages, removeProducts } from './product-cleanup.js';
 import type { SupplierReceptionService } from './supplier-reception.js';
 import QRCode from 'qrcode';
 import { readReceptionSchedule, recoveryStartTimestampMs } from './reception-schedule.js';
+import { applyConfirmedBrandToApprovedDescription } from './approved-brand-description.js';
 
 class ApprovalError extends Error {
   constructor(readonly statusCode: number, message: string) { super(message); }
@@ -114,8 +118,11 @@ function publicProduct(db: AppDatabase, assetsDirectory: string, product: Record
       i.ocr_text as ocrText, i.ocr_confidence as ocrConfidence, i.ocr_error as ocrError, i.code_candidates_json as codeCandidatesJson,
       i.detected_code as detectedCode, i.code_confidence as codeConfidence, i.world_variant as worldVariant,
       i.world_confidence as worldConfidence, i.inspected_at as inspectedAt,
-      i.engine_version as engineVersion,i.duration_ms as durationMs,i.ocr_passes as ocrPasses,i.cache_hit as cacheHit,i.world_detected as worldDetected
-    FROM media_assets m LEFT JOIN image_inspections i ON i.media_asset_id=m.id WHERE m.product_id=? ORDER BY m.position`)
+      i.engine_version as engineVersion,i.duration_ms as durationMs,i.ocr_passes as ocrPasses,i.cache_hit as cacheHit,i.world_detected as worldDetected,
+      b.model_id as brandModelId,b.status as brandStatus,b.suggested_brand as suggestedBrand,b.confirmed_brand as confirmedBrand,b.score as brandScore,
+      b.candidates_json as brandCandidatesJson,b.evidence_json as brandEvidenceJson,b.auto_eligible as brandAutoEligible,b.manual_override as brandManualOverride,b.reason as brandReason,b.error as brandError,b.inspected_at as brandInspectedAt,
+      (SELECT COUNT(*) FROM shoe_brand_references r WHERE r.media_asset_id=m.id) as brandReferenceCount
+    FROM media_assets m LEFT JOIN image_inspections i ON i.media_asset_id=m.id LEFT JOIN image_brand_inspections b ON b.media_asset_id=m.id WHERE m.product_id=? ORDER BY m.position`)
     .all(product.id as string) as Array<Record<string, unknown>>;
   const publications = db.prepare('SELECT group_id as groupId,group_name as groupName,status,updated_at as updatedAt FROM outbound_publications WHERE product_id=? ORDER BY created_at')
     .all(product.id as string) as Array<Record<string, unknown>>;
@@ -130,6 +137,12 @@ function publicProduct(db: AppDatabase, assetsDirectory: string, product: Record
     images: assets.map((asset) => ({
       id: asset.id, fileName: asset.fileName, mimeType: asset.mimeType, sizeBytes: asset.sizeBytes, position: asset.position,
       url: `/api/media/${asset.id}`,
+      brand: asset.brandModelId ? {
+        modelId: asset.brandModelId, status: asset.brandStatus, suggestedBrand: asset.suggestedBrand, confirmedBrand: asset.confirmedBrand,
+        score: asset.brandScore, candidates: JSON.parse(String(asset.brandCandidatesJson ?? '[]')),
+        evidence: JSON.parse(String(asset.brandEvidenceJson ?? '{}')), autoEligible: Boolean(asset.brandAutoEligible), manualOverride: Boolean(asset.brandManualOverride), reason: asset.brandReason,
+        error: asset.brandError, inspectedAt: asset.brandInspectedAt, referenceCount: asset.brandReferenceCount,
+      } : { modelId: null, status: 'pending', suggestedBrand: null, confirmedBrand: null, score: 0, candidates: [], evidence: {}, autoEligible: false, manualOverride: false, reason: 'La marca está pendiente de análisis.', error: null, inspectedAt: null, referenceCount: 0 },
       marking: readMarkDecision(db, asset.id as string, effectiveCode),
       inspection: asset.inspectedAt ? {
         ocrText: asset.ocrText,
@@ -553,6 +566,42 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     return products.map((product) => publicProduct(db, mediaDirectory, product));
   });
 
+  app.get('/api/image-brand-metrics', async () => {
+    const samples = db.prepare(`SELECT predicted_brand as predictedBrand,expected_brand as expectedBrand,source_predictions_json as sourcePredictionsJson
+      FROM shoe_brand_evaluation_samples WHERE model_id=? AND split='holdout'`).all(BRAND_MODEL_ID) as Array<{ predictedBrand: string | null; expectedBrand: string | null; sourcePredictionsJson: string }>;
+    const evaluated = evaluateBrandSuggestions(samples.map((sample) => {
+      let sourcePredictions: Record<string, string | null> = {};
+      try { sourcePredictions = JSON.parse(sample.sourcePredictionsJson); } catch { /* Old samples have no source-level detail. */ }
+      return { predictedBrand: sample.predictedBrand, expectedBrand: sample.expectedBrand, sourcePredictions };
+    }));
+    const labels = db.prepare(`SELECT COALESCE(expected_brand,'') as expectedBrand,split,COUNT(*) as count
+      FROM shoe_brand_labels GROUP BY expected_brand,split`).all() as Array<{ expectedBrand: string; split: 'reference' | 'holdout'; count: number }>;
+    const references = db.prepare(`SELECT normalized_brand as normalizedBrand,COUNT(*) as count FROM shoe_brand_references GROUP BY normalized_brand`)
+      .all() as Array<{ normalizedBrand: string; count: number }>;
+    const evaluatedByExpectedBrand = db.prepare(`SELECT expected_brand as expectedBrand,COUNT(*) as count FROM shoe_brand_evaluation_samples
+      WHERE model_id=? AND split='holdout' GROUP BY expected_brand`).all(BRAND_MODEL_ID) as Array<{ expectedBrand: string | null; count: number }>;
+    const registeredBrands = db.prepare('SELECT normalized_name as normalizedName,display_name as displayName FROM shoe_brand_registry ORDER BY display_name')
+      .all() as Array<{ normalizedName: string; displayName: string }>;
+    const brands = registeredBrands.map((brand) => {
+      const brandLabels = labels.filter((row) => row.expectedBrand && normalizeBrandName(row.expectedBrand) === brand.normalizedName);
+      return {
+        brand: brand.displayName,
+        referenceCount: references.find((row) => row.normalizedBrand === brand.normalizedName)?.count ?? 0,
+        reviewedCount: brandLabels.reduce((sum, row) => sum + row.count, 0),
+        holdoutLabelCount: brandLabels.filter((row) => row.split === 'holdout').reduce((sum, row) => sum + row.count, 0),
+        evaluatedCount: evaluatedByExpectedBrand.filter((row) => row.expectedBrand && normalizeBrandName(row.expectedBrand) === brand.normalizedName).reduce((sum, row) => sum + row.count, 0),
+      };
+    });
+    return {
+      ...evaluated,
+      modelId: BRAND_MODEL_ID,
+      reviewedLabelCount: labels.reduce((sum, row) => sum + row.count, 0),
+      holdoutLabelCount: labels.filter((row) => row.split === 'holdout').reduce((sum, row) => sum + row.count, 0),
+      referenceLabelCount: references.reduce((sum, row) => sum + row.count, 0),
+      brands,
+    };
+  });
+
   app.delete<{ Params: { id: string } }>('/api/products/:id', async (request, reply) => {
     const product = db.prepare('SELECT id,session_id,title FROM products WHERE id=?').get(request.params.id) as { id: string; session_id: string; title: string } | undefined;
     if (!product) return reply.code(404).send({ error: 'Producto no encontrado.' });
@@ -660,6 +709,83 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       ocrFailures,
     });
     return { inspections: results, errors };
+  });
+
+  app.put<{ Params: { id: string; assetId: string } }>('/api/products/:id/images/:assetId/brand', async (request, reply) => {
+    const product = db.prepare('SELECT id,session_id FROM products WHERE id=?').get(request.params.id) as { id: string; session_id: string } | undefined;
+    if (!product) return reply.code(404).send({ error: 'Producto no encontrado.' });
+    const asset = db.prepare(`SELECT m.id,m.sha256 as sha256,b.model_id as brandModelId,b.status as brandStatus,b.suggested_brand as suggestedBrand,
+        b.candidates_json as candidatesJson,b.evidence_json as evidenceJson FROM media_assets m
+      JOIN products p ON p.id=m.product_id LEFT JOIN image_brand_inspections b ON b.media_asset_id=m.id
+      WHERE m.id=? AND m.product_id=?`).get(request.params.assetId, product.id) as { id: string; sha256: string; brandModelId: string | null; brandStatus: string | null; suggestedBrand: string | null; candidatesJson: string | null; evidenceJson: string | null } | undefined;
+    if (!asset) return reply.code(404).send({ error: 'La fotografía no pertenece a este producto.' });
+    const input = z.object({ brand: z.string().trim().min(2).max(80).nullable(), aliases: z.array(z.string().trim().min(2).max(80)).max(12).optional().default([]) }).safeParse(request.body);
+    if (!input.success) return reply.code(400).send({ error: 'Indica una marca válida o selecciona “Sin marca legible”.', details: input.error.flatten() });
+    const displayName = input.data.brand;
+    const normalizedName = displayName ? normalizeBrandName(displayName) : '';
+    if (displayName && (!normalizedName || normalizedName.length > 80)) return reply.code(400).send({ error: 'El nombre de marca no es válido.' });
+    const now = new Date().toISOString();
+    const previousLabel = db.prepare('SELECT expected_brand as expectedBrand,split FROM shoe_brand_labels WHERE media_asset_id=?')
+      .get(asset.id) as { expectedBrand: string | null; split: 'reference' | 'holdout' } | undefined;
+    const duplicateLabel = db.prepare(`SELECT MAX(CASE WHEN l.split='holdout' THEN 1 ELSE 0 END) as hasHoldout,
+        MIN(l.split) as firstSplit FROM shoe_brand_labels l JOIN media_assets m ON m.id=l.media_asset_id
+        WHERE m.sha256=? AND l.media_asset_id<>?`).get(asset.sha256, asset.id) as { hasHoldout: number | null; firstSplit: 'reference' | 'holdout' | null };
+    const sameLabel = previousLabel && (displayName === null ? previousLabel.expectedBrand === null
+      : previousLabel.expectedBrand !== null && normalizeBrandName(previousLabel.expectedBrand) === normalizedName);
+    const existingLabels = db.prepare('SELECT media_asset_id as assetId,expected_brand as expectedBrand FROM shoe_brand_labels').all() as Array<{ assetId: string; expectedBrand: string | null }>;
+    const sameClassCount = existingLabels.filter((row) => row.assetId !== asset.id && (displayName === null
+      ? row.expectedBrand === null
+      : row.expectedBrand !== null && normalizeBrandName(row.expectedBrand) === normalizedName)).length;
+    // Reserve every fifth verified example per brand as a held-out evaluation photo.
+    const split: 'reference' | 'holdout' = duplicateLabel.hasHoldout ? 'holdout'
+      : sameLabel && previousLabel ? previousLabel.split
+        : duplicateLabel.firstSplit ?? ((sameClassCount + 1) % 5 === 0 ? 'holdout' : 'reference');
+    db.transaction(() => {
+      const oldReferences = db.prepare('SELECT normalized_brand FROM shoe_brand_references WHERE media_asset_id=?').all(asset.id) as Array<{ normalized_brand: string }>;
+      db.prepare('DELETE FROM shoe_brand_references WHERE media_asset_id=?').run(asset.id);
+      if (displayName) {
+        const current = db.prepare('SELECT aliases_json as aliasesJson FROM shoe_brand_registry WHERE normalized_name=?').get(normalizedName) as { aliasesJson: string } | undefined;
+        const aliases = new Set<string>(current ? JSON.parse(current.aliasesJson) as string[] : []);
+        for (const alias of input.data.aliases) {
+          const cleaned = alias.trim();
+          if (normalizeBrandName(cleaned) !== normalizedName && cleaned.toLocaleLowerCase('es') !== displayName.toLocaleLowerCase('es')) aliases.add(cleaned);
+        }
+        db.prepare(`INSERT INTO shoe_brand_registry(normalized_name,display_name,aliases_json,created_at,updated_at) VALUES (?,?,?,?,?)
+          ON CONFLICT(normalized_name) DO UPDATE SET display_name=excluded.display_name,aliases_json=excluded.aliases_json,updated_at=excluded.updated_at`)
+          .run(normalizedName, displayName, JSON.stringify([...aliases]), now, now);
+        if (split === 'reference') db.prepare(`INSERT INTO shoe_brand_references(normalized_brand,media_asset_id,created_at) VALUES (?,?,?)
+          ON CONFLICT(normalized_brand,media_asset_id) DO UPDATE SET created_at=excluded.created_at`).run(normalizedName, asset.id, now);
+      }
+      db.prepare(`INSERT INTO shoe_brand_labels(media_asset_id,expected_brand,split,reviewed_at) VALUES (?,?,?,?)
+        ON CONFLICT(media_asset_id) DO UPDATE SET expected_brand=excluded.expected_brand,split=excluded.split,reviewed_at=excluded.reviewed_at`)
+        .run(asset.id, displayName, split, now);
+      const stillUsedBrands = new Set((db.prepare('SELECT expected_brand as expectedBrand FROM shoe_brand_labels WHERE expected_brand IS NOT NULL').all() as Array<{ expectedBrand: string }>).map((row) => normalizeBrandName(row.expectedBrand)));
+      for (const reference of oldReferences) if (!stillUsedBrands.has(reference.normalized_brand)
+        && !db.prepare('SELECT 1 FROM shoe_brand_references WHERE normalized_brand=? LIMIT 1').get(reference.normalized_brand)) {
+        db.prepare('DELETE FROM shoe_brand_registry WHERE normalized_name=?').run(reference.normalized_brand);
+      }
+      if (asset.brandModelId === BRAND_MODEL_ID && asset.brandStatus !== 'failed') {
+        let candidates: Array<{ brand: string; score: number }> = [];
+        let evidence: ImageBrandInspection['evidence'] = { captionCandidates: [], ocrCandidates: [] };
+        try { candidates = JSON.parse(asset.candidatesJson ?? '[]'); } catch { /* Keep an empty source record for legacy results. */ }
+        try { evidence = JSON.parse(asset.evidenceJson ?? '{}'); } catch { /* Keep an empty source record for legacy results. */ }
+        const sourcePredictions = JSON.stringify(brandSourcePredictions(candidates, evidence));
+        db.prepare(`INSERT INTO shoe_brand_evaluation_samples(media_asset_id,model_id,predicted_brand,expected_brand,reviewed_at,split,source_predictions_json) VALUES (?,?,?,?,?,?,?)
+          ON CONFLICT(media_asset_id) DO UPDATE SET model_id=excluded.model_id,predicted_brand=excluded.predicted_brand,expected_brand=excluded.expected_brand,
+            split=excluded.split,source_predictions_json=excluded.source_predictions_json,reviewed_at=excluded.reviewed_at`)
+          .run(asset.id, asset.brandModelId, asset.suggestedBrand, displayName, now, split, sourcePredictions);
+      } else {
+        db.prepare('UPDATE shoe_brand_evaluation_samples SET expected_brand=?,split=? WHERE media_asset_id=?').run(displayName, split, asset.id);
+      }
+      db.prepare(`INSERT INTO image_brand_inspections(media_asset_id,model_id,status,suggested_brand,confirmed_brand,score,candidates_json,evidence_json,auto_eligible,manual_override,reason,error,inspected_at)
+        VALUES (?,?,?,?,?,0,'[]','{}',0,1,?,NULL,?)
+        ON CONFLICT(media_asset_id) DO UPDATE SET status=excluded.status,confirmed_brand=excluded.confirmed_brand,manual_override=1,auto_eligible=0,reason=excluded.reason,error=NULL,inspected_at=excluded.inspected_at`)
+        .run(asset.id, asset.brandModelId ?? BRAND_MODEL_ID, displayName ? 'confirmed' : 'unknown', asset.suggestedBrand, displayName, displayName ? 'Confirmada manualmente; se guardó como referencia para futuras sugerencias.' : 'Se confirmó manualmente que no hay una marca legible.', now);
+      if (displayName) applyConfirmedBrandToApprovedDescription(db, product.id, displayName, now);
+    })();
+    audit(db, displayName ? 'product.image.brand.confirmed' : 'product.image.brand.unknown', 'product', product.id,
+      { assetId: asset.id, brand: displayName, aliases: input.data.aliases });
+    return { ok: true, brand: { status: displayName ? 'confirmed' : 'unknown', confirmedBrand: displayName, suggestedBrand: asset.suggestedBrand, inspectedAt: now } };
   });
 
   app.get<{ Params: { id: string }; Querystring: { assetId?: string } }>('/api/products/:id/preview', async (request, reply) => {

@@ -394,6 +394,109 @@ export const MIGRATIONS = [
   ALTER TABLE supplier_reception_state ADD COLUMN recovery_pending_groups INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE supplier_reception_state ADD COLUMN recovery_responded_groups INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE supplier_reception_state ADD COLUMN recovery_interrupted_groups INTEGER NOT NULL DEFAULT 0;`,
+  `CREATE TABLE shoe_brand_registry (
+    normalized_name TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE shoe_brand_references (
+    normalized_brand TEXT NOT NULL REFERENCES shoe_brand_registry(normalized_name) ON DELETE CASCADE,
+    media_asset_id TEXT NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(normalized_brand, media_asset_id)
+  );
+  CREATE INDEX idx_shoe_brand_references_asset ON shoe_brand_references(media_asset_id);
+  CREATE TABLE shoe_brand_evaluation_samples (
+    media_asset_id TEXT PRIMARY KEY REFERENCES media_assets(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL,
+    predicted_brand TEXT,
+    expected_brand TEXT,
+    reviewed_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_shoe_brand_evaluation_model ON shoe_brand_evaluation_samples(model_id,reviewed_at);
+  CREATE TABLE image_brand_inspections (
+    media_asset_id TEXT PRIMARY KEY REFERENCES media_assets(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('review','confirmed','unknown','failed')),
+    suggested_brand TEXT,
+    confirmed_brand TEXT,
+    score REAL NOT NULL DEFAULT 0 CHECK(score BETWEEN 0 AND 1),
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    auto_eligible INTEGER NOT NULL DEFAULT 0 CHECK(auto_eligible IN (0,1)),
+    manual_override INTEGER NOT NULL DEFAULT 0 CHECK(manual_override IN (0,1)),
+    reason TEXT NOT NULL,
+    error TEXT,
+    inspected_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_image_brand_inspections_status ON image_brand_inspections(status,inspected_at);
+  CREATE TRIGGER image_brand_inspections_cleanup AFTER DELETE ON media_assets BEGIN
+    DELETE FROM image_brand_inspections WHERE media_asset_id=OLD.id;
+  END;`,
+  `ALTER TABLE shoe_brand_evaluation_samples ADD COLUMN split TEXT NOT NULL DEFAULT 'holdout' CHECK(split IN ('reference','holdout'));
+  ALTER TABLE shoe_brand_evaluation_samples ADD COLUMN source_predictions_json TEXT NOT NULL DEFAULT '{}';
+  CREATE TABLE shoe_brand_labels (
+    media_asset_id TEXT PRIMARY KEY REFERENCES media_assets(id) ON DELETE CASCADE,
+    expected_brand TEXT,
+    split TEXT NOT NULL CHECK(split IN ('reference','holdout')),
+    reviewed_at TEXT NOT NULL
+  );
+  INSERT OR IGNORE INTO shoe_brand_labels(media_asset_id,expected_brand,split,reviewed_at)
+    SELECT media_asset_id,expected_brand,'holdout',reviewed_at FROM shoe_brand_evaluation_samples;
+  DELETE FROM shoe_brand_references WHERE media_asset_id IN (
+    SELECT media_asset_id FROM shoe_brand_labels WHERE split='holdout'
+  );
+  CREATE INDEX idx_shoe_brand_labels_split ON shoe_brand_labels(split,expected_brand,reviewed_at);`,
+  `INSERT OR IGNORE INTO shoe_brand_labels(media_asset_id,expected_brand,split,reviewed_at)
+    SELECT r.media_asset_id,b.display_name,'reference',r.created_at FROM shoe_brand_references r
+      JOIN shoe_brand_registry b ON b.normalized_name=r.normalized_brand;
+  UPDATE shoe_brand_labels SET split='holdout'
+    WHERE split='reference' AND EXISTS (
+      SELECT 1 FROM media_assets reference_photo
+      JOIN shoe_brand_labels heldout_label ON heldout_label.split='holdout'
+      JOIN media_assets heldout_photo ON heldout_photo.id=heldout_label.media_asset_id
+      WHERE reference_photo.id=shoe_brand_labels.media_asset_id AND heldout_photo.sha256=reference_photo.sha256
+    );
+  DELETE FROM shoe_brand_references WHERE media_asset_id IN (
+    SELECT media_asset_id FROM shoe_brand_labels WHERE split='holdout'
+  );`,
+  `INSERT OR IGNORE INTO shoe_brand_registry(normalized_name,display_name,aliases_json,created_at,updated_at)
+    VALUES ('dolce & gabbana','Dolce & Gabbana','["DOLCE & GARRINI"]',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+  UPDATE shoe_brand_registry SET display_name='Dolce & Gabbana',
+    aliases_json=CASE
+      WHEN instr(lower(aliases_json),'"dolce & garrini"')>0 THEN aliases_json
+      WHEN aliases_json='[]' THEN '["DOLCE & GARRINI"]'
+      ELSE substr(aliases_json,1,length(aliases_json)-1)||',"DOLCE & GARRINI"]'
+    END,
+    updated_at=CURRENT_TIMESTAMP
+    WHERE normalized_name='dolce & gabbana';`,
+  `INSERT OR IGNORE INTO shoe_brand_registry(normalized_name,display_name,aliases_json,created_at,updated_at)
+    VALUES ('jordan','Jordan','["JUMODMAN","JUMPMAN","AIR JORDAN"]',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+  UPDATE shoe_brand_registry SET display_name='Jordan',
+    aliases_json=CASE
+      WHEN aliases_json='[]' THEN '["JUMODMAN","JUMPMAN","AIR JORDAN"]'
+      ELSE substr(aliases_json,1,length(aliases_json)-1)
+        || CASE WHEN instr(lower(aliases_json),'"jumodman"')=0 THEN ',"JUMODMAN"' ELSE '' END
+        || CASE WHEN instr(lower(aliases_json),'"jumpman"')=0 THEN ',"JUMPMAN"' ELSE '' END
+        || CASE WHEN instr(lower(aliases_json),'"air jordan"')=0 THEN ',"AIR JORDAN"' ELSE '' END
+        || ']'
+    END,
+    updated_at=CURRENT_TIMESTAMP
+    WHERE normalized_name='jordan';`,
+  `UPDATE shoe_brand_registry SET aliases_json=CASE
+      WHEN instr(lower(aliases_json),'"jumdman"')=0 THEN substr(aliases_json,1,length(aliases_json)-1)||',"JUMDMAN"]'
+      ELSE aliases_json
+    END,
+    updated_at=CURRENT_TIMESTAMP
+    WHERE normalized_name='jordan' AND instr(lower(aliases_json),'"jump man"')=0;
+  UPDATE shoe_brand_registry SET aliases_json=CASE
+      WHEN instr(lower(aliases_json),'"jump man"')=0 THEN substr(aliases_json,1,length(aliases_json)-1)||',"JUMP MAN"]'
+      ELSE aliases_json
+    END,
+    updated_at=CURRENT_TIMESTAMP
+    WHERE normalized_name='jordan' AND instr(lower(aliases_json),'"jump man"')=0;`,
 ];
 
 export type AppDatabase = InstanceType<typeof Database>;

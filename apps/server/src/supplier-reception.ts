@@ -98,7 +98,7 @@ export class SupplierReceptionService {
     for (const row of rows) if (row.imageFileName) rmSync(join(this.inboxDirectory, row.imageFileName), { force: true });
   }
 
-  async capture(message: IncomingSupplierMessage, deferUntilBatchEnd = false): Promise<'stored' | 'duplicate' | 'pending' | 'failed' | 'outside_window'> {
+  async capture(message: IncomingSupplierMessage, deferUntilBatchEnd = false): Promise<'stored' | 'ignored' | 'duplicate' | 'pending' | 'failed' | 'outside_window'> {
     const sessionId = message.sessionId ?? 'main';
     if (!message.messageId || !this.ingestion.isSupplierGroup(message.groupId, sessionId)) return 'duplicate';
     const mode = message.receptionMode ?? 'live';
@@ -149,7 +149,7 @@ export class SupplierReceptionService {
     if (deferUntilBatchEnd) return 'pending';
     await this.drainSession(sessionId);
     const result = this.db.prepare('SELECT status FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(sessionId, message.groupId, message.messageId) as { status: string } | undefined;
-    return result?.status === 'processed' ? 'stored' : result?.status === 'failed' ? 'failed' : result?.status === 'ignored' ? 'outside_window' : 'pending';
+    return result?.status === 'processed' ? 'stored' : result?.status === 'failed' ? 'failed' : result?.status === 'ignored' ? 'ignored' : 'pending';
   }
 
   recordUnsupported(sessionId: string, groupId: string, messageId: string, timestampMs: number, errorCode = 'unsupported') {
@@ -322,12 +322,13 @@ export class SupplierReceptionService {
             participantId: row.participant_jid || null, timestampMs: row.message_timestamp_ms, text: row.text,
             ...(row.image_file_name && row.image_mime_type ? { image: { bytes: readFileSync(join(this.inboxDirectory, row.image_file_name)), mimeType: row.image_mime_type,
               ...(row.expected_album_images == null ? {} : { expectedAlbumImages: row.expected_album_images }) } } : {}) };
-          await this.ingestion.receive(message);
+          const ingestionResult = await this.ingestion.receive(message);
           const processedAt = new Date(this.now()).toISOString();
-          this.db.prepare("UPDATE supplier_inbox_messages SET status='processed',error=NULL,error_code=NULL,processed_at=? WHERE session_id=? AND group_jid=? AND message_id=?")
-            .run(processedAt, sessionId, row.group_jid, row.message_id);
+          this.db.prepare("UPDATE supplier_inbox_messages SET status=?,error=?,error_code=?,processed_at=? WHERE session_id=? AND group_jid=? AND message_id=?")
+            .run(ingestionResult === 'ignored' ? 'ignored' : 'processed', ingestionResult === 'ignored' ? 'Publicación filtrada; el mensaje original permanece en WhatsApp.' : null,
+              ingestionResult === 'ignored' ? 'filtered' : null, processedAt, sessionId, row.group_jid, row.message_id);
           if (row.image_file_name) rmSync(join(this.inboxDirectory, row.image_file_name), { force: true });
-          this.db.prepare("UPDATE supplier_reception_state SET last_supplier_result='stored' WHERE session_id=?").run(sessionId);
+          this.db.prepare("UPDATE supplier_reception_state SET last_supplier_result=? WHERE session_id=?").run(ingestionResult === 'ignored' ? 'ignored' : 'stored', sessionId);
         } catch (error) {
           const errorType = error instanceof Error ? error.name : 'UnknownError';
           this.db.prepare("UPDATE supplier_inbox_messages SET status='failed',error='No se pudo procesar la publicación del proveedor.',error_code='processing_failed',processed_at=? WHERE session_id=? AND group_jid=? AND message_id=?")

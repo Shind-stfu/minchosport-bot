@@ -23,10 +23,57 @@ export type IncomingSupplierMessage = {
   image?: { bytes: Buffer; mimeType: string; expectedAlbumImages?: number };
 };
 
+function normalizeFilterText(value: string) {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/gu, '').toLocaleLowerCase('es').replace(/\s+/gu, ' ').trim();
+}
+
+function isSupplierScheduleNotice(value: string) {
+  const text = normalizeFilterText(value);
+  const hasReturns = /\bdevoluciones?\b/u.test(text);
+  const hasSchedule = /\b(?:horarios?|recibidas hasta las|ultima persona en ingresar|ultima persona en entrar)\b/u.test(text);
+  return hasReturns && hasSchedule || /\bultima persona en ingresar\b/u.test(text) && /\b(?:pm|am|horarios?)\b/u.test(text);
+}
+
+function isPromotionalImageText(value: string) {
+  const text = normalizeFilterText(value).replace(/[^\p{L}\p{N}\s]/gu, ' ');
+  return /\brecargas?\b/u.test(text)
+    || /\bbodega\s+martin\b/u.test(text)
+    || /\bmercancia\s+nueva\b/u.test(text)
+    || /\b(?:nos\s+llego|llego)\s+merca(?:ncia)?\b/u.test(text);
+}
+
+function promotionalImageReason(value: string) {
+  const text = normalizeFilterText(value).replace(/[^\p{L}\p{N}\s]/gu, ' ');
+  if (/\brecargas?\b/u.test(text) || /\bbodega\s+martin\b/u.test(text)) return 'Publicidad de recargas';
+  if (/\bmercancia\s+nueva\b/u.test(text) || /\b(?:nos\s+llego|llego)\s+merca(?:ncia)?\b/u.test(text)) return 'Aviso promocional de mercancía nueva';
+  return null;
+}
+
+function hasShoeProductSignal(value: string, db: AppDatabase) {
+  const text = normalizeFilterText(value).replace(/[^\p{L}\p{N}\s]/gu, ' ');
+  if (/\b(?:tenis|zapatillas?|calzado|shoes?|sneakers?|tallas?|precio|referencia|ref)\b/u.test(text)
+    || /\b\d{2,3}[-/]\d{1,3}\b/u.test(text) || /\$\s*\d/u.test(value)) return true;
+  const registered = db.prepare('SELECT display_name as displayName,aliases_json as aliasesJson FROM shoe_brand_registry').all() as Array<{ displayName: string; aliasesJson: string }>;
+  return registered.some((brand) => {
+    let aliases: string[] = [];
+    try { aliases = JSON.parse(brand.aliasesJson) as string[]; } catch { /* Ignore malformed aliases. */ }
+    return [brand.displayName, ...aliases].some((name) => {
+      const normalized = normalizeFilterText(name).replace(/[^\p{L}\p{N}\s]/gu, ' ');
+      return normalized.length >= 2 && ` ${text} `.includes(` ${normalized} `);
+    });
+  });
+}
+
+function looksLikeGenericGreeting(value: string) {
+  const text = normalizeFilterText(value).replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/gu, ' ').trim();
+  return Boolean(text) && /^(?:buenas tardes|buenas noches|buenos dias|buen dia|hola|saludos)(?:\s+(?:amigos|a todos))?$/u.test(text);
+}
+
 export class SupplierIngestionService {
   private readonly mediaDirectory: string;
 
-  constructor(private readonly db: AppDatabase, dataDirectory: string, private readonly logger: FastifyBaseLogger, private readonly onImageStored?: (assetId: string) => void) {
+  constructor(private readonly db: AppDatabase, dataDirectory: string, private readonly logger: FastifyBaseLogger, private readonly onImageStored?: (assetId: string) => void,
+    private readonly inspectImageText?: (source: Buffer) => Promise<string>, private readonly hasFootwear?: (source: Buffer) => Promise<boolean>) {
     this.mediaDirectory = join(dataDirectory, 'media');
     mkdirSync(this.mediaDirectory, { recursive: true });
   }
@@ -35,13 +82,32 @@ export class SupplierIngestionService {
     return Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL').get(sessionId, groupId));
   }
 
-  async receive(message: IncomingSupplierMessage): Promise<void> {
+  async receive(message: IncomingSupplierMessage): Promise<'stored' | 'ignored'> {
     const sessionId = message.sessionId ?? 'main';
     const supplier = this.db.prepare('SELECT id,margin_cop,box_margin_cop,marker_text,default_position FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL').get(sessionId, message.groupId) as { id: string; margin_cop: number; box_margin_cop: number; marker_text: string; default_position: 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right' } | undefined;
-    if (!supplier || !message.messageId) return;
-    if (this.db.prepare('SELECT 1 FROM whatsapp_source_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(sessionId, message.groupId, message.messageId)) return;
+    if (!supplier || !message.messageId) return 'ignored';
+    if (this.db.prepare('SELECT 1 FROM whatsapp_source_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(sessionId, message.groupId, message.messageId)) return 'ignored';
 
     const text = message.text.trim();
+    let filterReason: string | null = isSupplierScheduleNotice(text) ? 'Aviso de devoluciones u horarios' : null;
+    if (!filterReason && message.image) filterReason = promotionalImageReason(text);
+    let imageOcrText = '';
+    if (!filterReason && message.image && this.inspectImageText && (looksLikeGenericGreeting(text) || !text)) {
+      imageOcrText = await this.inspectImageText(message.image.bytes).catch(() => '');
+      if (isPromotionalImageText(imageOcrText)) filterReason = promotionalImageReason(imageOcrText) ?? 'Imagen promocional';
+    }
+    if (!filterReason && message.image && this.hasFootwear && (looksLikeGenericGreeting(text) || !text)) {
+      const hasFootwear = await this.hasFootwear(message.image.bytes).catch(() => null);
+      if (hasFootwear === false && !hasShoeProductSignal(`${text}\n${imageOcrText}`, this.db)) filterReason = 'Imagen sin calzado ni descripción de producto';
+    }
+    if (filterReason) {
+      const now = new Date(Number.isFinite(message.timestampMs) ? message.timestampMs : Date.now()).toISOString();
+      writeApplicationLog(this.db, { sessionId, category: 'products', action: 'product.received.filtered', entityType: 'whatsapp_group', entityId: message.groupId,
+        message: 'Se ignoró una publicación informativa o promocional; el mensaje original permanece en WhatsApp.',
+        details: { messageId: message.messageId, reason: filterReason, hasImage: Boolean(message.image) }, createdAt: now });
+      this.logger.info({ sessionId, groupId: message.groupId, messageId: message.messageId, reason: filterReason }, 'Publicación informativa o promocional omitida');
+      return 'ignored';
+    }
     const participant = message.participantId ?? `unknown:${message.messageId}`;
     const eventDate = new Date(message.timestampMs);
     const receivedAt = Number.isNaN(eventDate.valueOf()) ? new Date().toISOString() : eventDate.toISOString();
@@ -112,6 +178,7 @@ export class SupplierIngestionService {
       })();
       if (storedAssetId) this.onImageStored?.(storedAssetId);
       this.logger.info({ messageId: message.messageId, productId, image: Boolean(storedImage) }, 'Publicación del grupo proveedor guardada para revisión');
+      return 'stored';
     } catch (error) {
       if (storedImage) rmSync(storedImage.path, { force: true });
       throw error;

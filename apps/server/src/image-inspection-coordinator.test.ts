@@ -7,6 +7,7 @@ import { openDatabase } from './database.js';
 import { ImageInspectionCoordinator } from './image-inspection-coordinator.js';
 import type { ImageInspection } from './image-inspection.js';
 import type { ImageInspector } from './image-engine.js';
+import { BRAND_MODEL_ID, type ImageBrandInspection } from './image-brand-inspection.js';
 
 const directories: string[] = [];
 afterEach(() => { for (const path of directories.splice(0)) rmSync(path,{recursive:true,force:true}); });
@@ -43,6 +44,76 @@ describe('image engine queue and cache',()=>{
     const restarted=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>{throw Error('cache expected');}});
     await restarted.schedule('c');expect(db.prepare("SELECT cache_hit FROM image_inspections WHERE media_asset_id='c'").get()).toEqual({cache_hit:1});
     await restarted.close();db.close();
+  });
+  it('scores corrected brands and aliases on later photos and persists the suggestion for review',async()=>{
+    const directory=mkdtempSync(join(tmpdir(),'mincho-brand-candidates-'));directories.push(directory);mkdirSync(join(directory,'media'));
+    const db=openDatabase(join(directory,'business.sqlite'));const now=new Date().toISOString();
+    db.prepare("INSERT INTO products(id,title,raw_text,analysis_json,status,created_at,updated_at,session_id) VALUES ('brand-product','Zapato','Marca NB','{}','needs_review',?,?,'main')").run(now,now);
+    db.prepare("INSERT INTO shoe_brand_registry(normalized_name,display_name,aliases_json,created_at,updated_at) VALUES ('new balance','New Balance','[\"NB\"]',?,?)").run(now,now);
+    const bytes=Buffer.from('same photo');const hash=createHash('sha256').update(bytes).digest('hex');writeFileSync(join(directory,'media',`${hash}.png`),bytes);
+    db.prepare("INSERT INTO media_assets(id,product_id,sha256,file_name,mime_type,size_bytes,position,created_at) VALUES ('brand-photo','brand-product',?,?, 'image/png',?,0,?)").run(hash,`${hash}.png`,bytes.length,now);
+    const inspection={...result(),ocrText:'NB'};let scored:string[]=[];let usedEvidence:ImageBrandInspection['evidence']|undefined;
+    const brandInspector={inspect:async(_source:Buffer,candidates:string[],evidence:ImageBrandInspection['evidence'])=>{scored=candidates;usedEvidence=evidence;return {modelId:'test-brand-v1',status:'review',suggestedBrand:'New Balance',score:0.72,candidates:[{brand:'New Balance',score:0.72}],evidence:{...evidence,unknownScore:0.08},autoEligible:false,reason:'review',error:null} as ImageBrandInspection;}};
+    const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>inspection},brandInspector);
+    await coordinator.schedule('brand-photo');
+    expect(scored).toEqual(['New Balance']);
+    expect(usedEvidence).toMatchObject({captionCandidates:['New Balance'],ocrCandidates:['New Balance']});
+    expect(db.prepare('SELECT status,suggested_brand,auto_eligible FROM image_brand_inspections WHERE media_asset_id=?').get('brand-photo')).toEqual({status:'review',suggested_brand:'New Balance',auto_eligible:0});
+    db.prepare("UPDATE image_brand_inspections SET status='unknown',confirmed_brand=NULL,manual_override=1,reason='Se confirmó manualmente que no hay una marca legible.' WHERE media_asset_id='brand-photo'").run();
+    await coordinator.schedule('brand-photo',true);
+    expect(db.prepare('SELECT status,confirmed_brand,manual_override,reason FROM image_brand_inspections WHERE media_asset_id=?').get('brand-photo')).toEqual({status:'unknown',confirmed_brand:null,manual_override:1,reason:'Se confirmó manualmente que no hay una marca legible.'});
+    await coordinator.close();db.close();
+  });
+  it('compares later photos with manually confirmed brand reference images',async()=>{
+    const {db,directory,asset}=setup({version:'test-v1',inspect:async()=>result()});
+    const now=new Date().toISOString();
+    asset('reference-photo',Buffer.from('confirmed Nike photo'));
+    asset('incoming-photo',Buffer.from('new shoe photo'));
+    db.prepare("INSERT INTO shoe_brand_registry(normalized_name,display_name,aliases_json,created_at,updated_at) VALUES ('nike','Nike','[]',?,?)").run(now,now);
+    db.prepare("INSERT INTO shoe_brand_references(normalized_brand,media_asset_id,created_at) VALUES ('nike','reference-photo',?)").run(now);
+    let scored:string[]=[];let references:Array<{brand:string;source:Buffer}>|undefined;
+    const brandInspector={inspect:async(_source:Buffer,candidates:string[],evidence:ImageBrandInspection['evidence'],referenceImages:Array<{brand:string;source:Buffer}>)=>{
+      scored=candidates;references=referenceImages;
+      return {modelId:'test-brand-v1',status:'unknown',suggestedBrand:null,confirmedBrand:null,score:0,candidates:[],evidence,autoEligible:false,reason:'unknown',error:null} as ImageBrandInspection;
+    }};
+    const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>result()},brandInspector);
+    await coordinator.schedule('incoming-photo');
+    expect(scored).toContain('Nike');
+    expect(references?.map((reference)=>({brand:reference.brand,content:reference.source.toString()}))).toEqual([{brand:'Nike',content:'confirmed Nike photo'}]);
+    await coordinator.close();db.close();
+  });
+  it('auto-confirms a brand only after its reviewed predictions reach the precision and sample gates',async()=>{
+    const {db,directory,asset}=setup({version:'test-v1',inspect:async()=>result()});
+    const now=new Date().toISOString();
+    for(let index=0;index<20;index++){
+      const id=`reviewed-${index}`;asset(id,Buffer.from(id));
+      db.prepare('INSERT INTO shoe_brand_evaluation_samples(media_asset_id,model_id,predicted_brand,expected_brand,reviewed_at) VALUES (?,?,?,?,?)')
+        .run(id,BRAND_MODEL_ID,'New Balance','New Balance',now);
+    }
+    asset('auto-candidate',Buffer.from('future photo'));
+    const brandInspector={inspect:async()=>({modelId:BRAND_MODEL_ID,status:'review',suggestedBrand:'New Balance',confirmedBrand:null,score:0.92,candidates:[{brand:'New Balance',score:0.82}],evidence:{captionCandidates:[],ocrCandidates:[],unknownScore:0.01,visualBrand:'New Balance'},autoEligible:false,reason:'review',error:null} as ImageBrandInspection)};
+    const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>result()},brandInspector);
+    await coordinator.schedule('auto-candidate');
+    expect(db.prepare('SELECT status,confirmed_brand,auto_eligible,manual_override FROM image_brand_inspections WHERE media_asset_id=?').get('auto-candidate'))
+      .toEqual({status:'confirmed',confirmed_brand:'New Balance',auto_eligible:1,manual_override:0});
+    await coordinator.close();db.close();
+  });
+  it.each([
+    { evidence: { visualBrand: 'Nike', sneakerError: 'unavailable' }, expectedStatus: 'confirmed', expectedEligible: 1 },
+    { evidence: { visualBrand: 'Nike', brandConflict: true }, expectedStatus: 'review', expectedEligible: 0 },
+  ])('uses Florence + Qwen as the gate and treats the sneaker model as secondary: %o', async ({ evidence, expectedStatus, expectedEligible }) => {
+    const {db,directory,asset}=setup({version:'test-v1',inspect:async()=>result()});
+    const now=new Date().toISOString();
+    for(let index=0;index<20;index++){
+      const id=`gate-${index}`;asset(id,Buffer.from(id));
+      db.prepare('INSERT INTO shoe_brand_evaluation_samples(media_asset_id,model_id,predicted_brand,expected_brand,reviewed_at) VALUES (?,?,?,?,?)').run(id,BRAND_MODEL_ID,'Nike','Nike',now);
+    }
+    asset('unsafe-candidate',Buffer.from('photo'));
+    const brandInspector={inspect:async()=>({modelId:BRAND_MODEL_ID,status:'review',suggestedBrand:'Nike',confirmedBrand:null,score:0.92,candidates:[],evidence:{captionCandidates:[],ocrCandidates:[],...evidence},autoEligible:false,reason:'review',error:null} as ImageBrandInspection)};
+    const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>result()},brandInspector);
+    await coordinator.schedule('unsafe-candidate');
+    expect(db.prepare('SELECT status,auto_eligible FROM image_brand_inspections WHERE media_asset_id=?').get('unsafe-candidate')).toEqual({status:expectedStatus,auto_eligible:expectedEligible});
+    await coordinator.close();db.close();
   });
   it('bounds parallel work and advances waiting photos after completion',async()=>{
     let active=0,maxActive=0,calls=0;const gates=Array.from({length:3},()=>deferred<ImageInspection>());const entered=[deferred<void>(),deferred<void>(),deferred<void>()];
