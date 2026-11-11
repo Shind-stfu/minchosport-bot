@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const BRAND_MODEL_ID = 'siglip2-base-patch16-224@ba1f3b0+florence-2-base-ft@e88a44e+qwen3.5-0.8b-onnx@8fe9dbe+popular-sneakers@c978c26+balanced-references-v2+florence-qwen-logo-crops-v3+holdout-v1';
+export const BRAND_MODEL_ID = 'siglip2-base-patch16-224@ba1f3b0+solematch-clip-vit-b32@6b7c523+florence-2-base-ft@e88a44e+qwen3.5-0.8b-onnx@8fe9dbe+popular-sneakers@c978c26+balanced-references-v2+florence-qwen-logo-crops-v3+holdout-v1';
 
 export type BrandCandidateScore = { brand: string; score: number; supportCount?: number };
 export type BrandReferenceImage = { brand: string; source: Buffer };
@@ -15,7 +15,7 @@ export type ImageBrandInspection = {
   confirmedBrand: string | null;
   score: number;
   candidates: BrandCandidateScore[];
-  evidence: { captionCandidates: string[]; ocrCandidates: string[]; unknownScore?: number; noShoeScore?: number; mixedBrandsScore?: number; referenceMatches?: BrandCandidateScore[]; visualBrand?: string | null; visualAnswer?: string; visualLogoText?: string; visualEvidence?: string; visualConfidence?: number; visualModel?: string; visualError?: string; sneakerCandidates?: BrandCandidateScore[]; sneakerError?: string; brandConflict?: boolean };
+  evidence: { captionCandidates: string[]; ocrCandidates: string[]; unknownScore?: number; noShoeScore?: number; mixedBrandsScore?: number; referenceMatches?: BrandCandidateScore[]; soleMatchMatches?: BrandCandidateScore[]; soleMatchError?: string; visualBrand?: string | null; visualAnswer?: string; visualLogoText?: string; visualEvidence?: string; visualConfidence?: number; visualModel?: string; visualError?: string; sneakerCandidates?: BrandCandidateScore[]; sneakerError?: string; brandConflict?: boolean };
   autoEligible: boolean;
   reason: string;
   error: string | null;

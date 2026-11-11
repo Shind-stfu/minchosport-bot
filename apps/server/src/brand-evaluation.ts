@@ -17,6 +17,7 @@ export function brandSourcePredictions(candidates: BrandCandidateScore[], eviden
     'Florence + Qwen': evidence.visualBrand ?? null,
     'SigLIP · clases abiertas': top && top.score > nonBrand && top.score >= 0.12 ? top.brand : null,
     'SigLIP · referencias': confidentReferenceBrand(evidence.referenceMatches ?? []),
+    'SoleMatch · CLIP referencias': evidence.soleMatchMatches?.[0]?.brand ?? null,
     'Detector de zapatillas': evidence.sneakerCandidates?.[0]?.brand ?? null,
   };
 }

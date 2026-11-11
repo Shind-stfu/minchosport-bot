@@ -200,10 +200,14 @@ export class ImageInspectionCoordinator {
             source: await readFile(join(this.dataDirectory, 'media', reference.fileName)),
           })));
           const rawResult = await this.brandInspector.inspect(source, candidates, { captionCandidates: captions, ocrCandidates }, referenceImages);
-          const canonicalize = (brand: string | null) => brand ? aliasToCanonical.get(normalizeBrandName(brand)) ?? brand : null;
+          const jordanBrand = aliasToCanonical.get(normalizeBrandName('JUMPMAN')) ?? 'Jordan';
+          const canonicalize = (brand: string | null) => {
+            if (!brand) return null;
+            if (detectJordanBrandSignal([brand])) return jordanBrand;
+            return aliasToCanonical.get(normalizeBrandName(brand)) ?? brand;
+          };
           const jordanSignal = detectJordanBrandSignal([rawResult.evidence.visualLogoText, rawResult.evidence.visualEvidence, rawResult.evidence.visualAnswer]);
           const jordanMarkDetected = jordanSignal !== null;
-          const jordanBrand = aliasToCanonical.get(normalizeBrandName('JUMPMAN')) ?? 'Jordan';
           const modelVisualBrand = canonicalize(rawResult.evidence.visualBrand ?? null);
           const normalizedVisualBrand = jordanMarkDetected ? jordanBrand : modelVisualBrand;
           const normalizedSuggestion = jordanMarkDetected ? jordanBrand : canonicalize(rawResult.suggestedBrand);
@@ -224,6 +228,7 @@ export class ImageInspectionCoordinator {
               ...(jordanMarkDetected && modelVisualBrand && normalizeBrandName(modelVisualBrand) !== normalizeBrandName(jordanBrand)
                 ? { brandConflict: true } : {}),
               ...(rawResult.evidence.referenceMatches ? { referenceMatches: rawResult.evidence.referenceMatches.map((candidate) => ({ ...candidate, brand: canonicalize(candidate.brand)! })) } : {}),
+              ...(rawResult.evidence.soleMatchMatches ? { soleMatchMatches: rawResult.evidence.soleMatchMatches.map((candidate) => ({ ...candidate, brand: canonicalize(candidate.brand)! })) } : {}),
               ...(rawResult.evidence.sneakerCandidates ? { sneakerCandidates: rawResult.evidence.sneakerCandidates.map((candidate) => ({ ...candidate, brand: canonicalize(candidate.brand)! })) } : {}),
             },
           };

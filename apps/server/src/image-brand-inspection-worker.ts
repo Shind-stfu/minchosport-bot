@@ -1,22 +1,27 @@
 import { mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { parentPort, workerData } from 'node:worker_threads';
 import { BRAND_MODEL_ID, type ImageBrandInspection } from './image-brand-inspection.js';
 import { classifySneaker } from './sneaker-model.js';
 import { confidentReferenceBrand, rankBrandReferences } from './brand-reference-ranking.js';
 import { normalizeBrandName, resolveVisionBrandConsensus } from './brand-candidates.js';
+import { normalizeSoleMatchEmbedding, rankSoleMatchReferences } from './solematch-clip.js';
 
 const SIGLIP_MODEL_ID = 'onnx-community/siglip2-base-patch16-224-ONNX';
 const FLORENCE_MODEL_ID = 'onnx-community/Florence-2-base-ft';
 const FLORENCE_REVISION = 'e88a44eaf3791a35eae0c5a47b3dbcd36e67eb6f';
 const QWEN_MODEL_ID = 'onnx-community/Qwen3.5-0.8B-ONNX';
 const QWEN_REVISION = '8fe9dbe3fb39fe902e18df9be84b6a0ac77ae0f6';
+const SOLEMATCH_CLIP_MODEL_ID = 'Xenova/clip-vit-base-patch32';
+const SOLEMATCH_CLIP_REVISION = '6b7c523703ae26e39be4b03774966f8571c7f523';
 const VISION_MODEL_LABEL = 'Florence-2-base-ft + Qwen3.5-0.8B';
 
 type Message = { id: number; source: Uint8Array; action?: 'inspect' | 'screen'; candidates: string[]; evidence: ImageBrandInspection['evidence']; references?: Array<{ brand: string; source: Uint8Array }> };
 type ResultRow = { label: string; score: number };
 type ModelImage = import('@huggingface/transformers').RawImage;
 type EmbeddingTensor = { data: ArrayLike<number>; dims: number[] };
+type ImageFeatureExtractor = (images: ModelImage | ModelImage[]) => Promise<EmbeddingTensor>;
 type Classifier = ((image: ModelImage, labels: string[], options?: { hypothesis_template?: string }) => Promise<ResultRow[]>) & {
   tokenizer: ((texts: string[], options?: Record<string, unknown>) => Record<string, unknown>) & { _tokenizerConfig: { model_max_length?: number }; model_max_length: number };
   processor: (images: ModelImage[]) => Promise<Record<string, unknown>>;
@@ -38,13 +43,16 @@ type LoadedVisionModels = {
 type LoadedFlorenceModels = Pick<LoadedVisionModels, 'florenceProcessor' | 'florenceModel' | 'RawImage'>;
 
 let classifierPromise: Promise<{ classify: Classifier; RawImage: typeof import('@huggingface/transformers')['RawImage'] }> | undefined;
+let soleMatchExtractorPromise: Promise<ImageFeatureExtractor> | undefined;
 let florenceModelsPromise: Promise<LoadedFlorenceModels> | undefined;
 let visionModelsPromise: Promise<LoadedVisionModels> | undefined;
+const soleMatchEmbeddingCache = new Map<string, number[]>();
 
 async function getTransformerRuntime() {
   const packageEntry = import.meta.resolve('@huggingface/transformers');
-  const webEntry = packageEntry.replace(/transformers\.node\.mjs$/u, 'transformers.web.js');
-  return await import(webEntry) as any;
+  // The app runs in Node and persists model files locally; the browser bundle
+  // intentionally reports that filesystem caching is unavailable.
+  return await import(packageEntry) as any;
 }
 
 async function getClassifier() {
@@ -63,6 +71,50 @@ async function getClassifier() {
     return { classify, RawImage };
   })();
   return classifierPromise;
+}
+
+async function getSoleMatchExtractor(): Promise<ImageFeatureExtractor> {
+  soleMatchExtractorPromise ??= (async () => {
+    const runtime = await getTransformerRuntime();
+    const cacheDirectory = join(dirname(workerData.cacheDirectory as string), 'solematch-clip');
+    mkdirSync(cacheDirectory, { recursive: true });
+    runtime.env.cacheDir = cacheDirectory;
+    runtime.env.allowRemoteModels = true;
+    runtime.env.useFSCache = true;
+    if (runtime.env.backends?.onnx?.wasm) { runtime.env.backends.onnx.wasm.numThreads = 2; runtime.env.backends.onnx.wasm.proxy = false; }
+    return await runtime.pipeline('image-feature-extraction', SOLEMATCH_CLIP_MODEL_ID, {
+      revision: SOLEMATCH_CLIP_REVISION, dtype: 'q8',
+    }) as ImageFeatureExtractor;
+  })();
+  return soleMatchExtractorPromise;
+}
+
+function imageCacheKey(source: Uint8Array) {
+  return createHash('sha256').update(source).digest('hex');
+}
+
+async function getSoleMatchEmbeddings(images: Array<{ source: Uint8Array; image: ModelImage }>) {
+  const unique = new Map<string, ModelImage>();
+  for (const item of images) {
+    const key = imageCacheKey(item.source);
+    if (!soleMatchEmbeddingCache.has(key)) unique.set(key, item.image);
+  }
+  if (unique.size) {
+    const extractor = await getSoleMatchExtractor();
+    const entries = [...unique.entries()];
+    const output = await extractor(entries.map(([, image]) => image));
+    const rowCount = output.dims[0] ?? 0;
+    const width = output.dims[output.dims.length - 1] ?? 0;
+    if (rowCount !== entries.length || width < 1 || output.data.length < rowCount * width) {
+      throw new Error('La salida de embeddings de SoleMatch CLIP tiene una forma inesperada.');
+    }
+    for (let row = 0; row < rowCount; row += 1) {
+      const vector = Array.from(output.data).slice(row * width, (row + 1) * width);
+      soleMatchEmbeddingCache.set(entries[row]![0], normalizeSoleMatchEmbedding(vector));
+    }
+    while (soleMatchEmbeddingCache.size > 512) soleMatchEmbeddingCache.delete(soleMatchEmbeddingCache.keys().next().value!);
+  }
+  return images.map((item) => soleMatchEmbeddingCache.get(imageCacheKey(item.source))!);
 }
 
 async function getFlorenceModels(): Promise<LoadedFlorenceModels> {
@@ -317,8 +369,10 @@ async function inspectMessage(message: Message) {
   const visual = await inspectLocallyWithVision(message.source, image, message.candidates);
   const references = message.references ?? [];
   let referenceMatches: Array<{ brand: string; score: number }> = [];
+  let soleMatchMatches: Array<{ brand: string; score: number; supportCount?: number }> = [];
+  let soleMatchError: string | undefined;
+  const referenceImages = references.length ? await Promise.all(references.map((reference) => decode(reference.source, RawImage))) : [];
   if (references.length && classify.processor && classify.model) {
-    const referenceImages = await Promise.all(references.map((reference) => decode(reference.source, RawImage)));
     const textInputs = classify.tokenizer(['a photo of a shoe'], { padding: 'max_length', truncation: true });
     const imageInputs = await classify.processor([image, ...referenceImages]);
     const embedded = await classify.model({ ...textInputs, ...imageInputs });
@@ -339,6 +393,19 @@ async function inspectMessage(message: Message) {
       })));
     }
   }
+  if (references.length) {
+    try {
+      const embeddings = await getSoleMatchEmbeddings([
+        { source: message.source, image },
+        ...references.map((reference, index) => ({ source: reference.source, image: referenceImages[index]! })),
+      ]);
+      soleMatchMatches = rankSoleMatchReferences(embeddings[0]!, references.map((reference, index) => ({
+        brand: reference.brand, embedding: embeddings[index + 1]!,
+      })));
+    } catch (error) {
+      soleMatchError = error instanceof Error ? error.message.slice(0, 300) : 'Error de carga o inferencia de SoleMatch CLIP.';
+    }
+  }
   const referenceSuggestion = confidentReferenceBrand(referenceMatches);
   // Florence locates the shoe, logo-crop OCR supplies text, and Qwen reads the logo.
   // SigLIP is only a fallback suggestion. Its scores and the closed-set sneaker
@@ -354,6 +421,8 @@ async function inspectMessage(message: Message) {
     ...(sneakerCandidates.length ? { sneakerCandidates } : {}),
     ...(sneakerError ? { sneakerError } : {}),
     ...(referenceMatches.length ? { referenceMatches } : {}),
+    ...(soleMatchMatches.length ? { soleMatchMatches } : {}),
+    ...(soleMatchError ? { soleMatchError } : {}),
     visualBrand: visual.brand,
     ...(visual.answer ? { visualAnswer: visual.answer } : {}),
     ...(visual.logoText ? { visualLogoText: visual.logoText } : {}),

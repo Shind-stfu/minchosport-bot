@@ -56,7 +56,9 @@ describe('image engine queue and cache',()=>{
     const brandInspector={inspect:async(_source:Buffer,candidates:string[],evidence:ImageBrandInspection['evidence'])=>{scored=candidates;usedEvidence=evidence;return {modelId:'test-brand-v1',status:'review',suggestedBrand:'New Balance',score:0.72,candidates:[{brand:'New Balance',score:0.72}],evidence:{...evidence,unknownScore:0.08},autoEligible:false,reason:'review',error:null} as ImageBrandInspection;}};
     const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>inspection},brandInspector);
     await coordinator.schedule('brand-photo');
-    expect(scored).toEqual(['New Balance']);
+    expect(scored).toContain('New Balance');
+    expect(scored).toContain('Dolce & Gabbana');
+    expect(scored).toContain('Jordan');
     expect(usedEvidence).toMatchObject({captionCandidates:['New Balance'],ocrCandidates:['New Balance']});
     expect(db.prepare('SELECT status,suggested_brand,auto_eligible FROM image_brand_inspections WHERE media_asset_id=?').get('brand-photo')).toEqual({status:'review',suggested_brand:'New Balance',auto_eligible:0});
     db.prepare("UPDATE image_brand_inspections SET status='unknown',confirmed_brand=NULL,manual_override=1,reason='Se confirmó manualmente que no hay una marca legible.' WHERE media_asset_id='brand-photo'").run();

@@ -8,7 +8,10 @@ export function normalizeBrandName(value: string) {
 export function detectJordanBrandSignal(texts: Array<string | null | undefined>): 'jumpman' | 'jordan' | null {
   const text = texts.filter((value): value is string => Boolean(value)).join(' ');
   if (/\b(?:jumodman|jumdman|jump\s*man)\b/iu.test(text)) return 'jumpman';
-  if (/\b(?:air\s+)?jordan\b/iu.test(text)) return 'jordan';
+  // Florence/Qwen sometimes hallucinates "AIRBAN" when describing the Air Jordan
+  // wings logo. Treat that model output as a Jordan signal before it can be saved
+  // as an unrelated open-vocabulary brand.
+  if (/\b(?:air\s*ban|airban|(?:air\s+)?jordan)\b/iu.test(text)) return 'jordan';
   return null;
 }
 

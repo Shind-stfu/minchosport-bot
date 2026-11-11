@@ -137,6 +137,12 @@ Las correcciones manuales se guardan como etiquetas verificadas. Por cada marca,
 
 La aplicación utiliza SigLIP 2 localmente. Al comparar una foto con referencias guardadas, promedia las tres similitudes más altas por marca. Las referencias solo se usan como señal cuando hay al menos tres fotos distintas de esa marca y una diferencia mínima frente a la siguiente; la selección distribuye hasta ocho fotos por marca entre las fechas disponibles. La similitud coseno no representa una probabilidad y el modelo de clases cerradas solo aporta evidencia secundaria.
 
+### Búsqueda visual SoleMatch con CLIP
+
+La app también calcula embeddings con `Xenova/clip-vit-base-patch32` (licencia MIT, revisión fijada) y busca la foto verificada más parecida por marca entre las referencias locales. Es una señal independiente de SigLIP que aparece en los detalles y en las métricas de evaluación. Su similitud es una distancia visual, no una probabilidad; no cambia la marca sugerida, no aprueba productos ni inicia envíos. La primera inferencia descarga el modelo y guarda la caché fuera del repositorio.
+
+El encoder ResNet50 ajustado de SoleMatch no se integra: el repositorio upstream no declara licencia de código ni distribuye ese checkpoint. El piloto y sus comandos para Windows están en [`docs/solematch-pilot.md`](docs/solematch-pilot.md).
+
 Además, `identificar_marcas.py` permite probar por separado el checkpoint oficial `google/siglip2-base-patch16-224`, sin modificar la base de datos de la aplicación. Requiere Python 3.10 o posterior:
 
 ```bash

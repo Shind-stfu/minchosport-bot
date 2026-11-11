@@ -10,6 +10,16 @@ describe('brand precision and coverage gate', () => {
     ])).toMatchObject({ evaluationCount: 3, predictionCount: 2, correctCount: 1, precision: 0.5, coverage: 2 / 3, autoEligibleBrands: [] });
   });
 
+  it('records SoleMatch CLIP top-one retrieval as a separate source', () => {
+    const evaluated = evaluateBrandSuggestions([{
+      predictedBrand: null, expectedBrand: 'Jordan',
+      sourcePredictions: { 'SoleMatch · CLIP referencias': 'Jordan' },
+    }]);
+    expect(evaluated.bySource).toContainEqual(expect.objectContaining({
+      source: 'SoleMatch · CLIP referencias', predictionCount: 1, correctCount: 1, precision: 1, coverage: 1,
+    }));
+  });
+
   it('only enables a brand after at least 20 reviewed suggestions and 95% precision', () => {
     const perfect = Array.from({ length: BRAND_AUTO_MIN_PREDICTIONS_PER_BRAND }, () => ({ predictedBrand: 'New Balance', expectedBrand: 'New Balance' }));
     expect(evaluateBrandSuggestions(perfect).autoEligibleBrands).toEqual(['New Balance']);
