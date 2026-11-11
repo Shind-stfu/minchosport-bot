@@ -125,7 +125,19 @@ python3 -m venv data/sneaker-model-venv
 data/sneaker-model-venv/bin/pip install 'torch==2.2.2' 'transformers==4.46.3' 'pillow>=10,<12' 'numpy<2' 'safetensors>=0.4'
 ```
 
-La primera ejecución descarga los pesos desde Hugging Face; las imágenes se procesan localmente. También se puede indicar otro intérprete con `SNEAKER_MODEL_PYTHON`. El modelo clasifica modelos concretos de un conjunto cerrado; se agrupan sus puntuaciones por marca y Jordan se mantiene separado de Nike. Esas puntuaciones no son probabilidades de acierto calibradas. Las marcas desconocidas o fotos sin calzado requieren revisión. La asignación automática exige la calibración específica de esta versión; si el modelo no está disponible, se conservan las otras señales y no se asigna automáticamente.
+En Windows con una GPU NVIDIA, instala la rueda CUDA de PyTorch en vez de la rueda CPU y conserva la ruta del intérprete para el servidor:
+
+```powershell
+py -3.11 -m venv data\sneaker-model-venv
+$python = (Resolve-Path .\data\sneaker-model-venv\Scripts\python.exe).Path
+& $python -m pip install --upgrade pip
+& $python -m pip install 'torch==2.2.2' --index-url https://download.pytorch.org/whl/cu121
+& $python -m pip install 'transformers==4.46.3' 'pillow>=10,<12' 'numpy<2' 'safetensors>=0.4'
+$env:SNEAKER_MODEL_PYTHON = $python
+& $python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+```
+
+La primera ejecución descarga los pesos desde Hugging Face; las imágenes se procesan localmente. También se puede indicar otro intérprete con `SNEAKER_MODEL_PYTHON`. En Windows, `IMAGE_INFERENCE_DEVICE=auto` (predeterminado) intenta WebGPU primero con preferencia de alto rendimiento para favorecer la RTX, prueba DirectML si WebGPU no está disponible y usa CPU como respaldo. Si un proveedor falla durante una imagen, esa imagen se reintenta con DirectML y luego con CPU. Esto aplica a SigLIP, SoleMatch CLIP, Florence y Qwen. El clasificador Python elige CUDA si `torch.cuda.is_available()` y recurre a CPU si falla. En Windows puedes asignar el `node.exe` que usa el proyecto a **Alto rendimiento** en Configuración > Sistema > Pantalla > Gráficos. `IMAGE_INFERENCE_DEVICE=cpu` desactiva la aceleración de esos cuatro modelos; el clasificador Python sigue usando CUDA si está disponible. También acepta `gpu`, `dml` y `webgpu`. El detalle del análisis muestra el dispositivo solicitado o el respaldo aplicado. El modelo de zapatillas clasifica modelos concretos de un conjunto cerrado; se agrupan sus puntuaciones por marca y Jordan se mantiene separado de Nike. Esas puntuaciones no son probabilidades de acierto calibradas. Las marcas desconocidas o fotos sin calzado requieren revisión. La asignación automática exige la calibración específica de esta versión; si el modelo no está disponible, se conservan las otras señales y no se asigna automáticamente.
 
 ### Detección de marca con Florence-2 y Qwen3.5
 

@@ -5,6 +5,7 @@ import type { BrandCandidateScore } from './image-brand-inspection.js';
 
 export const SNEAKER_MODEL_ID = 'dima806/popular_sneakers_detection';
 type ModelRow = { label: string; score: number };
+export type SneakerClassification = { candidates: BrandCandidateScore[]; device: string };
 
 /** Aggregate mutually exclusive sneaker classes; Jordan must precede Nike. */
 export function aggregateSneakerBrands(rows: ModelRow[]): BrandCandidateScore[] {
@@ -28,7 +29,7 @@ export function aggregateSneakerBrands(rows: ModelRow[]): BrandCandidateScore[] 
   return [...totals].map(([brand, score]) => ({ brand, score })).sort((a, b) => b.score - a.score);
 }
 
-export async function classifySneaker(source: Uint8Array): Promise<BrandCandidateScore[]> {
+export async function classifySneaker(source: Uint8Array): Promise<SneakerClassification> {
   const python = process.env.SNEAKER_MODEL_PYTHON ?? fileURLToPath(new URL('../../../data/sneaker-model-venv/bin/python', import.meta.url));
   if (!existsSync(python)) throw new Error('Falta instalar el entorno del modelo de zapatillas.');
   const script = fileURLToPath(new URL('../scripts/sneaker_classifier.py', import.meta.url));
@@ -44,11 +45,15 @@ export async function classifySneaker(source: Uint8Array): Promise<BrandCandidat
       clearTimeout(timer);
       if (code !== 0) return reject(new Error(stderr.slice(-300) || 'Falló el modelo de zapatillas.'));
       try {
-        const rows: unknown = JSON.parse(stdout);
+        const parsed: unknown = JSON.parse(stdout);
+        const rows = Array.isArray(parsed) ? parsed
+          : parsed && typeof parsed === 'object' && 'results' in parsed ? parsed.results : undefined;
+        const device = parsed && typeof parsed === 'object' && 'device' in parsed && typeof parsed.device === 'string'
+          ? parsed.device : 'cpu';
         if (!Array.isArray(rows) || !rows.every((r) => typeof r?.label === 'string' && typeof r?.score === 'number')) throw new Error('Respuesta inválida del modelo.');
         const brands = aggregateSneakerBrands(rows);
         if (!brands.length) throw new Error('El modelo no devolvió clases conocidas.');
-        resolve(brands);
+        resolve({ candidates: brands, device });
       } catch (error) { reject(error); }
     });
     child.stdin.end(Buffer.from(source));

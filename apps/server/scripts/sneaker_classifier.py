@@ -19,9 +19,28 @@ try:
     model = AutoModelForImageClassification.from_pretrained(model_id, revision=revision)
     model.eval()
     image = ImageOps.exif_transpose(Image.open(BytesIO(sys.stdin.buffer.read()))).convert('RGB')
-    with torch.inference_mode():
-        probabilities = model(**processor(images=image, return_tensors='pt')).logits.softmax(dim=-1)[0]
-    print(json.dumps([{'label': model.config.id2label[i], 'score': float(score)} for i, score in enumerate(probabilities)]))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def predict(on_device):
+        model.to(on_device)
+        inputs = processor(images=image, return_tensors='pt').to(on_device)
+        with torch.inference_mode():
+            return model(**inputs).logits.softmax(dim=-1)[0].cpu()
+
+    try:
+        probabilities = predict(device)
+        device_name = str(device)
+    except RuntimeError:
+        if device.type != 'cuda':
+            raise
+        torch.cuda.empty_cache()
+        probabilities = predict(torch.device('cpu'))
+        device_name = 'cpu (respaldo tras error CUDA)'
+
+    print(json.dumps({
+        'device': device_name,
+        'results': [{'label': model.config.id2label[i], 'score': float(score)} for i, score in enumerate(probabilities)],
+    }))
 except Exception as exc:
     print(str(exc)[:300], file=sys.stderr)
     sys.exit(1)

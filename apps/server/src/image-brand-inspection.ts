@@ -4,8 +4,9 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const BRAND_MODEL_ID = 'siglip2-base-patch16-224@ba1f3b0+solematch-clip-vit-b32@6b7c523+florence-2-base-ft@e88a44e+qwen3.5-0.8b-onnx@8fe9dbe+popular-sneakers@c978c26+balanced-references-v2+florence-qwen-logo-crops-v3+holdout-v1';
+export const BRAND_MODEL_ID = 'siglip2-base-patch16-224@ba1f3b0+solematch-clip-vit-b32@6b7c523+florence-2-base-ft@e88a44e+qwen3.5-0.8b-onnx@8fe9dbe+popular-sneakers@c978c26+balanced-references-v2+florence-qwen-logo-crops-v3+gpu-auto-cpu-fallback-v1+holdout-v1';
 
+export type ImageInferenceDevice = 'auto' | 'gpu' | 'cpu' | 'dml' | 'webgpu';
 export type BrandCandidateScore = { brand: string; score: number; supportCount?: number };
 export type BrandReferenceImage = { brand: string; source: Buffer };
 export type ImageBrandInspection = {
@@ -15,7 +16,7 @@ export type ImageBrandInspection = {
   confirmedBrand: string | null;
   score: number;
   candidates: BrandCandidateScore[];
-  evidence: { captionCandidates: string[]; ocrCandidates: string[]; unknownScore?: number; noShoeScore?: number; mixedBrandsScore?: number; referenceMatches?: BrandCandidateScore[]; soleMatchMatches?: BrandCandidateScore[]; soleMatchError?: string; visualBrand?: string | null; visualAnswer?: string; visualLogoText?: string; visualEvidence?: string; visualConfidence?: number; visualModel?: string; visualError?: string; sneakerCandidates?: BrandCandidateScore[]; sneakerError?: string; brandConflict?: boolean };
+  evidence: { captionCandidates: string[]; ocrCandidates: string[]; unknownScore?: number; noShoeScore?: number; mixedBrandsScore?: number; referenceMatches?: BrandCandidateScore[]; soleMatchMatches?: BrandCandidateScore[]; soleMatchError?: string; inferenceDevice?: string; visualBrand?: string | null; visualAnswer?: string; visualLogoText?: string; visualEvidence?: string; visualConfidence?: number; visualModel?: string; visualError?: string; sneakerCandidates?: BrandCandidateScore[]; sneakerError?: string; brandConflict?: boolean };
   autoEligible: boolean;
   reason: string;
   error: string | null;
@@ -30,7 +31,7 @@ export class ImageBrandInspector {
   private nextId = 0;
   private closed = false;
 
-  constructor(private readonly cacheDirectory: string, private readonly timeoutMs = 600_000) {}
+  constructor(private readonly cacheDirectory: string, private readonly timeoutMs = 600_000, private readonly inferenceDevice: ImageInferenceDevice = 'auto') {}
 
   inspect(source: Buffer, candidates: string[], evidence: ImageBrandInspection['evidence'], references: BrandReferenceImage[] = []): Promise<ImageBrandInspection> {
     return this.request({ action: 'inspect', source, candidates, evidence, references }).then((result) => {
@@ -75,7 +76,7 @@ export class ImageBrandInspector {
       const tsImport = pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm/api')).href;
       workerFile = new URL(`data:text/javascript,${encodeURIComponent(`import { tsImport } from ${JSON.stringify(tsImport)}; await tsImport(${JSON.stringify(source.href)}, ${JSON.stringify(import.meta.url)});`)}`);
     }
-    this.worker = new Worker(workerFile, { workerData: { cacheDirectory: this.cacheDirectory }, execArgv: [] });
+    this.worker = new Worker(workerFile, { workerData: { cacheDirectory: this.cacheDirectory, inferenceDevice: this.inferenceDevice }, execArgv: [] });
     this.worker.on('message', (message: { id: number; result?: ImageBrandInspection; hasFootwear?: boolean; error?: string }) => {
       const job = this.pending.get(message.id);
       if (!job) return;

@@ -22,6 +22,7 @@ type ResultRow = { label: string; score: number };
 type ModelImage = import('@huggingface/transformers').RawImage;
 type EmbeddingTensor = { data: ArrayLike<number>; dims: number[] };
 type ImageFeatureExtractor = (images: ModelImage | ModelImage[]) => Promise<EmbeddingTensor>;
+type InferenceDevice = 'auto' | 'gpu' | 'cpu' | 'dml' | 'webgpu';
 type Classifier = ((image: ModelImage, labels: string[], options?: { hypothesis_template?: string }) => Promise<ResultRow[]>) & {
   tokenizer: ((texts: string[], options?: Record<string, unknown>) => Record<string, unknown>) & { _tokenizerConfig: { model_max_length?: number }; model_max_length: number };
   processor: (images: ModelImage[]) => Promise<Record<string, unknown>>;
@@ -47,6 +48,63 @@ let soleMatchExtractorPromise: Promise<ImageFeatureExtractor> | undefined;
 let florenceModelsPromise: Promise<LoadedFlorenceModels> | undefined;
 let visionModelsPromise: Promise<LoadedVisionModels> | undefined;
 const soleMatchEmbeddingCache = new Map<string, number[]>();
+const modelInferenceDevices = new Map<string, string>();
+const configuredInferenceDevice = (workerData.inferenceDevice as InferenceDevice | undefined) ?? 'auto';
+const preferredInferenceDevice: Exclude<InferenceDevice, 'auto'> = configuredInferenceDevice === 'auto'
+  ? process.platform === 'win32' ? 'gpu' : 'cpu'
+  : configuredInferenceDevice;
+let forceCpuInference = false;
+let preferDirectMlInference = false;
+
+function inferenceDeviceOrder(): Array<Exclude<InferenceDevice, 'auto'>> {
+  if (forceCpuInference) return ['cpu'];
+  if (preferDirectMlInference) return ['dml', 'cpu'];
+  if (preferredInferenceDevice === 'gpu' && process.platform === 'win32') return ['webgpu', 'dml', 'cpu'];
+  return preferredInferenceDevice === 'cpu' ? ['cpu'] : [preferredInferenceDevice, 'cpu'];
+}
+
+async function loadWithDeviceFallback<T>(modelName: string, load: (device: Exclude<InferenceDevice, 'auto'>) => Promise<T>) {
+  const devices = inferenceDeviceOrder();
+  let lastError: unknown;
+  for (const [index, device] of devices.entries()) {
+    try {
+      const model = await load(device);
+      const accelerator = device === 'webgpu' ? 'GPU preferida (WebGPU)'
+        : device === 'dml' ? 'GPU (DirectML)'
+          : device === 'gpu' ? 'GPU preferida' : device.toUpperCase();
+      modelInferenceDevices.set(modelName, index > 0 && device === 'cpu' ? `CPU (respaldo)` : accelerator);
+      return model;
+    } catch (error) {
+      lastError = error;
+      if (device !== 'cpu') {
+        const message = error instanceof Error ? error.message.slice(0, 220) : `error del proveedor ${device}`;
+        console.warn(`[image-brand] ${modelName} no pudo iniciar en ${device}${devices[index + 1] ? `; intenta ${devices[index + 1]}` : ''}: ${message}`);
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`No se pudo iniciar ${modelName} en los dispositivos disponibles.`);
+}
+
+function resetInferenceModelsForRetry(device: 'dml' | 'cpu') {
+  forceCpuInference = device === 'cpu';
+  preferDirectMlInference = device === 'dml';
+  classifierPromise = undefined;
+  soleMatchExtractorPromise = undefined;
+  florenceModelsPromise = undefined;
+  visionModelsPromise = undefined;
+  soleMatchEmbeddingCache.clear();
+  modelInferenceDevices.clear();
+}
+
+function inferenceDeviceSummary(sneakerDevice?: string) {
+  const devices = [...modelInferenceDevices.entries()].map(([model, device]) => `${model}: ${device}`);
+  if (sneakerDevice) devices.push(`Clasificador de zapatillas: ${sneakerDevice}`);
+  return devices.join(' · ');
+}
+
+function isAcceleratorActive() {
+  return [...modelInferenceDevices.values()].some((device) => !device.startsWith('CPU'));
+}
 
 async function getTransformerRuntime() {
   const packageEntry = import.meta.resolve('@huggingface/transformers');
@@ -64,7 +122,9 @@ async function getClassifier() {
     env.allowRemoteModels = true;
     env.useFSCache = true;
     if (env.backends?.onnx?.wasm) { env.backends.onnx.wasm.numThreads = 2; env.backends.onnx.wasm.proxy = false; }
-    const classify = await pipeline('zero-shot-image-classification', SIGLIP_MODEL_ID, { revision: 'ba1f3b0', dtype: 'q8' });
+    const classify = await loadWithDeviceFallback('SigLIP', async (device) => await pipeline('zero-shot-image-classification', SIGLIP_MODEL_ID, {
+      revision: 'ba1f3b0', dtype: 'q8', device,
+    }));
     // This checkpoint has a 64-token context, but its exported tokenizer may
     // omit model_max_length and otherwise attempt to pad to an enormous value.
     classify.tokenizer._tokenizerConfig.model_max_length = 64;
@@ -82,9 +142,9 @@ async function getSoleMatchExtractor(): Promise<ImageFeatureExtractor> {
     runtime.env.allowRemoteModels = true;
     runtime.env.useFSCache = true;
     if (runtime.env.backends?.onnx?.wasm) { runtime.env.backends.onnx.wasm.numThreads = 2; runtime.env.backends.onnx.wasm.proxy = false; }
-    return await runtime.pipeline('image-feature-extraction', SOLEMATCH_CLIP_MODEL_ID, {
-      revision: SOLEMATCH_CLIP_REVISION, dtype: 'q8',
-    }) as ImageFeatureExtractor;
+    return await loadWithDeviceFallback('SoleMatch CLIP', async (device) => await runtime.pipeline('image-feature-extraction', SOLEMATCH_CLIP_MODEL_ID, {
+      revision: SOLEMATCH_CLIP_REVISION, dtype: 'q8', device,
+    }) as ImageFeatureExtractor);
   })();
   return soleMatchExtractorPromise;
 }
@@ -129,7 +189,9 @@ async function getFlorenceModels(): Promise<LoadedFlorenceModels> {
 
     runtime.env.cacheDir = florenceCache;
     const florenceProcessor = await runtime.AutoProcessor.from_pretrained(FLORENCE_MODEL_ID, { revision: FLORENCE_REVISION }) as VisionProcessor;
-    const florenceModel = await runtime.Florence2ForConditionalGeneration.from_pretrained(FLORENCE_MODEL_ID, { revision: FLORENCE_REVISION, dtype: 'q8' }) as VisionModel;
+    const florenceModel = await loadWithDeviceFallback('Florence-2', async (device) => await runtime.Florence2ForConditionalGeneration.from_pretrained(FLORENCE_MODEL_ID, {
+      revision: FLORENCE_REVISION, dtype: 'q8', device,
+    }) as VisionModel);
     return { florenceProcessor, florenceModel, RawImage: runtime.RawImage };
   })();
   return florenceModelsPromise;
@@ -147,10 +209,11 @@ async function getVisionModels(): Promise<LoadedVisionModels> {
     if (runtime.env.backends?.onnx?.wasm) { runtime.env.backends.onnx.wasm.numThreads = 2; runtime.env.backends.onnx.wasm.proxy = false; }
     runtime.env.cacheDir = qwenCache;
     const qwenProcessor = await runtime.AutoProcessor.from_pretrained(QWEN_MODEL_ID, { revision: QWEN_REVISION }) as VisionProcessor;
-    const qwenModel = await runtime.Qwen3_5ForConditionalGeneration.from_pretrained(QWEN_MODEL_ID, {
+    const qwenModel = await loadWithDeviceFallback('Qwen3.5', async (device) => await runtime.Qwen3_5ForConditionalGeneration.from_pretrained(QWEN_MODEL_ID, {
       revision: QWEN_REVISION,
       dtype: { embed_tokens: 'q4', vision_encoder: 'fp16', decoder_model_merged: 'q4' },
-    }) as VisionModel;
+      device,
+    }) as VisionModel);
     return { ...florence, qwenProcessor, qwenModel };
   })();
   return visionModelsPromise;
@@ -330,6 +393,7 @@ async function inspectLocallyWithVision(source: Uint8Array, image: ModelImage, c
       error: undefined,
     };
   } catch (error) {
+    if (!forceCpuInference && isAcceleratorActive()) throw error;
     const message = error instanceof Error ? error.message.slice(0, 180) : 'Error de carga o inferencia del modelo visual.';
     return { brand: null, confidence: 0, logoText: '', evidence: '', answer: '', disagreement: false, votes: 0, totalVotes: 0, error: message };
   }
@@ -364,7 +428,12 @@ async function inspectMessage(message: Message) {
 
   let sneakerCandidates: Array<{ brand: string; score: number }> = [];
   let sneakerError: string | undefined;
-  try { sneakerCandidates = await classifySneaker(message.source); }
+  let sneakerDevice: string | undefined;
+  try {
+    const sneakerResult = await classifySneaker(message.source);
+    sneakerCandidates = sneakerResult.candidates;
+    sneakerDevice = sneakerResult.device;
+  }
   catch (error) { sneakerError = error instanceof Error ? error.message.slice(0, 300) : 'Error del modelo de zapatillas.'; }
   const visual = await inspectLocallyWithVision(message.source, image, message.candidates);
   const references = message.references ?? [];
@@ -403,6 +472,7 @@ async function inspectMessage(message: Message) {
         brand: reference.brand, embedding: embeddings[index + 1]!,
       })));
     } catch (error) {
+      if (!forceCpuInference && isAcceleratorActive()) throw error;
       soleMatchError = error instanceof Error ? error.message.slice(0, 300) : 'Error de carga o inferencia de SoleMatch CLIP.';
     }
   }
@@ -420,6 +490,7 @@ async function inspectMessage(message: Message) {
     ...message.evidence, unknownScore, noShoeScore, mixedBrandsScore, brandConflict: conflict || visual.disagreement,
     ...(sneakerCandidates.length ? { sneakerCandidates } : {}),
     ...(sneakerError ? { sneakerError } : {}),
+    inferenceDevice: inferenceDeviceSummary(sneakerDevice),
     ...(referenceMatches.length ? { referenceMatches } : {}),
     ...(soleMatchMatches.length ? { soleMatchMatches } : {}),
     ...(soleMatchError ? { soleMatchError } : {}),
@@ -454,13 +525,46 @@ async function inspectMessage(message: Message) {
   parentPort!.postMessage({ id: message.id, result });
 }
 
-let queue = Promise.resolve();
-parentPort!.on('message', (message: Message) => {
-  queue = queue.then(async () => {
-    if (message.action === 'screen') parentPort!.postMessage({ id: message.id, hasFootwear: await screenForFootwear(message.source) });
-    else await inspectMessage(message);
-  }).catch((error) => {
+async function processMessage(message: Message) {
+  if (message.action === 'screen') parentPort!.postMessage({ id: message.id, hasFootwear: await screenForFootwear(message.source) });
+  else await inspectMessage(message);
+}
+
+async function processMessageWithFallback(message: Message) {
+  try {
+    await processMessage(message);
+  } catch (error) {
+    if (!forceCpuInference && preferredInferenceDevice !== 'cpu' && isAcceleratorActive()) {
+      const reason = error instanceof Error ? error.message.slice(0, 220) : 'falló la inferencia acelerada';
+      const webGpuFailed = !preferDirectMlInference && [...modelInferenceDevices.values()].some((device) => device.includes('WebGPU'));
+      let finalError = error;
+      if (webGpuFailed) {
+        console.warn(`[image-brand] Falló la inferencia en WebGPU; se reinician los modelos para probar DirectML: ${reason}`);
+        resetInferenceModelsForRetry('dml');
+        try {
+          await processMessage(message);
+          return;
+        } catch (directMlError) {
+          finalError = directMlError;
+        }
+      }
+      const fallbackReason = finalError instanceof Error ? finalError.message.slice(0, 220) : reason;
+      console.warn(`[image-brand] Falló la inferencia acelerada; se reinician los modelos para continuar en CPU: ${fallbackReason}`);
+      resetInferenceModelsForRetry('cpu');
+      try {
+        await processMessage(message);
+        return;
+      } catch (retryError) {
+        finalError = retryError;
+      }
+      error = finalError;
+    }
     const messageText = error instanceof Error ? error.message.slice(0, 300) : 'Error desconocido al clasificar la marca.';
     parentPort!.postMessage({ id: message.id, error: messageText });
-  });
+  }
+}
+
+let queue = Promise.resolve();
+parentPort!.on('message', (message: Message) => {
+  queue = queue.then(async () => await processMessageWithFallback(message));
 });
