@@ -1051,8 +1051,9 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     try {
       const result = await distribution.approveAndSendAll(body.data.supplierId ?? undefined, body.data.productIds);
       audit(db, body.data.productIds ? 'products.sent.selected' : 'products.sent.in_bulk', 'distribution', body.data.sessionId, { ...result, supplierId: body.data.supplierId ?? null, productIds: body.data.productIds ?? null });
-      const message = result.error
-        ? `Se completaron ${result.sentProducts} referencias (${result.sentImages} envíos de fotos). El lote se detuvo porque una publicación quedó incierta: ${result.error} ${result.reviewRequired} referencias siguen por revisar.`
+      const omitted = Math.max(0, result.skipped - result.uncertain);
+      const message = result.uncertain
+        ? `Lote procesado: ${result.sentProducts} referencias completadas; WhatsApp aceptó ${result.sentImages} envíos de fotos a ${result.sentGroups} destinos. ${result.uncertain} referencias quedaron con al menos un envío incierto y requieren revisión manual; esas unidades no se reintentaron. ${omitted} referencias se omitieron. ${result.reviewRequired} referencias ambiguas siguen por revisar.${result.skippedErrors.length ? ` Errores: ${result.skippedErrors.slice(0,3).join(' | ')}` : ''}`
         : `Listo: ${result.sentProducts} referencias enviadas; se procesaron ${result.sentImages} envíos de fotos a ${result.sentGroups} destinos. ${result.reviewRequired} referencias ambiguas siguen por revisar; ${result.skipped} se omitieron.${result.skippedErrors.length ? ` Primeros errores: ${result.skippedErrors.slice(0,3).join(' | ')}` : ''}`;
       return { ok: true, ...result, message };
     } catch (error) {

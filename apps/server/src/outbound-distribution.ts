@@ -161,7 +161,7 @@ export class OutboundDistributionService {
   }
 
   /** Bulk sends only supplier products with an already clear, prepared price. */
-  async approveAndSendAll(supplierId?: string, productIds?: string[]): Promise<{ sentProducts: number; sentGroups: number; sentImages: number; reviewRequired: number; skipped: number; skippedErrors: string[]; error?: string }> {
+  async approveAndSendAll(supplierId?: string, productIds?: string[]): Promise<{ sentProducts: number; sentGroups: number; sentImages: number; reviewRequired: number; skipped: number; uncertain: number; skippedErrors: string[] }> {
     const signal = this.sendCancellation.signal;
     signal.throwIfAborted();
     if (!this.enabled) throw new Error('El envío real está deshabilitado. Revisa APP_MODE, WHATSAPP_ENABLED y WHATSAPP_SEND_ENABLED en .env.');
@@ -187,7 +187,7 @@ export class OutboundDistributionService {
     let sentGroups = 0;
     let sentImages = 0;
     let skipped = products.filter((product) => !['approved', 'needs_review'].includes(product.status)).length;
-    let uncertainError: string | undefined;
+    let uncertain = 0;
     const skippedErrors: string[] = [];
 
     for (const product of ready) {
@@ -199,6 +199,10 @@ export class OutboundDistributionService {
         skipped += 1;
         continue;
       }
+      const submittedBefore = new Set((this.db.prepare(`SELECT u.id FROM outbound_units u
+        JOIN outbound_publications p ON p.id=u.publication_id
+        WHERE u.session_id=? AND p.session_id=? AND p.product_id=? AND u.status='submitted'`)
+        .all(this.sessionId, this.sessionId, product.id) as Array<{ id: string }>).map((unit) => unit.id));
       try {
         const result = await this.sendApprovedProduct(product.id);
         signal.throwIfAborted();
@@ -211,13 +215,21 @@ export class OutboundDistributionService {
         const detail = error instanceof Error ? error.message : 'No se pudo enviar una referencia.';
         skippedErrors.push(`${product.title || product.id}: ${detail}`);
         if (detail.includes('quedó incierto')) {
-          uncertainError = detail;
-          break;
+          uncertain += 1;
+          const submittedAfter = this.db.prepare(`SELECT u.id,p.group_id FROM outbound_units u
+            JOIN outbound_publications p ON p.id=u.publication_id
+            WHERE u.session_id=? AND p.session_id=? AND p.product_id=? AND u.status='submitted'`)
+            .all(this.sessionId, this.sessionId, product.id) as Array<{ id: string; group_id: string }>;
+          const newlySubmitted = submittedAfter.filter((unit) => !submittedBefore.has(unit.id));
+          sentImages += newlySubmitted.length;
+          sentGroups += new Set(newlySubmitted.map((unit) => unit.group_id)).size;
+          this.logger.warn({ productId: product.id, acceptedImages: newlySubmitted.length, uncertain: true }, 'El lote continúa con las demás referencias; la unidad incierta requiere revisión manual');
+          continue;
         }
         this.logger.warn({ err: error, productId: product.id }, 'Se omitió una referencia durante el envío masivo');
       }
     }
-    return { sentProducts, sentGroups, sentImages, reviewRequired, skipped, skippedErrors, ...(uncertainError ? { error: uncertainError } : {}) };
+    return { sentProducts, sentGroups, sentImages, reviewRequired, skipped, uncertain, skippedErrors };
   }
 
   private tick(): Promise<void> {
