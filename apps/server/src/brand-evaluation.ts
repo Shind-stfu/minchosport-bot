@@ -1,6 +1,5 @@
 import { normalizeBrandName } from './brand-candidates.js';
-import { confidentReferenceBrand } from './brand-reference-ranking.js';
-import type { BrandCandidateScore, ImageBrandInspection } from './image-brand-inspection.js';
+import type { ImageBrandInspection } from './image-brand-inspection.js';
 
 export type BrandEvaluationSample = {
   predictedBrand: string | null;
@@ -10,16 +9,8 @@ export type BrandEvaluationSample = {
 export const BRAND_AUTO_PRECISION_THRESHOLD = 0.95;
 export const BRAND_AUTO_MIN_PREDICTIONS_PER_BRAND = 20;
 
-export function brandSourcePredictions(candidates: BrandCandidateScore[], evidence: ImageBrandInspection['evidence']) {
-  const top = candidates[0];
-  const nonBrand = Math.max(evidence.unknownScore ?? 0, evidence.noShoeScore ?? 0, evidence.mixedBrandsScore ?? 0);
-  return {
-    'Florence + Qwen': evidence.visualBrand ?? null,
-    'SigLIP · clases abiertas': top && top.score > nonBrand && top.score >= 0.12 ? top.brand : null,
-    'SigLIP · referencias': confidentReferenceBrand(evidence.referenceMatches ?? []),
-    'SoleMatch · CLIP referencias': evidence.soleMatchMatches?.[0]?.brand ?? null,
-    'Detector de zapatillas': evidence.sneakerCandidates?.[0]?.brand ?? null,
-  };
+export function brandSourcePredictions(evidence: ImageBrandInspection['evidence']) {
+  return { 'Florence + Qwen': evidence.visualBrand ?? null };
 }
 
 export function evaluateBrandSuggestions(samples: BrandEvaluationSample[]) {

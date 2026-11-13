@@ -53,7 +53,7 @@ describe('image engine queue and cache',()=>{
     const bytes=Buffer.from('same photo');const hash=createHash('sha256').update(bytes).digest('hex');writeFileSync(join(directory,'media',`${hash}.png`),bytes);
     db.prepare("INSERT INTO media_assets(id,product_id,sha256,file_name,mime_type,size_bytes,position,created_at) VALUES ('brand-photo','brand-product',?,?, 'image/png',?,0,?)").run(hash,`${hash}.png`,bytes.length,now);
     const inspection={...result(),ocrText:'NB'};let scored:string[]=[];let usedEvidence:ImageBrandInspection['evidence']|undefined;
-    const brandInspector={inspect:async(_source:Buffer,candidates:string[],evidence:ImageBrandInspection['evidence'])=>{scored=candidates;usedEvidence=evidence;return {modelId:'test-brand-v1',status:'review',suggestedBrand:'New Balance',score:0.72,candidates:[{brand:'New Balance',score:0.72}],evidence:{...evidence,unknownScore:0.08},autoEligible:false,reason:'review',error:null} as ImageBrandInspection;}};
+    const brandInspector={inspect:async(_source:Buffer,candidates:string[],evidence:ImageBrandInspection['evidence'])=>{scored=candidates;usedEvidence=evidence;return {modelId:'test-brand-v1',status:'review',suggestedBrand:'New Balance',score:0.72,candidates:[{brand:'New Balance',score:0.72}],evidence:{...evidence},autoEligible:false,reason:'review',error:null} as ImageBrandInspection;}};
     const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>inspection},brandInspector);
     await coordinator.schedule('brand-photo');
     expect(scored).toContain('New Balance');
@@ -66,22 +66,22 @@ describe('image engine queue and cache',()=>{
     expect(db.prepare('SELECT status,confirmed_brand,manual_override,reason FROM image_brand_inspections WHERE media_asset_id=?').get('brand-photo')).toEqual({status:'unknown',confirmed_brand:null,manual_override:1,reason:'Se confirmó manualmente que no hay una marca legible.'});
     await coordinator.close();db.close();
   });
-  it('compares later photos with manually confirmed brand reference images',async()=>{
+  it('uses verified brand names as candidates without sending reference images to inference',async()=>{
     const {db,directory,asset}=setup({version:'test-v1',inspect:async()=>result()});
     const now=new Date().toISOString();
     asset('reference-photo',Buffer.from('confirmed Nike photo'));
     asset('incoming-photo',Buffer.from('new shoe photo'));
     db.prepare("INSERT INTO shoe_brand_registry(normalized_name,display_name,aliases_json,created_at,updated_at) VALUES ('nike','Nike','[]',?,?)").run(now,now);
     db.prepare("INSERT INTO shoe_brand_references(normalized_brand,media_asset_id,created_at) VALUES ('nike','reference-photo',?)").run(now);
-    let scored:string[]=[];let references:Array<{brand:string;source:Buffer}>|undefined;
-    const brandInspector={inspect:async(_source:Buffer,candidates:string[],evidence:ImageBrandInspection['evidence'],referenceImages:Array<{brand:string;source:Buffer}>)=>{
-      scored=candidates;references=referenceImages;
+    let scored:string[]=[];let inferenceArgumentCount=0;
+    const brandInspector={inspect:async function(_source:Buffer,candidates:string[],evidence:ImageBrandInspection['evidence']){
+      inferenceArgumentCount=arguments.length;scored=candidates;
       return {modelId:'test-brand-v1',status:'unknown',suggestedBrand:null,confirmedBrand:null,score:0,candidates:[],evidence,autoEligible:false,reason:'unknown',error:null} as ImageBrandInspection;
     }};
     const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>result()},brandInspector);
     await coordinator.schedule('incoming-photo');
     expect(scored).toContain('Nike');
-    expect(references?.map((reference)=>({brand:reference.brand,content:reference.source.toString()}))).toEqual([{brand:'Nike',content:'confirmed Nike photo'}]);
+    expect(inferenceArgumentCount).toBe(3);
     await coordinator.close();db.close();
   });
   it('auto-confirms a brand only after its reviewed predictions reach the precision and sample gates',async()=>{
@@ -93,7 +93,7 @@ describe('image engine queue and cache',()=>{
         .run(id,BRAND_MODEL_ID,'New Balance','New Balance',now);
     }
     asset('auto-candidate',Buffer.from('future photo'));
-    const brandInspector={inspect:async()=>({modelId:BRAND_MODEL_ID,status:'review',suggestedBrand:'New Balance',confirmedBrand:null,score:0.92,candidates:[{brand:'New Balance',score:0.82}],evidence:{captionCandidates:[],ocrCandidates:[],unknownScore:0.01,visualBrand:'New Balance'},autoEligible:false,reason:'review',error:null} as ImageBrandInspection)};
+    const brandInspector={inspect:async()=>({modelId:BRAND_MODEL_ID,status:'review',suggestedBrand:'New Balance',confirmedBrand:null,score:0.92,candidates:[{brand:'New Balance',score:0.82}],evidence:{captionCandidates:[],ocrCandidates:[],visualBrand:'New Balance'},autoEligible:false,reason:'review',error:null} as ImageBrandInspection)};
     const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>result()},brandInspector);
     await coordinator.schedule('auto-candidate');
     expect(db.prepare('SELECT status,confirmed_brand,auto_eligible,manual_override FROM image_brand_inspections WHERE media_asset_id=?').get('auto-candidate'))
@@ -101,9 +101,9 @@ describe('image engine queue and cache',()=>{
     await coordinator.close();db.close();
   });
   it.each([
-    { evidence: { visualBrand: 'Nike', sneakerError: 'unavailable' }, expectedStatus: 'confirmed', expectedEligible: 1 },
+    { evidence: { visualBrand: 'Nike' }, expectedStatus: 'confirmed', expectedEligible: 1 },
     { evidence: { visualBrand: 'Nike', brandConflict: true }, expectedStatus: 'review', expectedEligible: 0 },
-  ])('uses Florence + Qwen as the gate and treats the sneaker model as secondary: %o', async ({ evidence, expectedStatus, expectedEligible }) => {
+  ])('uses Florence + Qwen confidence and rejects internal disagreement: %o', async ({ evidence, expectedStatus, expectedEligible }) => {
     const {db,directory,asset}=setup({version:'test-v1',inspect:async()=>result()});
     const now=new Date().toISOString();
     for(let index=0;index<20;index++){

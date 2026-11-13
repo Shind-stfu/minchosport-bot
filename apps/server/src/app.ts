@@ -769,7 +769,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
         let evidence: ImageBrandInspection['evidence'] = { captionCandidates: [], ocrCandidates: [] };
         try { candidates = JSON.parse(asset.candidatesJson ?? '[]'); } catch { /* Keep an empty source record for legacy results. */ }
         try { evidence = JSON.parse(asset.evidenceJson ?? '{}'); } catch { /* Keep an empty source record for legacy results. */ }
-        const sourcePredictions = JSON.stringify(brandSourcePredictions(candidates, evidence));
+        const sourcePredictions = JSON.stringify(brandSourcePredictions(evidence));
         db.prepare(`INSERT INTO shoe_brand_evaluation_samples(media_asset_id,model_id,predicted_brand,expected_brand,reviewed_at,split,source_predictions_json) VALUES (?,?,?,?,?,?,?)
           ON CONFLICT(media_asset_id) DO UPDATE SET model_id=excluded.model_id,predicted_brand=excluded.predicted_brand,expected_brand=excluded.expected_brand,
             split=excluded.split,source_predictions_json=excluded.source_predictions_json,reviewed_at=excluded.reviewed_at`)

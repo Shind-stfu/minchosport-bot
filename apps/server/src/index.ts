@@ -42,7 +42,7 @@ const imageInspector = new ImageInspectorPool(join(dataDirectory, 'ocr-cache'), 
 const nearbyModelCaches = [join(dirname(dataDirectory), 'models'), join(dirname(dirname(dataDirectory)), 'models')];
 const sharedModelCache = nearbyModelCaches.find((directory) => existsSync(join(directory, 'qwen3.5')) && existsSync(join(directory, 'florence2')))
   ?? nearbyModelCaches[0]!;
-const imageBrandInspector = new ImageBrandInspector(join(sharedModelCache, 'siglip2'), 600_000, config.IMAGE_INFERENCE_DEVICE);
+const imageBrandInspector = new ImageBrandInspector(join(sharedModelCache, 'florence-qwen'), 600_000, config.IMAGE_INFERENCE_DEVICE);
 const imageInspections = new ImageInspectionCoordinator(database, dataDirectory, imageInspector, imageBrandInspector);
 const supplierIngestion = new SupplierIngestionService(database, dataDirectory, whatsappLogger,
   (assetId) => { void imageInspections.schedule(assetId); },

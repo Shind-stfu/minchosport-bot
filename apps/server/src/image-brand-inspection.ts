@@ -4,11 +4,10 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const BRAND_MODEL_ID = 'siglip2-base-patch16-224@ba1f3b0+solematch-clip-vit-b32@6b7c523+florence-2-base-ft@e88a44e+qwen3.5-0.8b-onnx@8fe9dbe+popular-sneakers@c978c26+balanced-references-v2+florence-qwen-logo-crops-v3+gpu-auto-cpu-fallback-v1+holdout-v1';
+export const BRAND_MODEL_ID = 'florence-2-base-ft@e88a44e+qwen3.5-0.8b-onnx@8fe9dbe+logo-crops-v4+gpu-fallback-v1';
 
 export type ImageInferenceDevice = 'auto' | 'gpu' | 'cpu' | 'dml' | 'webgpu';
 export type BrandCandidateScore = { brand: string; score: number; supportCount?: number };
-export type BrandReferenceImage = { brand: string; source: Buffer };
 export type ImageBrandInspection = {
   modelId: string;
   status: 'review' | 'confirmed' | 'unknown' | 'failed';
@@ -16,7 +15,7 @@ export type ImageBrandInspection = {
   confirmedBrand: string | null;
   score: number;
   candidates: BrandCandidateScore[];
-  evidence: { captionCandidates: string[]; ocrCandidates: string[]; unknownScore?: number; noShoeScore?: number; mixedBrandsScore?: number; referenceMatches?: BrandCandidateScore[]; soleMatchMatches?: BrandCandidateScore[]; soleMatchError?: string; inferenceDevice?: string; visualBrand?: string | null; visualAnswer?: string; visualLogoText?: string; visualEvidence?: string; visualConfidence?: number; visualModel?: string; visualError?: string; sneakerCandidates?: BrandCandidateScore[]; sneakerError?: string; brandConflict?: boolean };
+  evidence: { captionCandidates: string[]; ocrCandidates: string[]; inferenceDevice?: string; visualBrand?: string | null; visualAnswer?: string; visualLogoText?: string; visualEvidence?: string; visualConfidence?: number; visualModel?: string; visualError?: string; brandConflict?: boolean };
   autoEligible: boolean;
   reason: string;
   error: string | null;
@@ -33,8 +32,8 @@ export class ImageBrandInspector {
 
   constructor(private readonly cacheDirectory: string, private readonly timeoutMs = 600_000, private readonly inferenceDevice: ImageInferenceDevice = 'auto') {}
 
-  inspect(source: Buffer, candidates: string[], evidence: ImageBrandInspection['evidence'], references: BrandReferenceImage[] = []): Promise<ImageBrandInspection> {
-    return this.request({ action: 'inspect', source, candidates, evidence, references }).then((result) => {
+  inspect(source: Buffer, candidates: string[], evidence: ImageBrandInspection['evidence']): Promise<ImageBrandInspection> {
+    return this.request({ action: 'inspect', source, candidates, evidence }).then((result) => {
       if (typeof result === 'boolean') throw new Error('Respuesta inválida del clasificador de marcas.');
       return result;
     });
@@ -47,7 +46,7 @@ export class ImageBrandInspector {
     });
   }
 
-  private request(payload: { action: 'inspect' | 'screen'; source: Buffer; candidates: string[]; evidence: ImageBrandInspection['evidence']; references?: BrandReferenceImage[] }): Promise<ImageBrandInspection | boolean> {
+  private request(payload: { action: 'inspect' | 'screen'; source: Buffer; candidates: string[]; evidence: ImageBrandInspection['evidence'] }): Promise<ImageBrandInspection | boolean> {
     if (this.closed) return Promise.reject(new Error('El clasificador de marcas está cerrado.'));
     const worker = this.getWorker();
     const id = ++this.nextId;

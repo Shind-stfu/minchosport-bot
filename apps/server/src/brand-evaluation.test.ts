@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BRAND_AUTO_MIN_PREDICTIONS_PER_BRAND, evaluateBrandSuggestions } from './brand-evaluation.js';
+import { BRAND_AUTO_MIN_PREDICTIONS_PER_BRAND, brandSourcePredictions, evaluateBrandSuggestions } from './brand-evaluation.js';
 
 describe('brand precision and coverage gate', () => {
   it('reports precision and coverage independently, including false positives and misses', () => {
@@ -10,14 +10,9 @@ describe('brand precision and coverage gate', () => {
     ])).toMatchObject({ evaluationCount: 3, predictionCount: 2, correctCount: 1, precision: 0.5, coverage: 2 / 3, autoEligibleBrands: [] });
   });
 
-  it('records SoleMatch CLIP top-one retrieval as a separate source', () => {
-    const evaluated = evaluateBrandSuggestions([{
-      predictedBrand: null, expectedBrand: 'Jordan',
-      sourcePredictions: { 'SoleMatch · CLIP referencias': 'Jordan' },
-    }]);
-    expect(evaluated.bySource).toContainEqual(expect.objectContaining({
-      source: 'SoleMatch · CLIP referencias', predictionCount: 1, correctCount: 1, precision: 1, coverage: 1,
-    }));
+  it('records only the active Florence + Qwen prediction source', () => {
+    expect(brandSourcePredictions({ captionCandidates: [], ocrCandidates: [], visualBrand: 'Jordan' }))
+      .toEqual({ 'Florence + Qwen': 'Jordan' });
   });
 
   it('only enables a brand after at least 20 reviewed suggestions and 95% precision', () => {

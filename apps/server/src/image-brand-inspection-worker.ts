@@ -1,33 +1,18 @@
 import { mkdirSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { parentPort, workerData } from 'node:worker_threads';
 import { BRAND_MODEL_ID, type ImageBrandInspection } from './image-brand-inspection.js';
-import { classifySneaker } from './sneaker-model.js';
-import { confidentReferenceBrand, rankBrandReferences } from './brand-reference-ranking.js';
 import { normalizeBrandName, resolveVisionBrandConsensus } from './brand-candidates.js';
-import { normalizeSoleMatchEmbedding, rankSoleMatchReferences } from './solematch-clip.js';
 
-const SIGLIP_MODEL_ID = 'onnx-community/siglip2-base-patch16-224-ONNX';
 const FLORENCE_MODEL_ID = 'onnx-community/Florence-2-base-ft';
 const FLORENCE_REVISION = 'e88a44eaf3791a35eae0c5a47b3dbcd36e67eb6f';
 const QWEN_MODEL_ID = 'onnx-community/Qwen3.5-0.8B-ONNX';
 const QWEN_REVISION = '8fe9dbe3fb39fe902e18df9be84b6a0ac77ae0f6';
-const SOLEMATCH_CLIP_MODEL_ID = 'Xenova/clip-vit-base-patch32';
-const SOLEMATCH_CLIP_REVISION = '6b7c523703ae26e39be4b03774966f8571c7f523';
 const VISION_MODEL_LABEL = 'Florence-2-base-ft + Qwen3.5-0.8B';
 
-type Message = { id: number; source: Uint8Array; action?: 'inspect' | 'screen'; candidates: string[]; evidence: ImageBrandInspection['evidence']; references?: Array<{ brand: string; source: Uint8Array }> };
-type ResultRow = { label: string; score: number };
+type Message = { id: number; source: Uint8Array; action?: 'inspect' | 'screen'; candidates: string[]; evidence: ImageBrandInspection['evidence'] };
 type ModelImage = import('@huggingface/transformers').RawImage;
-type EmbeddingTensor = { data: ArrayLike<number>; dims: number[] };
-type ImageFeatureExtractor = (images: ModelImage | ModelImage[]) => Promise<EmbeddingTensor>;
 type InferenceDevice = 'auto' | 'gpu' | 'cpu' | 'dml' | 'webgpu';
-type Classifier = ((image: ModelImage, labels: string[], options?: { hypothesis_template?: string }) => Promise<ResultRow[]>) & {
-  tokenizer: ((texts: string[], options?: Record<string, unknown>) => Record<string, unknown>) & { _tokenizerConfig: { model_max_length?: number }; model_max_length: number };
-  processor: (images: ModelImage[]) => Promise<Record<string, unknown>>;
-  model: (inputs: Record<string, unknown>) => Promise<{ image_embeds?: EmbeddingTensor }>;
-};
 type VisionProcessor = ((...args: any[]) => Promise<Record<string, any>>) & {
   batch_decode: (sequences: any, options?: Record<string, unknown>) => string[];
   post_process_generation: (text: string, task: string, imageSize: [number, number]) => Record<string, any>;
@@ -43,11 +28,8 @@ type LoadedVisionModels = {
 };
 type LoadedFlorenceModels = Pick<LoadedVisionModels, 'florenceProcessor' | 'florenceModel' | 'RawImage'>;
 
-let classifierPromise: Promise<{ classify: Classifier; RawImage: typeof import('@huggingface/transformers')['RawImage'] }> | undefined;
-let soleMatchExtractorPromise: Promise<ImageFeatureExtractor> | undefined;
 let florenceModelsPromise: Promise<LoadedFlorenceModels> | undefined;
 let visionModelsPromise: Promise<LoadedVisionModels> | undefined;
-const soleMatchEmbeddingCache = new Map<string, number[]>();
 const modelInferenceDevices = new Map<string, string>();
 const configuredInferenceDevice = (workerData.inferenceDevice as InferenceDevice | undefined) ?? 'auto';
 const preferredInferenceDevice: Exclude<InferenceDevice, 'auto'> = configuredInferenceDevice === 'auto'
@@ -88,17 +70,13 @@ async function loadWithDeviceFallback<T>(modelName: string, load: (device: Exclu
 function resetInferenceModelsForRetry(device: 'dml' | 'cpu') {
   forceCpuInference = device === 'cpu';
   preferDirectMlInference = device === 'dml';
-  classifierPromise = undefined;
-  soleMatchExtractorPromise = undefined;
   florenceModelsPromise = undefined;
   visionModelsPromise = undefined;
-  soleMatchEmbeddingCache.clear();
   modelInferenceDevices.clear();
 }
 
-function inferenceDeviceSummary(sneakerDevice?: string) {
+function inferenceDeviceSummary() {
   const devices = [...modelInferenceDevices.entries()].map(([model, device]) => `${model}: ${device}`);
-  if (sneakerDevice) devices.push(`Clasificador de zapatillas: ${sneakerDevice}`);
   return devices.join(' · ');
 }
 
@@ -111,70 +89,6 @@ async function getTransformerRuntime() {
   // The app runs in Node and persists model files locally; the browser bundle
   // intentionally reports that filesystem caching is unavailable.
   return await import(packageEntry) as any;
-}
-
-async function getClassifier() {
-  classifierPromise ??= (async () => {
-    const { env, pipeline, RawImage } = await getTransformerRuntime();
-    const cacheDirectory = workerData.cacheDirectory as string;
-    mkdirSync(cacheDirectory, { recursive: true });
-    env.cacheDir = cacheDirectory;
-    env.allowRemoteModels = true;
-    env.useFSCache = true;
-    if (env.backends?.onnx?.wasm) { env.backends.onnx.wasm.numThreads = 2; env.backends.onnx.wasm.proxy = false; }
-    const classify = await loadWithDeviceFallback('SigLIP', async (device) => await pipeline('zero-shot-image-classification', SIGLIP_MODEL_ID, {
-      revision: 'ba1f3b0', dtype: 'q8', device,
-    }));
-    // This checkpoint has a 64-token context, but its exported tokenizer may
-    // omit model_max_length and otherwise attempt to pad to an enormous value.
-    classify.tokenizer._tokenizerConfig.model_max_length = 64;
-    return { classify, RawImage };
-  })();
-  return classifierPromise;
-}
-
-async function getSoleMatchExtractor(): Promise<ImageFeatureExtractor> {
-  soleMatchExtractorPromise ??= (async () => {
-    const runtime = await getTransformerRuntime();
-    const cacheDirectory = join(dirname(workerData.cacheDirectory as string), 'solematch-clip');
-    mkdirSync(cacheDirectory, { recursive: true });
-    runtime.env.cacheDir = cacheDirectory;
-    runtime.env.allowRemoteModels = true;
-    runtime.env.useFSCache = true;
-    if (runtime.env.backends?.onnx?.wasm) { runtime.env.backends.onnx.wasm.numThreads = 2; runtime.env.backends.onnx.wasm.proxy = false; }
-    return await loadWithDeviceFallback('SoleMatch CLIP', async (device) => await runtime.pipeline('image-feature-extraction', SOLEMATCH_CLIP_MODEL_ID, {
-      revision: SOLEMATCH_CLIP_REVISION, dtype: 'q8', device,
-    }) as ImageFeatureExtractor);
-  })();
-  return soleMatchExtractorPromise;
-}
-
-function imageCacheKey(source: Uint8Array) {
-  return createHash('sha256').update(source).digest('hex');
-}
-
-async function getSoleMatchEmbeddings(images: Array<{ source: Uint8Array; image: ModelImage }>) {
-  const unique = new Map<string, ModelImage>();
-  for (const item of images) {
-    const key = imageCacheKey(item.source);
-    if (!soleMatchEmbeddingCache.has(key)) unique.set(key, item.image);
-  }
-  if (unique.size) {
-    const extractor = await getSoleMatchExtractor();
-    const entries = [...unique.entries()];
-    const output = await extractor(entries.map(([, image]) => image));
-    const rowCount = output.dims[0] ?? 0;
-    const width = output.dims[output.dims.length - 1] ?? 0;
-    if (rowCount !== entries.length || width < 1 || output.data.length < rowCount * width) {
-      throw new Error('La salida de embeddings de SoleMatch CLIP tiene una forma inesperada.');
-    }
-    for (let row = 0; row < rowCount; row += 1) {
-      const vector = Array.from(output.data).slice(row * width, (row + 1) * width);
-      soleMatchEmbeddingCache.set(entries[row]![0], normalizeSoleMatchEmbedding(vector));
-    }
-    while (soleMatchEmbeddingCache.size > 512) soleMatchEmbeddingCache.delete(soleMatchEmbeddingCache.keys().next().value!);
-  }
-  return images.map((item) => soleMatchEmbeddingCache.get(imageCacheKey(item.source))!);
 }
 
 async function getFlorenceModels(): Promise<LoadedFlorenceModels> {
@@ -346,9 +260,10 @@ async function screenForFootwear(source: Uint8Array) {
   }));
 }
 
-async function inspectLocallyWithVision(source: Uint8Array, image: ModelImage, candidates: string[]) {
+async function inspectLocallyWithVision(source: Uint8Array, candidates: string[]) {
   try {
     const models = await getVisionModels();
+    const image = await decode(source, models.RawImage);
     const shoes = await locateShoes(source, image, models);
     if (!shoes.length) return { brand: null, confidence: 0, logoText: '', evidence: '', answer: 'No se encontró una zapatilla para recortar.', disagreement: false, votes: 0, totalVotes: 0, error: undefined };
     const promptFor = (logoText: string) => `Reconoce la marca de esta zapatilla usando solamente un logotipo o texto visible. No deduzcas la marca por la silueta, el modelo, la caja ni el fondo. El OCR opcional de esta zona dice: ${logoText || '(sin texto legible)'}. Si el texto puede pertenecer al proveedor o al fondo, ignóralo. Devuelve solo JSON válido con las claves brand (nombre de marca o null), logo_text (letras que realmente ves, o string vacío), evidence (breve señal visual concreta) y uncertain (boolean). Si no puedes identificar el logo con seguridad, usa brand null y uncertain true. No inventes una marca.`;
@@ -400,100 +315,11 @@ async function inspectLocallyWithVision(source: Uint8Array, image: ModelImage, c
 }
 
 async function inspectMessage(message: Message) {
-  const { classify, RawImage } = await getClassifier();
-  const unknownLabel = 'a shoe with no readable or recognizable brand';
-  const noShoeLabel = 'an advertisement or message that does not show shoes';
-  const mixedBrandsLabel = 'an assortment of unrelated shoes with different brand logos';
-  const prompts = new Map<string, string>();
-  for (const brand of message.candidates.slice(0, 48)) {
-    prompts.set(`a ${brand} sneaker`, brand);
-    prompts.set(`a shoe with the ${brand} logo`, brand);
-  }
-  const image = await decode(message.source, RawImage);
-  const output = await classify(image, [...prompts.keys(), unknownLabel, noShoeLabel, mixedBrandsLabel], { hypothesis_template: '{}' });
-  const unknownScore = output.find((row) => row.label === unknownLabel)?.score ?? 0;
-  const noShoeScore = output.find((row) => row.label === noShoeLabel)?.score ?? 0;
-  const mixedBrandsScore = output.find((row) => row.label === mixedBrandsLabel)?.score ?? 0;
-  const nonBrandLabels = new Set([unknownLabel, noShoeLabel, mixedBrandsLabel]);
-  const byBrand = new Map<string, number>();
-  for (const row of output) {
-    if (nonBrandLabels.has(row.label)) continue;
-    const brand = prompts.get(row.label) ?? row.label;
-    byBrand.set(brand, Math.max(byBrand.get(brand) ?? 0, row.score));
-  }
-  const candidates = [...byBrand].map(([brand, score]) => ({ brand, score })).sort((a, b) => b.score - a.score).slice(0, 5);
-  const top = candidates[0];
-  const nonSingleBrandScore = Math.max(unknownScore, noShoeScore, mixedBrandsScore);
-  const textSuggestion = top && top.score > nonSingleBrandScore && top.score >= 0.12 ? top.brand : null;
-
-  let sneakerCandidates: Array<{ brand: string; score: number }> = [];
-  let sneakerError: string | undefined;
-  let sneakerDevice: string | undefined;
-  try {
-    const sneakerResult = await classifySneaker(message.source);
-    sneakerCandidates = sneakerResult.candidates;
-    sneakerDevice = sneakerResult.device;
-  }
-  catch (error) { sneakerError = error instanceof Error ? error.message.slice(0, 300) : 'Error del modelo de zapatillas.'; }
-  const visual = await inspectLocallyWithVision(message.source, image, message.candidates);
-  const references = message.references ?? [];
-  let referenceMatches: Array<{ brand: string; score: number }> = [];
-  let soleMatchMatches: Array<{ brand: string; score: number; supportCount?: number }> = [];
-  let soleMatchError: string | undefined;
-  const referenceImages = references.length ? await Promise.all(references.map((reference) => decode(reference.source, RawImage))) : [];
-  if (references.length && classify.processor && classify.model) {
-    const textInputs = classify.tokenizer(['a photo of a shoe'], { padding: 'max_length', truncation: true });
-    const imageInputs = await classify.processor([image, ...referenceImages]);
-    const embedded = await classify.model({ ...textInputs, ...imageInputs });
-    const tensor = embedded.image_embeds;
-    if (tensor && tensor.dims.length === 2 && tensor.dims[0] === references.length + 1) {
-      const width = tensor.dims[1] ?? 0;
-      const vector = (row: number) => Array.from(tensor.data).slice(row * width, (row + 1) * width);
-      const cosine = (left: number[], right: number[]) => {
-        let dot = 0, leftNorm = 0, rightNorm = 0;
-        for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
-          dot += left[index]! * right[index]!; leftNorm += left[index]! ** 2; rightNorm += right[index]! ** 2;
-        }
-        return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : 0;
-      };
-      const target = vector(0);
-      referenceMatches = rankBrandReferences(references.map((reference, index) => ({
-        brand: reference.brand, score: cosine(target, vector(index + 1)),
-      })));
-    }
-  }
-  if (references.length) {
-    try {
-      const embeddings = await getSoleMatchEmbeddings([
-        { source: message.source, image },
-        ...references.map((reference, index) => ({ source: reference.source, image: referenceImages[index]! })),
-      ]);
-      soleMatchMatches = rankSoleMatchReferences(embeddings[0]!, references.map((reference, index) => ({
-        brand: reference.brand, embedding: embeddings[index + 1]!,
-      })));
-    } catch (error) {
-      if (!forceCpuInference && isAcceleratorActive()) throw error;
-      soleMatchError = error instanceof Error ? error.message.slice(0, 300) : 'Error de carga o inferencia de SoleMatch CLIP.';
-    }
-  }
-  const referenceSuggestion = confidentReferenceBrand(referenceMatches);
-  // Florence locates the shoe, logo-crop OCR supplies text, and Qwen reads the logo.
-  // SigLIP is only a fallback suggestion. Its scores and the closed-set sneaker
-  // classifier never overrule a logo read or create a conflict by themselves.
-  const suggestedBrand = visual.brand ?? textSuggestion ?? referenceSuggestion;
-  const strongSiglipSuggestion = top && top.score >= 0.3 ? textSuggestion : null;
-  const conflictingStrongSignal = [strongSiglipSuggestion, referenceSuggestion].some((candidate) => candidate
-    && visual.brand && visual.confidence >= 0.8 && normalizeBrandName(candidate) !== normalizeBrandName(visual.brand));
-  const conflict = Boolean(conflictingStrongSignal);
-  const score = visual.brand ? visual.confidence : 0;
+  const visual = await inspectLocallyWithVision(message.source, message.candidates);
   const evidence: ImageBrandInspection['evidence'] = {
-    ...message.evidence, unknownScore, noShoeScore, mixedBrandsScore, brandConflict: conflict || visual.disagreement,
-    ...(sneakerCandidates.length ? { sneakerCandidates } : {}),
-    ...(sneakerError ? { sneakerError } : {}),
-    inferenceDevice: inferenceDeviceSummary(sneakerDevice),
-    ...(referenceMatches.length ? { referenceMatches } : {}),
-    ...(soleMatchMatches.length ? { soleMatchMatches } : {}),
-    ...(soleMatchError ? { soleMatchError } : {}),
+    ...message.evidence,
+    inferenceDevice: inferenceDeviceSummary(),
+    brandConflict: visual.disagreement,
     visualBrand: visual.brand,
     ...(visual.answer ? { visualAnswer: visual.answer } : {}),
     ...(visual.logoText ? { visualLogoText: visual.logoText } : {}),
@@ -504,22 +330,17 @@ async function inspectMessage(message: Message) {
   };
   const result: ImageBrandInspection = {
     modelId: BRAND_MODEL_ID,
-    status: suggestedBrand ? 'review' : 'unknown',
-    suggestedBrand,
+    status: visual.brand ? 'review' : 'unknown',
+    suggestedBrand: visual.brand,
     confirmedBrand: null,
-    score,
-    candidates,
+    score: visual.brand ? visual.confidence : 0,
+    candidates: [],
     evidence,
     autoEligible: false,
-    reason: conflict ? `Florence + Qwen sugirió ${suggestedBrand}; SigLIP tiene otra señal fuerte y requiere revisión.`
-      : visual.brand && visual.disagreement ? `Florence + Qwen leyó ${visual.brand} en ${visual.votes} de ${visual.totalVotes} respuestas; una lectura discrepa y requiere revisión.`
+    reason: visual.brand && visual.disagreement ? `Qwen leyó ${visual.brand} en ${visual.votes} de ${visual.totalVotes} vistas; las lecturas discrepan y requiere revisión.`
       : visual.brand ? `Florence localizó el calzado; Qwen leyó ${visual.brand} en ${visual.confidence >= 0.8 ? 'vistas concordantes o apoyadas por OCR' : 'una vista'}. La marca sigue sujeta a la calibración independiente.`
-        : referenceSuggestion ? 'Sugerencia secundaria basada en varias fotos de referencia; requiere revisión.'
-          : suggestedBrand ? 'Sugerencia secundaria de SigLIP; requiere revisión y validación con fotos propias.'
-            : noShoeScore >= mixedBrandsScore && noShoeScore >= unknownScore ? 'La imagen parece un anuncio sin calzado; no se asignó marca.'
-              : mixedBrandsScore >= unknownScore ? 'La imagen podría mostrar varias marcas; requiere revisión.'
-                : visual.error ? 'No se pudo leer el logo con el modelo visual local y no hay evidencia suficiente para sugerir una marca.'
-                  : 'No se distinguió una marca con evidencia suficiente.',
+        : visual.error ? 'No se pudo leer el logo con Florence + Qwen y no hay evidencia suficiente para sugerir una marca.'
+          : 'No se distinguió una marca con evidencia suficiente.',
     error: null,
   };
   parentPort!.postMessage({ id: message.id, result });

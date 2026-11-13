@@ -116,69 +116,10 @@ pnpm build
 
 La conexión QR, recepción del proveedor, cola por destino y envío experimental están implementados para probarse localmente. La sesión y las publicaciones requieren un piloto controlado con grupos propios; la automatización no es una integración oficial ni garantiza entrega. Revisa [`PLAN.md`](./PLAN.md) para los límites investigados y las fases futuras.
 
-### Clasificador local de zapatillas
-
-El análisis de marcas puede usar `dima806/popular_sneakers_detection` junto con las señales existentes. Para instalar su entorno local desde la raíz del proyecto:
-
-```bash
-python3 -m venv data/sneaker-model-venv
-data/sneaker-model-venv/bin/pip install 'torch==2.2.2' 'transformers==4.46.3' 'pillow>=10,<12' 'numpy<2' 'safetensors>=0.4'
-```
-
-En Windows con una GPU NVIDIA, instala la rueda CUDA de PyTorch en vez de la rueda CPU y conserva la ruta del intérprete para el servidor:
-
-```powershell
-py -3.11 -m venv data\sneaker-model-venv
-$python = (Resolve-Path .\data\sneaker-model-venv\Scripts\python.exe).Path
-& $python -m pip install --upgrade pip
-& $python -m pip install 'torch==2.2.2' --index-url https://download.pytorch.org/whl/cu121
-& $python -m pip install 'transformers==4.46.3' 'pillow>=10,<12' 'numpy<2' 'safetensors>=0.4'
-$env:SNEAKER_MODEL_PYTHON = $python
-& $python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
-```
-
-La primera ejecución descarga los pesos desde Hugging Face; las imágenes se procesan localmente. También se puede indicar otro intérprete con `SNEAKER_MODEL_PYTHON`. En Windows, `IMAGE_INFERENCE_DEVICE=auto` (predeterminado) intenta WebGPU primero con preferencia de alto rendimiento para favorecer la RTX, prueba DirectML si WebGPU no está disponible y usa CPU como respaldo. Si un proveedor falla durante una imagen, esa imagen se reintenta con DirectML y luego con CPU. Esto aplica a SigLIP, SoleMatch CLIP, Florence y Qwen. El clasificador Python elige CUDA si `torch.cuda.is_available()` y recurre a CPU si falla. En Windows puedes asignar el `node.exe` que usa el proyecto a **Alto rendimiento** en Configuración > Sistema > Pantalla > Gráficos. `IMAGE_INFERENCE_DEVICE=cpu` desactiva la aceleración de esos cuatro modelos; el clasificador Python sigue usando CUDA si está disponible. También acepta `gpu`, `dml` y `webgpu`. El detalle del análisis muestra el dispositivo solicitado o el respaldo aplicado. El modelo de zapatillas clasifica modelos concretos de un conjunto cerrado; se agrupan sus puntuaciones por marca y Jordan se mantiene separado de Nike. Esas puntuaciones no son probabilidades de acierto calibradas. Las marcas desconocidas o fotos sin calzado requieren revisión. La asignación automática exige la calibración específica de esta versión; si el modelo no está disponible, se conservan las otras señales y no se asigna automáticamente.
-
 ### Detección de marca con Florence-2 y Qwen3.5
 
-Florence-2-base-ft localiza hasta dos zapatillas en la imagen y Qwen3.5-0.8B analiza los recortes para leer el logo; esa respuesta es la sugerencia principal y se agrega automáticamente al borrador antes del código REF. SigLIP 2, las referencias guardadas y el clasificador de zapatillas quedan como señales de contraste. Si discrepan, la marca conserva el estado «por revisar», pero la sugerencia permanece en el borrador; esto no aprueba el producto ni inicia un envío. Las revisiones exactas de los dos modelos ONNX están fijadas; la primera inferencia descarga sus pesos y luego se ejecuta localmente.
+La detección de marca usa únicamente estos dos modelos: Florence-2-base-ft localiza hasta dos zapatillas y lee el texto visible; Qwen3.5-0.8B analiza dos vistas de cada calzado para identificar el logo. Florence aporta la localización y el OCR. Si no hay evidencia suficiente o las vistas discrepan, la marca queda para revisión. La sugerencia puede agregarse al borrador, pero no aprueba el producto ni inicia un envío. SigLIP, SoleMatch y el clasificador de zapatillas no se cargan ni ejecutan en este flujo. Las revisiones exactas de los modelos ONNX están fijadas; la primera inferencia descarga sus pesos y luego se ejecuta localmente.
 
-Las correcciones manuales se guardan como etiquetas verificadas. Por cada marca, cuatro de cada cinco ejemplos pueden servir como referencias; cada quinto se reserva para una evaluación independiente y se excluye del buscador de referencias. El panel muestra cobertura, precisión, avance por marca y resultados separados por señal. La confirmación automática requiere al menos 20 predicciones de evaluación independiente, 95 % de precisión para esa marca, y que Florence + Qwen concuerden en el logo. Las fotos ya revisadas con modelos anteriores se vuelven a analizar al iniciar esta versión y no se cuentan como si fueran resultados de la actual.
+Las correcciones manuales se guardan como etiquetas verificadas. Cuatro de cada cinco ejemplos quedan como referencias de calibración y cada quinto se reserva para evaluación independiente. El panel muestra precisión, cobertura y avance por marca para Florence + Qwen. La confirmación automática exige al menos 20 predicciones de evaluación independiente, 95 % de precisión por marca y confianza interna de 80 % o más (dos vistas concordantes o una vista respaldada por el OCR de Florence). Las fotos ya analizadas con otra versión se vuelven a procesar y no se mezclan con las métricas de esta versión.
 
-### Comparar fotos de referencia con SigLIP 2
-
-La aplicación utiliza SigLIP 2 localmente. Al comparar una foto con referencias guardadas, promedia las tres similitudes más altas por marca. Las referencias solo se usan como señal cuando hay al menos tres fotos distintas de esa marca y una diferencia mínima frente a la siguiente; la selección distribuye hasta ocho fotos por marca entre las fechas disponibles. La similitud coseno no representa una probabilidad y el modelo de clases cerradas solo aporta evidencia secundaria.
-
-### Búsqueda visual SoleMatch con CLIP
-
-La app también calcula embeddings con `Xenova/clip-vit-base-patch32` (licencia MIT, revisión fijada) y busca la foto verificada más parecida por marca entre las referencias locales. Es una señal independiente de SigLIP que aparece en los detalles y en las métricas de evaluación. Su similitud es una distancia visual, no una probabilidad; no cambia la marca sugerida, no aprueba productos ni inicia envíos. La primera inferencia descarga el modelo y guarda la caché fuera del repositorio.
-
-El encoder ResNet50 ajustado de SoleMatch no se integra: el repositorio upstream no declara licencia de código ni distribuye ese checkpoint. El piloto y sus comandos para Windows están en [`docs/solematch-pilot.md`](docs/solematch-pilot.md).
-
-Además, `identificar_marcas.py` permite probar por separado el checkpoint oficial `google/siglip2-base-patch16-224`, sin modificar la base de datos de la aplicación. Requiere Python 3.10 o posterior:
-
-```bash
-python3 -m venv .venv-marcas
-source .venv-marcas/bin/activate
-pip install -r requirements_marcas.txt
-pip install pytest
-python -m pytest -q tests/test_identificar_marcas.py
-python identificar_marcas.py --help
-```
-
-Para un catálogo propio, organiza las fotos en carpetas como `referencias/Nike/` y `referencias/Adidas/` y ejecuta:
-
-```bash
-python identificar_marcas.py foto.jpg --referencias referencias --top-k 5
-python identificar_marcas.py foto.jpg --referencias referencias --device cpu --json
-```
-
-Para usar las referencias ya guardadas en la aplicación, indica la ruta de su `business.sqlite`. Por ejemplo, en macOS con los datos predeterminados del modo experimental:
-
-```bash
-python identificar_marcas.py foto.jpg --base-de-datos "$HOME/Library/Application Support/BotDistribuidorTenis/modes/experimental/business.sqlite" --json
-```
-
-La consulta se excluye del catálogo si su contenido es idéntico a una referencia. Las imágenes dañadas se informan y se omiten. La primera ejecución descarga el modelo; las posteriores utilizan la caché local y pueden funcionar sin internet. Las fotos nunca se envían a un servicio externo. Se selecciona CUDA, MPS o CPU automáticamente; `--device` permite elegir el dispositivo, y `--lote` controla la cantidad de imágenes procesadas a la vez.
-
-El resultado es una **marca estimada por parecido visual**, no necesariamente por un logo visible. La similitud coseno no es una probabilidad. Sin `--umbral` siempre se propone la marca más cercana; si la marca real no está en el catálogo, esta propuesta puede ser incorrecta. `--umbral` permite obtener «Desconocida», pero debe elegirse y evaluarse previamente con fotos separadas y ejemplos negativos; no hay un valor recomendado o calibrado por defecto. Las referencias que se usan para buscar coincidencias no sirven para medir por sí solas la precisión de generalización.
+En Windows, `IMAGE_INFERENCE_DEVICE=auto` (predeterminado) intenta WebGPU, luego DirectML y finalmente CPU para Florence y Qwen. También acepta `gpu`, `dml`, `webgpu` y `cpu`. Para favorecer la GPU dedicada, asigna `node.exe` a **Alto rendimiento** en Configuración > Sistema > Pantalla > Gráficos. El detalle del análisis muestra el dispositivo utilizado por cada uno de los dos modelos. El OCR usado para leer códigos y ubicar la marca de agua es parte independiente del procesamiento de publicación.

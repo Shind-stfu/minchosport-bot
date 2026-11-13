@@ -163,43 +163,7 @@ export class ImageInspectionCoordinator {
         const candidates = [...new Map([...captions, ...ocrCandidates, ...registry.map((row) => row.displayName), ...catalogCandidates]
           .map((brand) => [normalizeBrandName(brand), brand])).values()];
         try {
-          const normalizedKnown = new Map(registry.map((row) => [row.normalizedName, row.displayName]));
-          const referenceRows = this.db.prepare(`SELECT r.normalized_brand as normalizedBrand,m.id as assetId,m.file_name as fileName,m.sha256 as sha256,r.created_at as createdAt
-            FROM shoe_brand_references r JOIN media_assets m ON m.id=r.media_asset_id
-            WHERE r.normalized_brand IN (SELECT normalized_name FROM shoe_brand_registry)
-              AND NOT EXISTS (SELECT 1 FROM shoe_brand_labels l WHERE l.media_asset_id=m.id AND l.split='holdout')
-            ORDER BY r.normalized_brand,r.created_at`).all() as Array<{ normalizedBrand: string; assetId: string; fileName: string; sha256: string; createdAt: string }>;
-          const rowsByBrand = new Map<string, typeof referenceRows>();
-          const hashesByBrand = new Map<string, Set<string>>();
-          for (const row of referenceRows) {
-            if (row.assetId === assetId || row.sha256 === asset.sha256 || !normalizedKnown.has(row.normalizedBrand)) continue;
-            const hashes = hashesByBrand.get(row.normalizedBrand) ?? new Set<string>();
-            if (hashes.has(row.sha256)) continue;
-            hashes.add(row.sha256); hashesByBrand.set(row.normalizedBrand, hashes);
-            const rows = rowsByBrand.get(row.normalizedBrand) ?? [];
-            rows.push(row); rowsByBrand.set(row.normalizedBrand, rows);
-          }
-          const balancedReferenceRows: typeof referenceRows = [];
-          for (const [normalized, rows] of rowsByBrand) {
-            const limit = Math.min(rows.length, 8);
-            for (let index = 0; index < limit; index += 1) {
-              const selectedIndex = limit === 1 ? 0 : Math.round(index * (rows.length - 1) / (limit - 1));
-              balancedReferenceRows.push(rows[selectedIndex]!);
-            }
-          }
-          const selectedReferences: Array<{ brand: string; fileName: string }> = [];
-          const brandOrder = [...new Set(balancedReferenceRows.map((row) => row.normalizedBrand))].sort();
-          for (let position = 0; position < 8 && selectedReferences.length < 48; position += 1) {
-            for (const normalized of brandOrder) {
-              const row = balancedReferenceRows.filter((candidate) => candidate.normalizedBrand === normalized)[position];
-              if (row && selectedReferences.length < 48) selectedReferences.push({ brand: normalizedKnown.get(normalized)!, fileName: row.fileName });
-            }
-          }
-          const referenceImages = await Promise.all(selectedReferences.map(async (reference) => ({
-            brand: reference.brand,
-            source: await readFile(join(this.dataDirectory, 'media', reference.fileName)),
-          })));
-          const rawResult = await this.brandInspector.inspect(source, candidates, { captionCandidates: captions, ocrCandidates }, referenceImages);
+          const rawResult = await this.brandInspector.inspect(source, candidates, { captionCandidates: captions, ocrCandidates });
           const jordanBrand = aliasToCanonical.get(normalizeBrandName('JUMPMAN')) ?? 'Jordan';
           const canonicalize = (brand: string | null) => {
             if (!brand) return null;
@@ -218,7 +182,7 @@ export class ImageInspectionCoordinator {
             confirmedBrand: jordanMarkDetected ? null : canonicalize(rawResult.confirmedBrand),
             reason: jordanMarkDetected
               ? modelVisualBrand && normalizeBrandName(modelVisualBrand) !== normalizeBrandName(jordanBrand)
-                ? `${jordanSignal === 'jumpman' ? 'El logo Jumpman' : 'La marca Jordan'} se asocia con Jordan; Florence + Qwen también propuso ${modelVisualBrand}, así que queda para revisión.`
+                ? `${jordanSignal === 'jumpman' ? 'El logo Jumpman' : 'La marca Jordan'} se asocia con Jordan; La lectura visual también propuso ${modelVisualBrand}, así que queda para revisión.`
                 : `${jordanSignal === 'jumpman' ? 'El logo Jumpman' : 'La marca Jordan'} fue identificado en la zapatilla.`
               : rawResult.reason,
             candidates: rawResult.candidates.map((candidate) => ({ ...candidate, brand: canonicalize(candidate.brand)! })),
@@ -227,9 +191,6 @@ export class ImageInspectionCoordinator {
               visualBrand: normalizedVisualBrand,
               ...(jordanMarkDetected && modelVisualBrand && normalizeBrandName(modelVisualBrand) !== normalizeBrandName(jordanBrand)
                 ? { brandConflict: true } : {}),
-              ...(rawResult.evidence.referenceMatches ? { referenceMatches: rawResult.evidence.referenceMatches.map((candidate) => ({ ...candidate, brand: canonicalize(candidate.brand)! })) } : {}),
-              ...(rawResult.evidence.soleMatchMatches ? { soleMatchMatches: rawResult.evidence.soleMatchMatches.map((candidate) => ({ ...candidate, brand: canonicalize(candidate.brand)! })) } : {}),
-              ...(rawResult.evidence.sneakerCandidates ? { sneakerCandidates: rawResult.evidence.sneakerCandidates.map((candidate) => ({ ...candidate, brand: canonicalize(candidate.brand)! })) } : {}),
             },
           };
           const reviewed = this.db.prepare(`SELECT predicted_brand as predictedBrand,expected_brand as expectedBrand
@@ -242,7 +203,7 @@ export class ImageInspectionCoordinator {
             && gate.autoEligibleBrands.some((brand) => normalizeBrandName(brand) === normalizeBrandName(result.suggestedBrand!));
           const brand: ImageBrandInspection = autoEligible ? {
             ...result, status: 'confirmed', confirmedBrand: result.suggestedBrand, autoEligible: true,
-            reason: 'Marca asignada automáticamente: Florence + Qwen coincide en el logo y esta marca superó 95 % de precisión en al menos 20 fotos de evaluación independientes.',
+            reason: 'Marca asignada automáticamente: la lectura superó 80 % de confianza y esta marca alcanzó 95 % de precisión en al menos 20 fotos de evaluación independientes.',
           } : result;
           this.saveBrandInspection(assetId, brand);
           const holdoutLabel = this.db.prepare(`SELECT expected_brand as expectedBrand FROM shoe_brand_labels
@@ -251,7 +212,7 @@ export class ImageInspectionCoordinator {
             VALUES (?,?,?,?,?,'holdout',?) ON CONFLICT(media_asset_id) DO UPDATE SET model_id=excluded.model_id,
               predicted_brand=excluded.predicted_brand,expected_brand=excluded.expected_brand,reviewed_at=excluded.reviewed_at,
               split='holdout',source_predictions_json=excluded.source_predictions_json`)
-            .run(assetId, BRAND_MODEL_ID, result.suggestedBrand, holdoutLabel.expectedBrand, new Date().toISOString(), JSON.stringify(brandSourcePredictions(result.candidates, result.evidence)));
+            .run(assetId, BRAND_MODEL_ID, result.suggestedBrand, holdoutLabel.expectedBrand, new Date().toISOString(), JSON.stringify(brandSourcePredictions(result.evidence)));
           const savedBrand = this.db.prepare('SELECT status,confirmed_brand as confirmedBrand,suggested_brand as suggestedBrand,evidence_json as evidence FROM image_brand_inspections WHERE media_asset_id=?')
             .get(assetId) as { status: string; confirmedBrand: string | null; suggestedBrand: string | null; evidence: string } | undefined;
           if (savedBrand?.status === 'confirmed' && savedBrand.confirmedBrand) {
@@ -266,7 +227,7 @@ export class ImageInspectionCoordinator {
           }
         } catch (error) {
           const reason = error instanceof Error ? error.message.slice(0, 300) : 'Error local desconocido.';
-          this.saveBrandInspection(assetId, { modelId: BRAND_MODEL_ID, status: 'failed', suggestedBrand: null, confirmedBrand: null, score: 0, candidates: [], evidence: { captionCandidates: captions, ocrCandidates, unknownScore: 0 }, autoEligible: false, reason: 'No se pudo completar la detección local de marca.', error: reason });
+          this.saveBrandInspection(assetId, { modelId: BRAND_MODEL_ID, status: 'failed', suggestedBrand: null, confirmedBrand: null, score: 0, candidates: [], evidence: { captionCandidates: captions, ocrCandidates }, autoEligible: false, reason: 'No se pudo completar la detección local de marca.', error: reason });
         }
       }
     } catch (error) {
