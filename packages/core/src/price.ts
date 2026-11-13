@@ -24,6 +24,7 @@ const CODE_LABEL = /(?:^|[^\p{L}\p{N}_])(?:COD(?:IGO)?|C[ÓO]DIGO|REF(?:ERENCIA)
 const GENDER_CODE = /(?:^|[^\p{L}\p{N}_])(?:HOMBRE|MUJER|DAMA|CABALLERO)(?:\s|[\p{Extended_Pictographic}\uFE0F\u200D\p{Emoji_Modifier}])+(\d{3}-\d{1,3})(?![\p{L}\p{N}_-])/giu;
 const LEADING_CODE = /^[\s*_~`#\p{Extended_Pictographic}\uFE0F\u200D\p{Emoji_Modifier}]*([0-9]{3,6}(?:-[0-9]{1,6})?)(?![\p{L}\p{N}_.,/-])[\s*_~`:.–—-]+(?=\p{L})/iu;
 const DOZEN_LABEL = /docena/iu;
+const BOX_DOZEN_LABEL = /\b(cajas?)\b[\s*_~`\u200B-\u200D\uFEFF]*&[\s*_~`\u200B-\u200D\uFEFF]*\bdocenas?\b/iu;
 const EMOJI_SEQUENCE = /(?:\p{Regional_Indicator}{2}|[#*0-9]\uFE0F?\u20E3|\p{Extended_Pictographic}(?:\uFE0F)?(?:\p{Emoji_Modifier})?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F)?(?:\p{Emoji_Modifier})?)*(?:[\u{E0020}-\u{E007E}]+\u{E007F})?)/gu;
 
 function parseAmount(token: string): number | null {
@@ -89,14 +90,22 @@ function priceKind(text: string, start: number): PriceCandidate['kind'] {
 }
 
 function containsDozenReference(line: string): boolean {
-  // Also catch combined labels, plural, formatting and invisible separators.
-  return DOZEN_LABEL.test(line.normalize('NFKC').replace(/[*_~`\u200B-\u200D\uFEFF]/gu, ''));
+  // Normalize formatting variants; CAJA & DOCENA is classified as a box price.
+  const normalized = line.normalize('NFKC').replace(/[*_~`\u200B-\u200D\uFEFF]/gu, '');
+  return DOZEN_LABEL.test(normalized) && !BOX_DOZEN_LABEL.test(normalized);
 }
 
-/** Removes every line mentioning docena, even without an amount or with a combined CAJA label. */
+function normalizeCombinedBoxDozenLabel(line: string): string {
+  return line.replace(new RegExp(BOX_DOZEN_LABEL.source, 'giu'), 'CAJA').replace(/[\t ]{2,}/gu, ' ');
+}
+
+/** Removes docena-only lines and keeps combined CAJA & DOCENA lines as CAJA. */
 export function removeDozenPriceLines(text: string): string {
   const newline = text.includes('\r\n') ? '\r\n' : '\n';
-  return text.split(/\r\n|[\r\n\u2028\u2029]/u).filter((line) => !containsDozenReference(line)).join(newline);
+  return text.split(/\r\n|[\r\n\u2028\u2029]/u)
+    .filter((line) => !containsDozenReference(line))
+    .map(normalizeCombinedBoxDozenLabel)
+    .join(newline);
 }
 
 /** Removes decorative emoji from outbound descriptions while preserving 💲 as a readable dollar sign. */
