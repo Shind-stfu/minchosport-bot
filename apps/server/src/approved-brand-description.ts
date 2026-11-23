@@ -232,7 +232,10 @@ function applyBrandToApprovedDescription(db: AppDatabase, productId: string, bra
     && [entry.displayName, ...(JSON.parse(entry.aliasesJson) as string[])].some((name) =>
       normalizeBrandName(name) !== expected && descriptionContainsBrand(product.rawText, name)))) return false;
 
-  const outputText = prependBrandBeforeShoeCode(product.outputText, brand, product.shoeCode);
+  const aliases = registeredBrands.find((entry) => normalizeBrandName(entry.displayName) === expected)?.aliasesJson;
+  let brandAliases: string[] = [];
+  try { brandAliases = aliases ? JSON.parse(aliases) as string[] : []; } catch { /* Ignore a malformed alias list. */ }
+  const outputText = prependBrandBeforeShoeCode(product.outputText, brand, product.shoeCode, brandAliases);
   if (outputText === product.outputText) return false;
   db.prepare('UPDATE products SET output_text=?,updated_at=? WHERE id=?').run(outputText, now, productId);
   return true;

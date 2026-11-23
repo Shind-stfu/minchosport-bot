@@ -8,6 +8,7 @@ import { ImageInspectionCoordinator } from './image-inspection-coordinator.js';
 import type { ImageInspection } from './image-inspection.js';
 import type { ImageInspector } from './image-engine.js';
 import { BRAND_MODEL_ID, type ImageBrandInspection } from './image-brand-inspection.js';
+import { RAG_ENCODER } from './rag-version.js';
 
 const directories: string[] = [];
 afterEach(() => { for (const path of directories.splice(0)) rmSync(path,{recursive:true,force:true}); });
@@ -48,7 +49,7 @@ describe('image engine queue and cache',()=>{
   it('scores corrected brands and aliases on later photos and persists the suggestion for review',async()=>{
     const directory=mkdtempSync(join(tmpdir(),'mincho-brand-candidates-'));directories.push(directory);mkdirSync(join(directory,'media'));
     const db=openDatabase(join(directory,'business.sqlite'));const now=new Date().toISOString();
-    db.prepare("INSERT INTO products(id,title,raw_text,analysis_json,status,created_at,updated_at,session_id) VALUES ('brand-product','Zapato','Marca NB','{}','needs_review',?,?,'main')").run(now,now);
+    db.prepare("INSERT INTO products(id,title,raw_text,analysis_json,status,created_at,updated_at,session_id) VALUES ('brand-product','Zapato','COD 960','{}','needs_review',?,?,'main')").run(now,now);
     db.prepare("INSERT INTO shoe_brand_registry(normalized_name,display_name,aliases_json,created_at,updated_at) VALUES ('new balance','New Balance','[\"NB\"]',?,?)").run(now,now);
     const bytes=Buffer.from('same photo');const hash=createHash('sha256').update(bytes).digest('hex');writeFileSync(join(directory,'media',`${hash}.png`),bytes);
     db.prepare("INSERT INTO media_assets(id,product_id,sha256,file_name,mime_type,size_bytes,position,created_at) VALUES ('brand-photo','brand-product',?,?, 'image/png',?,0,?)").run(hash,`${hash}.png`,bytes.length,now);
@@ -59,7 +60,7 @@ describe('image engine queue and cache',()=>{
     expect(scored).toContain('New Balance');
     expect(scored).toContain('Dolce & Gabbana');
     expect(scored).toContain('Jordan');
-    expect(usedEvidence).toMatchObject({captionCandidates:['New Balance'],ocrCandidates:['New Balance']});
+    expect(usedEvidence).toMatchObject({captionCandidates:[],ocrCandidates:['New Balance']});
     expect(db.prepare('SELECT status,suggested_brand,auto_eligible FROM image_brand_inspections WHERE media_asset_id=?').get('brand-photo')).toEqual({status:'review',suggested_brand:'New Balance',auto_eligible:0});
     db.prepare("UPDATE image_brand_inspections SET status='unknown',confirmed_brand=NULL,manual_override=1,reason='Se confirmó manualmente que no hay una marca legible.' WHERE media_asset_id='brand-photo'").run();
     await coordinator.schedule('brand-photo',true);
@@ -81,7 +82,45 @@ describe('image engine queue and cache',()=>{
     const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>result()},brandInspector);
     await coordinator.schedule('incoming-photo');
     expect(scored).toContain('Nike');
-    expect(inferenceArgumentCount).toBe(3);
+    expect(inferenceArgumentCount).toBe(4);
+    await coordinator.close();db.close();
+  });
+  it('uses labeled RAG references in trial mode and still runs Florence plus Qwen',async()=>{
+    const {db,directory,asset}=setup({version:'test-v1',inspect:async()=>result()});
+    const now=new Date().toISOString();
+    for(const [brand,vector] of [['Nike',[1,0]],['Adidas',[0,1]]] as Array<[string,number[]]>) {
+      for(let index=0;index<1;index++) {
+        const id=`${brand.toLowerCase()}-reference-${index}`;
+        const bytes=Buffer.from(id);const hash=createHash('sha256').update(bytes).digest('hex');
+        const productId=`product-${id}`;const file=`${hash}.png`;
+        db.prepare("INSERT INTO products(id,title,raw_text,analysis_json,status,created_at,updated_at,session_id) VALUES (?,?, '', '{}','needs_review',?,?,'main')")
+          .run(productId,`${brand} reference ${index}`,now,now);
+        writeFileSync(join(directory,'media',file),bytes);
+        db.prepare("INSERT INTO media_assets(id,product_id,sha256,file_name,mime_type,size_bytes,position,created_at) VALUES (?,?,?,?,'image/png',?,0,?)")
+          .run(`asset-${id}`,productId,hash,file,bytes.length,now);
+        db.prepare("INSERT INTO shoe_brand_labels(media_asset_id,expected_brand,split,reviewed_at) VALUES (?,?,'reference',?)")
+          .run(`asset-${id}`,brand,now);
+        db.prepare('INSERT INTO brand_rag_vectors(sha256,encoder,vectors_json) VALUES (?,?,?)')
+          .run(hash,RAG_ENCODER,JSON.stringify([vector]));
+      }
+    }
+    asset('incoming-photo',Buffer.from('new Nike-looking photo'));
+    let embedCalls=0;let visionCalls=0;
+    const brandInspector={
+      embedShoes:async()=>{embedCalls++;return [[1,0]];},
+      inspect:async(_source:Buffer,_candidates:string[],evidence:ImageBrandInspection['evidence'])=>{
+        visionCalls++;
+        return {modelId:BRAND_MODEL_ID,status:'unknown',suggestedBrand:null,confirmedBrand:null,score:0,candidates:[],evidence,autoEligible:false,reason:'Sin lectura visual clara.',error:null} as ImageBrandInspection;
+      },
+    };
+    const coordinator=new ImageInspectionCoordinator(db,directory,{version:'test-v1',inspect:async()=>result()},brandInspector,'trial');
+    await coordinator.schedule('incoming-photo');
+    expect(embedCalls).toBe(1);
+    expect(visionCalls).toBe(1);
+    expect(db.prepare('SELECT status,suggested_brand,confirmed_brand,auto_eligible,evidence_json FROM image_brand_inspections WHERE media_asset_id=?').get('incoming-photo'))
+      .toMatchObject({status:'confirmed',suggested_brand:'Nike',confirmed_brand:'Nike',auto_eligible:1});
+    const evidence=db.prepare('SELECT evidence_json FROM image_brand_inspections WHERE media_asset_id=?').get('incoming-photo') as {evidence_json:string};
+    expect(JSON.parse(evidence.evidence_json)).toMatchObject({retrieval:{route:'similar',brand:'Nike'},visualBrand:null});
     await coordinator.close();db.close();
   });
   it('auto-confirms a brand only after its reviewed predictions reach the precision and sample gates',async()=>{

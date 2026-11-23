@@ -28,6 +28,7 @@ const Environment = z.object({
   DEFAULT_MARGIN_COP: z.coerce.number().refine((value) => value === 5000 || value === 10000).transform((value) => value as 5000 | 10000).default(10000),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   IMAGE_ANALYSIS_WORKERS: z.coerce.number().int().min(1).max(4).optional(),
+  BRAND_RAG_MODE: z.enum(['off', 'exact', 'shadow', 'trial', 'auto']).default('trial'),
   IMAGE_INFERENCE_DEVICE: z.enum(['auto', 'gpu', 'cpu', 'dml', 'webgpu']).default('auto'),
 });
 
@@ -42,8 +43,8 @@ const imageInspector = new ImageInspectorPool(join(dataDirectory, 'ocr-cache'), 
 const nearbyModelCaches = [join(dirname(dataDirectory), 'models'), join(dirname(dirname(dataDirectory)), 'models')];
 const sharedModelCache = nearbyModelCaches.find((directory) => existsSync(join(directory, 'qwen3.5')) && existsSync(join(directory, 'florence2')))
   ?? nearbyModelCaches[0]!;
-const imageBrandInspector = new ImageBrandInspector(join(sharedModelCache, 'florence-qwen'), 600_000, config.IMAGE_INFERENCE_DEVICE);
-const imageInspections = new ImageInspectionCoordinator(database, dataDirectory, imageInspector, imageBrandInspector);
+const imageBrandInspector = new ImageBrandInspector(join(sharedModelCache, 'florence-qwen'), 3_600_000, config.IMAGE_INFERENCE_DEVICE);
+const imageInspections = new ImageInspectionCoordinator(database, dataDirectory, imageInspector, imageBrandInspector, config.BRAND_RAG_MODE, config.IMAGE_INFERENCE_DEVICE);
 const supplierIngestion = new SupplierIngestionService(database, dataDirectory, whatsappLogger,
   (assetId) => { void imageInspections.schedule(assetId); },
   async (source) => (await imageInspector.inspect(source)).ocrText,

@@ -1,16 +1,18 @@
+import { normalizeSoleMatchEmbedding } from './solematch-clip.js';
+import { CLIP_REVISION } from './rag-version.js';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parentPort, workerData } from 'node:worker_threads';
 import { BRAND_MODEL_ID, type ImageBrandInspection } from './image-brand-inspection.js';
-import { normalizeBrandName, resolveVisionBrandConsensus } from './brand-candidates.js';
+import { isBackgroundBrandEvidence, normalizeBrandName, resolveVisionBrandConsensus } from './brand-candidates.js';
 
-const FLORENCE_MODEL_ID = 'onnx-community/Florence-2-base-ft';
-const FLORENCE_REVISION = 'e88a44eaf3791a35eae0c5a47b3dbcd36e67eb6f';
-const QWEN_MODEL_ID = 'onnx-community/Qwen3.5-0.8B-ONNX';
-const QWEN_REVISION = '8fe9dbe3fb39fe902e18df9be84b6a0ac77ae0f6';
-const VISION_MODEL_LABEL = 'Florence-2-base-ft + Qwen3.5-0.8B';
+const FLORENCE_MODEL_ID = 'onnx-community/Florence-2-large-ft';
+const FLORENCE_REVISION = '04ace74913c28d7ec94af32cee5c111a10126b6f';
+const QWEN_MODEL_ID = 'onnx-community/Qwen3.5-4B-ONNX';
+const QWEN_REVISION = '23ac3352f288351eddcdf141b32f4f66587f7e2d';
+const VISION_MODEL_LABEL = 'Florence-2-large-ft + Qwen3.5-4B Q4';
 
-type Message = { id: number; source: Uint8Array; action?: 'inspect' | 'screen'; candidates: string[]; evidence: ImageBrandInspection['evidence'] };
+type Message = { id: number; source: Uint8Array; action?: 'inspect' | 'screen' | 'embed'; candidates: string[]; evidence: ImageBrandInspection['evidence'] };
 type ModelImage = import('@huggingface/transformers').RawImage;
 type InferenceDevice = 'auto' | 'gpu' | 'cpu' | 'dml' | 'webgpu';
 type VisionProcessor = ((...args: any[]) => Promise<Record<string, any>>) & {
@@ -104,7 +106,9 @@ async function getFlorenceModels(): Promise<LoadedFlorenceModels> {
     runtime.env.cacheDir = florenceCache;
     const florenceProcessor = await runtime.AutoProcessor.from_pretrained(FLORENCE_MODEL_ID, { revision: FLORENCE_REVISION }) as VisionProcessor;
     const florenceModel = await loadWithDeviceFallback('Florence-2', async (device) => await runtime.Florence2ForConditionalGeneration.from_pretrained(FLORENCE_MODEL_ID, {
-      revision: FLORENCE_REVISION, dtype: 'q8', device,
+      revision: FLORENCE_REVISION,
+      dtype: { embed_tokens: 'fp16', vision_encoder: 'fp16', encoder_model: 'q4', decoder_model_merged: 'q4' },
+      device,
     }) as VisionModel);
     return { florenceProcessor, florenceModel, RawImage: runtime.RawImage };
   })();
@@ -144,6 +148,8 @@ async function decode(source: Uint8Array, RawImage: LoadedVisionModels['RawImage
 function readBrandAnswer(answer: string, candidates: string[]) {
   const clean = answer.replace(/<\|[^|]+\|>/gu, ' ').replace(/\s+/gu, ' ').trim();
   if (!clean || /\b(?:marca por revisar|no se distingue|no puedo|no es posible|unknown|unclear|not sure|no readable brand|no logo|nondetectable|non detectable|cannot detect|cannot identify|not visible|unreadable|illegible|no se ve)\b/iu.test(clean)) return null;
+  // CloudTec is an On technology; normalize only complete model brand answers.
+  if (/^(?:on|on\s*cloud|cloud\s*tec)$/iu.test(clean)) return 'ON CLOUD';
   const normalizedAnswer = normalizeBrandName(clean);
   const knownMatch = [...candidates].sort((a, b) => normalizeBrandName(b).length - normalizeBrandName(a).length)
     .find((candidate) => {
@@ -169,7 +175,7 @@ function readVisionDecision(answer: string, candidates: string[]) {
       const uncertain = parsed.uncertain === true;
       const brandText = typeof parsed.brand === 'string' ? parsed.brand.trim() : '';
       return {
-        brand: uncertain || !brandText ? null : readBrandAnswer(brandText, candidates),
+        brand: uncertain || !brandText || isBackgroundBrandEvidence(parsed.evidence) ? null : readBrandAnswer(brandText, candidates),
         logoText: typeof parsed.logo_text === 'string' ? parsed.logo_text.trim().slice(0, 100) : '',
         evidence: typeof parsed.evidence === 'string' ? parsed.evidence.trim().slice(0, 180) : '',
       };
@@ -178,7 +184,7 @@ function readVisionDecision(answer: string, candidates: string[]) {
   return { brand: readBrandAnswer(answer, candidates), logoText: '', evidence: '', };
 }
 
-async function locateShoes(source: Uint8Array, image: ModelImage, models: LoadedFlorenceModels) {
+async function locateShoes(source: Uint8Array, image: ModelImage, models: LoadedFlorenceModels, readOcr = true) {
   const task = '<OD>';
   const inputs = await models.florenceProcessor(image, task);
   const generated = await models.florenceModel.generate({ ...inputs, max_new_tokens: 256 });
@@ -229,6 +235,7 @@ async function locateShoes(source: Uint8Array, image: ModelImage, models: Loaded
     }).jpeg().toBuffer();
     const shoeImage = await decode(crop, models.RawImage);
     const detailImage = await decode(detail, models.RawImage);
+    if (!readOcr) return { image: shoeImage, detailImage, logoText: '', label };
     let logoText = '';
     try {
       const ocrTask = '<OCR>';
@@ -260,24 +267,35 @@ async function screenForFootwear(source: Uint8Array) {
   }));
 }
 
-async function inspectLocallyWithVision(source: Uint8Array, candidates: string[]) {
+async function inspectLocallyWithVision(source: Uint8Array, candidates: string[], id: number) {
   try {
+    const progress = (value: number) => parentPort!.postMessage({ id, progress: value });
+    progress(5);
     const models = await getVisionModels();
+    progress(20);
     const image = await decode(source, models.RawImage);
     const shoes = await locateShoes(source, image, models);
+    progress(40);
     if (!shoes.length) return { brand: null, confidence: 0, logoText: '', evidence: '', answer: 'No se encontró una zapatilla para recortar.', disagreement: false, votes: 0, totalVotes: 0, error: undefined };
     const promptFor = (logoText: string) => `Reconoce la marca de esta zapatilla usando solamente un logotipo o texto visible. No deduzcas la marca por la silueta, el modelo, la caja ni el fondo. El OCR opcional de esta zona dice: ${logoText || '(sin texto legible)'}. Si el texto puede pertenecer al proveedor o al fondo, ignóralo. Devuelve solo JSON válido con las claves brand (nombre de marca o null), logo_text (letras que realmente ves, o string vacío), evidence (breve señal visual concreta) y uncertain (boolean). Si no puedes identificar el logo con seguridad, usa brand null y uncertain true. No inventes una marca.`;
     const inspectCrop = async (crop: ModelImage, logoText: string) => {
-      const chat = models.qwenProcessor.apply_chat_template([{ role: 'user', content: [{ type: 'image' }, { type: 'text', text: promptFor(logoText) }] }], { add_generation_prompt: true });
+      const chat = models.qwenProcessor.apply_chat_template([{ role: 'user', content: [{ type: 'image' }, { type: 'text', text: promptFor(logoText) }] }], { add_generation_prompt: true, enable_thinking: false });
       const inputs = await models.qwenProcessor(chat, crop);
-      const generated = await models.qwenModel.generate({ ...inputs, max_new_tokens: 100, do_sample: false });
+      const generated = await models.qwenModel.generate({ ...inputs, max_new_tokens: 128, do_sample: false });
       const promptLength = (inputs.input_ids?.dims?.at(-1) as number | undefined) ?? 0;
       const answerTokens = promptLength ? generated.slice(null, [promptLength, null]) : generated;
       const answer = models.qwenProcessor.batch_decode(answerTokens, { skip_special_tokens: true })[0]?.trim() ?? '';
       return { answer, ...readVisionDecision(answer, candidates) };
     };
+    let completedViews = 0;
+    const inspectView = async (crop: ModelImage, logoText: string) => {
+      const decision = await inspectCrop(crop, logoText);
+      completedViews += 1;
+      progress(40 + Math.round(55 * completedViews / (shoes.length * 2)));
+      return decision;
+    };
     const shoeResults = await Promise.all(shoes.map(async (shoe) => {
-      const decisions = await Promise.all([inspectCrop(shoe.image, shoe.logoText), inspectCrop(shoe.detailImage, shoe.logoText)]);
+      const decisions = await Promise.all([inspectView(shoe.image, shoe.logoText), inspectView(shoe.detailImage, shoe.logoText)]);
       const names = [...new Set(decisions.map((item) => item.brand).filter((brand): brand is string => Boolean(brand)))];
       const disagrees = names.length > 1;
       const brand = disagrees ? null : names[0] ?? null;
@@ -315,7 +333,7 @@ async function inspectLocallyWithVision(source: Uint8Array, candidates: string[]
 }
 
 async function inspectMessage(message: Message) {
-  const visual = await inspectLocallyWithVision(message.source, message.candidates);
+  const visual = await inspectLocallyWithVision(message.source, message.candidates, message.id);
   const evidence: ImageBrandInspection['evidence'] = {
     ...message.evidence,
     inferenceDevice: inferenceDeviceSummary(),
@@ -346,7 +364,33 @@ async function inspectMessage(message: Message) {
   parentPort!.postMessage({ id: message.id, result });
 }
 
+type Extractor = (images: ModelImage[]) => Promise<{ data: ArrayLike<number>; dims: number[] }>;
+let clipExtractor: Extractor | undefined;
+async function embedShoes(source: Uint8Array) {
+  const florence = await getFlorenceModels();
+  const image = await decode(source, florence.RawImage);
+  const shoes = await locateShoes(source, image, florence, false);
+  if (!shoes.length) return [];
+  if (!clipExtractor) {
+    const runtime = await getTransformerRuntime();
+    clipExtractor = await runtime.pipeline('image-feature-extraction', 'Xenova/clip-vit-base-patch32', {
+      revision: CLIP_REVISION, dtype: 'q8', device: 'cpu',
+      cache_dir: join(dirname(workerData.cacheDirectory), 'solematch-clip'),
+    }) as Extractor;
+  }
+  const output = await clipExtractor(shoes.map(shoe => shoe.image));
+  if (output.dims.length !== 2 || output.dims[0] !== shoes.length || output.dims[1] !== 512) {
+    throw new Error('SoleMatch CLIP devolvió dimensiones inesperadas.');
+  }
+  const values = Array.from(output.data);
+  return shoes.map((_, i) => normalizeSoleMatchEmbedding(values.slice(i * 512, (i + 1) * 512)));
+}
+
 async function processMessage(message: Message) {
+  if (message.action === 'embed') {
+    parentPort!.postMessage({ id: message.id, vectors: await embedShoes(message.source) });
+    return;
+  }
   if (message.action === 'screen') parentPort!.postMessage({ id: message.id, hasFootwear: await screenForFootwear(message.source) });
   else await inspectMessage(message);
 }

@@ -9,7 +9,12 @@ import { BRAND_MODEL_ID, ImageBrandInspector, type ImageBrandInspection } from '
 import { writeApplicationLog } from './application-log.js';
 import { applyConfirmedBrandToApprovedDescription, applyPrimaryVisionBrandToApprovedDescription, reconcilePrimaryVisionBrandDescriptions } from './approved-brand-description.js';
 
+import { defaultThresholds, exactBrand, indexRagReferences, indexedReferences, matchShoes, matchShoesTrial, qualifies,
+  ragCatalog, ragDevice, readPolicy, type RagEvidence, type RagMode } from './brand-rag.js';
+
 export class ImageInspectionCoordinator {
+  private readonly brandProgress = new Map<string, number>();
+  progress(assetId: string) { return this.brandProgress.get(assetId) ?? null; }
   private jobs = new Map<string, Promise<void>>();
   private waiting: Array<{ assetId: string; force: boolean; finish: () => void }> = [];
   private active = 0;
@@ -19,7 +24,57 @@ export class ImageInspectionCoordinator {
   private closed = false;
 
   constructor(private readonly db: AppDatabase, private readonly dataDirectory: string, private readonly inspector: ImageInspector,
-    private readonly brandInspector?: Pick<ImageBrandInspector, 'inspect'> & Partial<Pick<ImageBrandInspector, 'close'>>) {}
+    private readonly brandInspector?: Pick<ImageBrandInspector, 'inspect'> & Partial<Pick<ImageBrandInspector, 'close' | 'embedShoes'>>,
+    private readonly ragMode: RagMode = 'exact', private readonly device = 'auto') {}
+
+  private indexJob: Promise<void> | undefined;
+  private pendingSessions = new Set<string>();
+
+  refreshReferences(session: string) {
+    const inspector = this.brandInspector;
+    if (this.closed || !inspector?.embedShoes || !['shadow', 'trial', 'auto'].includes(this.ragMode)) return;
+    this.pendingSessions.add(session);
+    if (this.indexJob) return;
+    this.indexJob = (async () => {
+      while (!this.closed && this.pendingSessions.size) {
+        const session = this.pendingSessions.values().next().value!;
+        this.pendingSessions.delete(session);
+        const errors = await indexRagReferences(this.db, join(this.dataDirectory, 'media'), ragCatalog(this.db, session).groups,
+          source => inspector.embedShoes!(source), () => this.closed);
+        if (errors.length) console.warn('[brand-rag]', errors.join(' · '));
+      }
+    })().catch(error => console.warn('[brand-rag]', error)).finally(() => { this.indexJob = undefined; });
+  }
+
+  private async retrieve(assetId: string, session: string, sha: string, source: Buffer): Promise<RagEvidence | undefined> {
+    if (this.ragMode === 'off') return;
+    const catalog = ragCatalog(this.db, session);
+    const group = catalog.byPhoto.get(assetId);
+    if (!group) return;
+    const exact = exactBrand(group, assetId, sha);
+    if (exact) return { route: 'exact', brand: exact };
+    if (this.ragMode === 'exact' || !this.brandInspector?.embedShoes) return;
+    const started = performance.now();
+    try {
+      const { indexed, missing } = indexedReferences(this.db, catalog.groups);
+      const references = indexed.filter(ref => ref.key !== group.key);
+      if (references.length === 0) return { route: 'shadow', brand: null };
+      const shoeVectors = await this.brandInspector.embedShoes(source);
+      const match = this.ragMode === 'trial' ? matchShoesTrial(shoeVectors, references) : matchShoes(shoeVectors, references);
+      const policy = this.ragMode === 'auto' && !missing && !group.reserved && !group.conflict
+        ? readPolicy(this.db, ragDevice(this.device), catalog.fingerprint) : null;
+      const trialMatch = this.ragMode === 'trial' && Boolean(match) && !group.conflict
+        && ragCatalog(this.db, session).fingerprint === catalog.fingerprint;
+      const eligible = Boolean(trialMatch || (policy && qualifies(match, policy) && policy.brands.includes(normalizeBrandName(match.brand))
+        && ragCatalog(this.db, session).fingerprint === catalog.fingerprint));
+      const accepted = this.ragMode === 'trial' ? Boolean(match) : qualifies(match, policy ?? defaultThresholds);
+      return { route: eligible ? 'similar' : 'shadow', brand: accepted ? match!.brand : null,
+        ...(match ? { score: match.score, margin: match.margin, ...(match.supportCount ? { supportCount: match.supportCount } : {}) } : {}),
+        elapsedMs: Math.round(performance.now() - started) };
+    } catch (error) {
+      return { route: 'shadow', brand: null, error: error instanceof Error ? error.message.slice(0, 240) : String(error) };
+    }
+  }
 
   private get version() { return this.inspector.version ?? IMAGE_ENGINE_VERSION; }
   private get concurrency() { return Math.max(1, Math.min(4, this.inspector.concurrency ?? 1)); }
@@ -32,6 +87,7 @@ export class ImageInspectionCoordinator {
 
   resume(): void {
     reconcilePrimaryVisionBrandDescriptions(this.db);
+    for (const row of this.db.prepare('SELECT id FROM whatsapp_sessions').all() as { id: string }[]) this.refreshReferences(row.id);
     const assets = this.db.prepare(`SELECT m.id FROM media_assets m LEFT JOIN image_marking_state s ON s.media_asset_id=m.id
       LEFT JOIN image_inspections i ON i.media_asset_id=m.id
       LEFT JOIN image_brand_inspections b ON b.media_asset_id=m.id
@@ -76,6 +132,7 @@ export class ImageInspectionCoordinator {
     this.closed = true;
     for (const job of this.waiting.splice(0)) { this.jobs.delete(job.assetId); job.finish(); }
     await Promise.all([...this.jobs.values()]);
+    await this.indexJob;
     await this.brandInspector?.close?.();
     await this.inspector.close?.();
   }
@@ -163,7 +220,58 @@ export class ImageInspectionCoordinator {
         const candidates = [...new Map([...captions, ...ocrCandidates, ...registry.map((row) => row.displayName), ...catalogCandidates]
           .map((brand) => [normalizeBrandName(brand), brand])).values()];
         try {
-          const rawResult = await this.brandInspector.inspect(source, candidates, { captionCandidates: captions, ocrCandidates });
+          const supplierBrands = [...new Set(registry.filter((entry) => [entry.displayName, ...(JSON.parse(entry.aliasesJson) as string[])].some((name) => {
+            const normalized = normalizeBrandName(name);
+            if (!normalized || !containsTerm(asset.raw_text, name)) return false;
+            // Short words such as "on" are ambiguous in ordinary text.
+            if (normalized.length <= 2) return new RegExp(`(?<![\\p{L}\\p{N}])${name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}(?![\\p{L}\\p{N}])`, 'u').test(asset.raw_text);
+            return true;
+          })).map((entry) => entry.displayName))];
+          const supplierBrand = supplierBrands.length === 1 ? supplierBrands[0]! : null;
+          const retrieval = supplierBrand ? undefined : await this.retrieve(assetId, asset.session_id, asset.sha256, source);
+          const reused = retrieval?.route === 'exact' || retrieval?.route === 'similar' ? retrieval.brand : null;
+          let rawResult: ImageBrandInspection;
+          if (supplierBrand) {
+            rawResult = {
+              modelId: BRAND_MODEL_ID, status: 'review', suggestedBrand: supplierBrand, confirmedBrand: null,
+              score: 0, candidates: [], evidence: { captionCandidates: captions, ocrCandidates }, autoEligible: false,
+              reason: 'La marca aparece en la descripción del proveedor; se omitió el análisis visual de marca.', error: null,
+            };
+          } else if (reused && this.ragMode !== 'trial') {
+            rawResult = {
+              modelId: BRAND_MODEL_ID, status: 'confirmed', confirmedBrand: reused, suggestedBrand: reused,
+              score: retrieval!.route === 'exact' ? 1 : retrieval!.score!, candidates: [],
+              evidence: { captionCandidates: captions, ocrCandidates }, autoEligible: true,
+              reason: retrieval!.route === 'exact' ? 'Marca de una foto idéntica verificada.' : 'Marca recuperada de referencias visuales calibradas en este equipo.',
+              error: null,
+            };
+          } else {
+            const visual = await this.brandInspector.inspect(source, candidates, { captionCandidates: captions, ocrCandidates }, (value) => this.brandProgress.set(assetId, value));
+            if (this.ragMode !== 'trial' || !reused) rawResult = visual;
+            else {
+              const visualBrand = visual.evidence.visualBrand ?? visual.suggestedBrand;
+              const visualConflict = Boolean(visual.evidence.brandConflict || visualBrand
+                && normalizeBrandName(visualBrand) !== normalizeBrandName(reused));
+              const confirmed = !visualConflict;
+              const retrievalScore = retrieval?.route === 'exact' ? 1 : retrieval?.score ?? 0;
+              const ragCandidate = { brand: reused, score: retrievalScore, supportCount: retrieval?.supportCount ?? 3 };
+              rawResult = {
+                ...visual,
+                status: confirmed ? 'confirmed' : 'review',
+                suggestedBrand: reused,
+                confirmedBrand: confirmed ? reused : null,
+                score: retrievalScore,
+                candidates: [ragCandidate, ...visual.candidates.filter((candidate) => normalizeBrandName(candidate.brand) !== normalizeBrandName(reused))],
+                evidence: { ...visual.evidence, ...(retrieval ? { retrieval } : {}), ...(visualConflict ? { brandConflict: true } : {}) },
+                autoEligible: confirmed,
+                reason: visualConflict
+                  ? `El RAG de prueba sugiere ${reused}; Florence + Qwen discrepan${visualBrand ? ` y sugieren ${visualBrand}` : ''}. La marca queda para revisión.`
+                  : retrieval?.route === 'exact'
+                    ? `Coincidencia exacta con una foto etiquetada como ${reused}; Florence + Qwen también se ejecutaron para comparar.`
+                    : `El RAG de prueba recuperó ${reused} de las referencias visuales; Florence + Qwen no contradijeron la sugerencia.`,
+              };
+            }
+          }
           const jordanBrand = aliasToCanonical.get(normalizeBrandName('JUMPMAN')) ?? 'Jordan';
           const canonicalize = (brand: string | null) => {
             if (!brand) return null;
@@ -188,6 +296,7 @@ export class ImageInspectionCoordinator {
             candidates: rawResult.candidates.map((candidate) => ({ ...candidate, brand: canonicalize(candidate.brand)! })),
             evidence: {
               ...rawResult.evidence,
+              ...(retrieval ? { retrieval } : {}),
               visualBrand: normalizedVisualBrand,
               ...(jordanMarkDetected && modelVisualBrand && normalizeBrandName(modelVisualBrand) !== normalizeBrandName(jordanBrand)
                 ? { brandConflict: true } : {}),
@@ -199,16 +308,20 @@ export class ImageInspectionCoordinator {
           const gate = evaluateBrandSuggestions(reviewed);
           const visualConfirmsSuggestion = Boolean(result.suggestedBrand && result.evidence.visualBrand
             && normalizeBrandName(result.suggestedBrand) === normalizeBrandName(result.evidence.visualBrand));
-          const autoEligible = visualConfirmsSuggestion && result.score >= 0.8 && !result.evidence.brandConflict
+          const trialRagAssignment = this.ragMode === 'trial'
+            && (retrieval?.route === 'exact' || retrieval?.route === 'similar')
+            && result.status === 'confirmed' && !result.evidence.brandConflict;
+          const autoEligible = trialRagAssignment || visualConfirmsSuggestion && result.score >= 0.8 && !result.evidence.brandConflict
             && gate.autoEligibleBrands.some((brand) => normalizeBrandName(brand) === normalizeBrandName(result.suggestedBrand!));
           const brand: ImageBrandInspection = autoEligible ? {
             ...result, status: 'confirmed', confirmedBrand: result.suggestedBrand, autoEligible: true,
-            reason: 'Marca asignada automáticamente: la lectura superó 80 % de confianza y esta marca alcanzó 95 % de precisión en al menos 20 fotos de evaluación independientes.',
+            reason: trialRagAssignment ? result.reason
+              : 'Marca asignada automáticamente: la lectura superó 80 % de confianza y esta marca alcanzó 95 % de precisión en al menos 20 fotos de evaluación independientes.',
           } : result;
           this.saveBrandInspection(assetId, brand);
           const holdoutLabel = this.db.prepare(`SELECT expected_brand as expectedBrand FROM shoe_brand_labels
             WHERE media_asset_id=? AND split='holdout'`).get(assetId) as { expectedBrand: string | null } | undefined;
-          if (holdoutLabel) this.db.prepare(`INSERT INTO shoe_brand_evaluation_samples(media_asset_id,model_id,predicted_brand,expected_brand,reviewed_at,split,source_predictions_json)
+          if (holdoutLabel && !supplierBrand) this.db.prepare(`INSERT INTO shoe_brand_evaluation_samples(media_asset_id,model_id,predicted_brand,expected_brand,reviewed_at,split,source_predictions_json)
             VALUES (?,?,?,?,?,'holdout',?) ON CONFLICT(media_asset_id) DO UPDATE SET model_id=excluded.model_id,
               predicted_brand=excluded.predicted_brand,expected_brand=excluded.expected_brand,reviewed_at=excluded.reviewed_at,
               split='holdout',source_predictions_json=excluded.source_predictions_json`)
@@ -228,7 +341,7 @@ export class ImageInspectionCoordinator {
         } catch (error) {
           const reason = error instanceof Error ? error.message.slice(0, 300) : 'Error local desconocido.';
           this.saveBrandInspection(assetId, { modelId: BRAND_MODEL_ID, status: 'failed', suggestedBrand: null, confirmedBrand: null, score: 0, candidates: [], evidence: { captionCandidates: captions, ocrCandidates }, autoEligible: false, reason: 'No se pudo completar la detección local de marca.', error: reason });
-        }
+        } finally { this.brandProgress.delete(assetId); }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message.slice(0, 300) : 'Error local desconocido.';

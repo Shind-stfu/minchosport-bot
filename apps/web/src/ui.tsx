@@ -5,7 +5,7 @@ import { api } from './api.js';
 
 type ImageCodeCandidate = { code: string; confidence: number; evidence: 'label' | 'mixed-code' | 'number-only' };
 type ImageInspection = { ocrText: string; ocrConfidence: number; ocrError: string | null; codeCandidates: ImageCodeCandidate[]; detectedCode: string | null; codeConfidence: number; world: { detected: boolean; variant: string | null; confidence: number }; inspectedAt: string; engineVersion?: string | null; durationMs?: number | null; ocrPasses?: number | null; cacheHit?: boolean };
-type ImageBrand = { modelId: string | null; status: 'pending' | 'review' | 'confirmed' | 'unknown' | 'failed'; suggestedBrand: string | null; confirmedBrand: string | null; score: number; candidates: Array<{ brand: string; score: number }>; evidence: { captionCandidates?: string[]; ocrCandidates?: string[]; brandConflict?: boolean; inferenceDevice?: string; visualBrand?: string | null; visualAnswer?: string; visualLogoText?: string; visualEvidence?: string; visualConfidence?: number; visualModel?: string; visualError?: string }; autoEligible: boolean; manualOverride: boolean; reason: string; error: string | null; inspectedAt: string | null; referenceCount: number };
+type ImageBrand = { modelId: string | null; status: 'pending' | 'review' | 'confirmed' | 'unknown' | 'failed'; suggestedBrand: string | null; confirmedBrand: string | null; aliases?: string[]; score: number; candidates: Array<{ brand: string; score: number }>; evidence: { captionCandidates?: string[]; ocrCandidates?: string[]; brandConflict?: boolean; inferenceDevice?: string; visualBrand?: string | null; visualAnswer?: string; visualLogoText?: string; visualEvidence?: string; visualConfidence?: number; visualModel?: string; visualError?: string; retrieval?: { route: 'exact' | 'shadow' | 'similar'; brand: string | null; score?: number; margin?: number; supportCount?: number; error?: string } }; autoEligible: boolean; manualOverride: boolean; reason: string; error: string | null; inspectedAt: string | null; referenceCount: number };
 type BrandMetricRow = { brand: string; predictionCount: number; correctCount: number; precision: number; coverage: number };
 type BrandMetrics = { modelId: string; evaluationCount: number; predictionCount: number; correctCount: number; precision: number | null; coverage: number | null; precisionThreshold: number; minimumPredictionsPerBrand: number; autoEligibleBrands: string[]; perBrand: BrandMetricRow[]; bySource: Array<{ source: string; evaluationCount: number; predictionCount: number; correctCount: number; precision: number | null; coverage: number | null; perBrand: BrandMetricRow[] }>; reviewedLabelCount: number; holdoutLabelCount: number; referenceLabelCount: number; brands: Array<{ brand: string; referenceCount: number; reviewedCount: number; holdoutLabelCount: number; evaluatedCount: number }> };
 type MarkMode = 'original' | 'mark_all' | 'mark_code' | 'mark_world';
@@ -76,7 +76,12 @@ function brandForProductCaption(product: Product) {
 function productCaption(product: Product, text: string) {
   const brand = brandForProductCaption(product);
   const code = product.shoe_code ?? extractShoeCode(product.raw_text).code;
-  return prepareOutgoingDescription(brand ? prependBrandBeforeShoeCode(text, brand, code) : text);
+  const normalizeBrand = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/gu, '').replace(/[^\p{L}\p{N}]+/gu, '').toLocaleLowerCase('es-CO');
+  const brandKey = brand ? normalizeBrand(brand) : '';
+  const aliases = product.images.find((image) => image.brand.confirmedBrand && normalizeBrand(image.brand.confirmedBrand) === brandKey)?.brand.aliases
+    ?? product.images.find((image) => image.brand.suggestedBrand && normalizeBrand(image.brand.suggestedBrand) === brandKey)?.brand.aliases
+    ?? [];
+  return prepareOutgoingDescription(brand ? prependBrandBeforeShoeCode(text, brand, code, aliases) : text);
 }
 
 export function App() {
@@ -689,12 +694,20 @@ function ImageBrandReview({ image, imageNumber, productId, disabled, onSaved, on
   const [brand, setBrand] = useState(image.brand.confirmedBrand ?? '');
   const [aliases, setAliases] = useState('');
   const [saving, setSaving] = useState(false);
+  const [progress, setProgress] = useState<number | null>(null);
+  useEffect(() => {
+    if (image.brand.status !== 'pending') { setProgress(null); return; }
+    const update = () => { void api<{ progress: number | null }>(`/image-brand-progress/${encodeURIComponent(image.id)}`).then((value) => setProgress(value.progress)).catch(() => undefined); };
+    update();
+    const timer = window.setInterval(update, 3000);
+    return () => window.clearInterval(timer);
+  }, [image.id, image.brand.status]);
   useEffect(() => { setBrand(image.brand.confirmedBrand ?? ''); }, [image.brand.confirmedBrand]);
   const statusLabel = image.brand.status === 'confirmed'
     ? `${image.brand.confirmedBrand ?? 'Confirmada'} · ${image.brand.autoEligible ? 'automática' : image.brand.manualOverride ? 'corregida' : 'confirmada'}`
     : image.brand.status === 'review' ? `Por revisar${image.brand.suggestedBrand ? ` · posible ${image.brand.suggestedBrand}` : ''}`
       : image.brand.status === 'unknown' ? 'Sin marca legible'
-        : image.brand.status === 'failed' ? 'No se pudo analizar' : 'Analizando marca…';
+        : image.brand.status === 'failed' ? 'No se pudo analizar' : progress === null ? 'Esperando análisis…' : `Analizando marca… ${progress}%`;
   const signals = [...new Set([...(image.brand.evidence.captionCandidates ?? []), ...(image.brand.evidence.ocrCandidates ?? [])])];
 
   async function save(value: string | null) {
@@ -729,6 +742,12 @@ function ImageBrandReview({ image, imageNumber, productId, disabled, onSaved, on
     </details>
     {(image.brand.reason || image.brand.error || signals.length > 0 || image.brand.evidence.visualAnswer || image.brand.evidence.inferenceDevice || image.brand.evidence.visualError) && <details className="image-brand-diagnostics"><summary>Detalles del análisis</summary>
       {image.brand.reason && <small>{image.brand.reason}</small>}{image.brand.error && <small role="alert">{image.brand.error}</small>}
+      {image.brand.evidence.retrieval && <small>{image.brand.evidence.retrieval.route === 'exact'
+        ? `RAG: coincidencia exacta con una referencia${image.brand.evidence.retrieval.brand ? ` (${image.brand.evidence.retrieval.brand})` : ''}.`
+        : image.brand.evidence.retrieval.route === 'similar'
+          ? `RAG de prueba: ${image.brand.evidence.retrieval.brand ?? 'sin marca'} · similitud ${image.brand.evidence.retrieval.score?.toFixed(2) ?? '—'} · margen ${image.brand.evidence.retrieval.margin?.toFixed(2) ?? '—'}${image.brand.evidence.retrieval.supportCount ? ` · ${image.brand.evidence.retrieval.supportCount} referencias` : ''}.`
+          : `RAG: referencia no concluyente${image.brand.evidence.retrieval.error ? ` (${image.brand.evidence.retrieval.error})` : ''}.`}</small>}
+      {image.brand.evidence.retrieval?.route === 'shadow' && <small>Referencias en evaluación · {image.brand.evidence.retrieval.error ?? image.brand.evidence.retrieval.brand ?? 'Sin coincidencia suficiente'}</small>}
       {image.brand.evidence.inferenceDevice && <small>Dispositivo de inferencia: {image.brand.evidence.inferenceDevice}</small>}
       {image.brand.evidence.visualAnswer && <small>{image.brand.evidence.visualModel ?? 'Modelo visual'}: {image.brand.evidence.visualAnswer}</small>}
       {image.brand.evidence.visualLogoText && <small>OCR del calzado: {image.brand.evidence.visualLogoText}</small>}{image.brand.evidence.visualEvidence && <small>Evidencia visual: {image.brand.evidence.visualEvidence}</small>}

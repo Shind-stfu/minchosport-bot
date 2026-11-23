@@ -4,6 +4,11 @@ export function normalizeBrandName(value: string) {
   return value.normalize('NFD').replace(/[\u0300-\u036f]/gu, '').toLocaleLowerCase('es').replace(/[^\p{L}\p{N}&.' -]/gu, ' ').replace(/\s+/gu, ' ').trim();
 }
 
+/** Treat a logo described on a box or background as outside the shoe. */
+export function isBackgroundBrandEvidence(evidence: unknown): boolean {
+  return typeof evidence === 'string' && /\b(?:caja|empaque|embalaje|fondo|background|box|packaging)\b/iu.test(evidence);
+}
+
 /** Detect a shoe-specific Jordan mark even when the model labels the shoe as Nike or no brand. */
 export function detectJordanBrandSignal(texts: Array<string | null | undefined>): 'jumpman' | 'jordan' | null {
   const text = texts.filter((value): value is string => Boolean(value)).join(' ');
@@ -18,13 +23,15 @@ export function detectJordanBrandSignal(texts: Array<string | null | undefined>)
 /** Recover a clear brand consensus from repeated Florence/Qwen JSON crop responses. */
 export function resolveVisionBrandConsensus(answer: string, logoText = '') {
   const votes: string[] = [];
+  let backgroundVotes = 0;
   for (const match of answer.matchAll(/\{[^{}]*\}/gu)) {
     try {
-      const parsed = JSON.parse(match[0]) as { brand?: unknown; uncertain?: unknown };
+      const parsed = JSON.parse(match[0]) as { brand?: unknown; uncertain?: unknown; evidence?: unknown };
       if (parsed.uncertain === true || typeof parsed.brand !== 'string') continue;
       const brand = parsed.brand.trim();
       if (!brand || /^(?:null|none|unknown|unclear)$/iu.test(brand)) continue;
-      votes.push(brand);
+      if (isBackgroundBrandEvidence(parsed.evidence)) { backgroundVotes += 1; continue; }
+      votes.push(/^(?:on|on\s*cloud|cloud\s*tec)$/iu.test(brand) ? 'ON CLOUD' : brand);
     } catch { /* Ignore malformed crop responses and keep the other votes. */ }
   }
   const byBrand = new Map<string, { brand: string; count: number }>();
@@ -36,13 +43,13 @@ export function resolveVisionBrandConsensus(answer: string, logoText = '') {
   }
   const ranked = [...byBrand.values()].sort((a, b) => b.count - a.count || a.brand.localeCompare(b.brand, 'es'));
   const winner = ranked[0];
-  const totalVotes = votes.length;
+  const totalVotes = votes.length + backgroundVotes;
   if (!winner || winner.count < 2 || totalVotes === 0) return { brand: null, votes: winner?.count ?? 0, totalVotes, disagreement: false, confidence: 0 };
   const share = winner.count / totalVotes;
   const normalizedLogoText = ` ${normalizeBrandName(logoText)} `;
   const logoSupportsWinner = normalizedLogoText.includes(` ${normalizeBrandName(winner.brand)} `);
   const qualifies = share >= 0.75 || share >= 2 / 3 && logoSupportsWinner;
-  if (!qualifies) return { brand: null, votes: winner.count, totalVotes, disagreement: ranked.length > 1, confidence: 0 };
+  if (!qualifies) return { brand: null, votes: winner.count, totalVotes, disagreement: ranked.length > 1 || backgroundVotes > 0, confidence: 0 };
   return {
     brand: winner.brand,
     votes: winner.count,

@@ -113,7 +113,18 @@ function audit(db: AppDatabase, action: string, type: string, id: string, detail
   writeApplicationLog(db, { sessionId, category, action, entityType: type, entityId: id, message: messages[action] ?? action.replaceAll('.', ' '), details, createdAt, level });
 }
 
-function publicProduct(db: AppDatabase, assetsDirectory: string, product: Record<string, unknown>) {
+function readBrandAliasMap(db: AppDatabase) {
+  const rows = db.prepare('SELECT normalized_name as normalizedName,aliases_json as aliasesJson FROM shoe_brand_registry')
+    .all() as Array<{ normalizedName: string; aliasesJson: string }>;
+  const aliasesByName = new Map<string, string[]>();
+  for (const row of rows) {
+    try { aliasesByName.set(row.normalizedName, JSON.parse(row.aliasesJson) as string[]); }
+    catch { aliasesByName.set(row.normalizedName, []); }
+  }
+  return aliasesByName;
+}
+
+function publicProduct(db: AppDatabase, assetsDirectory: string, product: Record<string, unknown>, brandAliasMap = readBrandAliasMap(db)) {
   const assets = db.prepare(`SELECT m.id, m.file_name as fileName, m.mime_type as mimeType, m.size_bytes as sizeBytes, m.position,
       i.ocr_text as ocrText, i.ocr_confidence as ocrConfidence, i.ocr_error as ocrError, i.code_candidates_json as codeCandidatesJson,
       i.detected_code as detectedCode, i.code_confidence as codeConfidence, i.world_variant as worldVariant,
@@ -139,6 +150,7 @@ function publicProduct(db: AppDatabase, assetsDirectory: string, product: Record
       url: `/api/media/${asset.id}`,
       brand: asset.brandModelId ? {
         modelId: asset.brandModelId, status: asset.brandStatus, suggestedBrand: asset.suggestedBrand, confirmedBrand: asset.confirmedBrand,
+        aliases: brandAliasMap.get(normalizeBrandName(String(asset.confirmedBrand ?? asset.suggestedBrand ?? ''))) ?? [],
         score: asset.brandScore, candidates: JSON.parse(String(asset.brandCandidatesJson ?? '[]')),
         evidence: JSON.parse(String(asset.brandEvidenceJson ?? '{}')), autoEligible: Boolean(asset.brandAutoEligible), manualOverride: Boolean(asset.brandManualOverride), reason: asset.brandReason,
         error: asset.brandError, inspectedAt: asset.brandInspectedAt, referenceCount: asset.brandReferenceCount,
@@ -250,6 +262,8 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     if (!sessionRow(sessionId)) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
     return imageInspections.status(sessionId);
   });
+
+  app.get<{ Params: { assetId: string } }>('/api/image-brand-progress/:assetId', async (request) => ({ progress: imageInspections.progress(request.params.assetId) }));
 
   app.get('/api/sessions', async () => {
     const rows = db.prepare('SELECT id,name,created_at as createdAt FROM whatsapp_sessions WHERE archived_at IS NULL ORDER BY created_at').all() as Array<{ id: string; name: string; createdAt: string }>;
@@ -563,7 +577,8 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       JOIN whatsapp_sessions ws ON ws.id=p.session_id
       WHERE p.session_id=? ${request.query.supplierId ? 'AND p.supplier_id=?' : ''}
       ORDER BY p.created_at DESC LIMIT 500`).all(...(request.query.supplierId ? [sessionId, request.query.supplierId] : [sessionId])) as Array<Record<string, unknown>>;
-    return products.map((product) => publicProduct(db, mediaDirectory, product));
+    const brandAliasMap = readBrandAliasMap(db);
+    return products.map((product) => publicProduct(db, mediaDirectory, product, brandAliasMap));
   });
 
   app.get('/api/image-brand-metrics', async () => {
@@ -783,6 +798,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
         .run(asset.id, asset.brandModelId ?? BRAND_MODEL_ID, displayName ? 'confirmed' : 'unknown', asset.suggestedBrand, displayName, displayName ? 'Confirmada manualmente; se guardó como referencia para futuras sugerencias.' : 'Se confirmó manualmente que no hay una marca legible.', now);
       if (displayName) applyConfirmedBrandToApprovedDescription(db, product.id, displayName, now);
     })();
+    imageInspections.refreshReferences(product.session_id);
     audit(db, displayName ? 'product.image.brand.confirmed' : 'product.image.brand.unknown', 'product', product.id,
       { assetId: asset.id, brand: displayName, aliases: input.data.aliases });
     return { ok: true, brand: { status: displayName ? 'confirmed' : 'unknown', confirmedBrand: displayName, suggestedBrand: asset.suggestedBrand, inspectedAt: now } };

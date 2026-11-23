@@ -10,6 +10,7 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
+    "evaluate:rag": "node --import tsx scripts/evaluate-brand-rag.ts",
     "benchmark:images": "tsx scripts/benchmark-images.ts"
   },
   "dependencies": {

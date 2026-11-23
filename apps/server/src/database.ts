@@ -497,6 +497,18 @@ export const MIGRATIONS = [
     END,
     updated_at=CURRENT_TIMESTAMP
     WHERE normalized_name='jordan' AND instr(lower(aliases_json),'"jump man"')=0;`,
+  `CREATE TABLE brand_rag_vectors (
+    sha256 TEXT NOT NULL, encoder TEXT NOT NULL, vectors_json TEXT NOT NULL,
+    PRIMARY KEY (sha256, encoder)
+  );
+  CREATE INDEX idx_media_assets_sha ON media_assets(sha256);
+  CREATE TRIGGER cleanup_brand_rag_vectors AFTER DELETE ON media_assets BEGIN
+    DELETE FROM brand_rag_vectors WHERE sha256=OLD.sha256 AND NOT EXISTS
+      (SELECT 1 FROM media_assets WHERE sha256=OLD.sha256);
+  END;
+  CREATE TABLE brand_rag_calibration (
+    device TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, policy_json TEXT NOT NULL
+  );`,
 ];
 
 export type AppDatabase = InstanceType<typeof Database>;

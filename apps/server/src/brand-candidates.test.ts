@@ -1,7 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { extractBrandCandidates, extractCatalogBrandCandidates, normalizeBrandName } from './brand-candidates.js';
+import { extractBrandCandidates, extractCatalogBrandCandidates, normalizeBrandName, resolveVisionBrandConsensus } from './brand-candidates.js';
 
 describe('open-vocabulary brand candidates', () => {
+  it('does not let a logo on a background box settle conflicting shoe readings', () => {
+    const answer = [
+      { brand: 'Saucony', evidence: 'Logo en el lateral de la zapatilla', uncertain: false },
+      { brand: 'Saucony', evidence: 'Texto en la zapatilla', uncertain: false },
+      { brand: 'New Balance', evidence: 'Logo visible en la caja roja en el fondo', uncertain: false },
+      { brand: 'On', evidence: 'Logo en el lateral de la zapatilla', uncertain: false },
+    ].map((item) => JSON.stringify(item)).join(' · ');
+    expect(resolveVisionBrandConsensus(answer).brand).toBeNull();
+    expect(resolveVisionBrandConsensus(answer).disagreement).toBe(true);
+  });
   it('extracts a previously unseen brand from uppercase or title-case descriptions', () => {
     expect(extractBrandCandidates('TENIS HOKA PARA DAMA · TALLAS 36 A 40')).toContain('HOKA');
     expect(extractBrandCandidates('Zapatos On Running para hombre')).toContain('On Running');
