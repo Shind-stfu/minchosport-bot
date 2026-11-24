@@ -1,3 +1,4 @@
+import { acceptsSupplierMessage } from './supplier-reception-policy.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
@@ -325,7 +326,7 @@ export class WhatsmeowConnector implements WhatsAppConnector {
 
   async requestHistory() {
     if (!this.enabled || this.currentStatus !== 'connected' || !this.historyRecovery) throw new Error('Conecta WhatsApp antes de solicitar la recuperación del historial.');
-    if (!this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId)) throw new Error('Agrega un proveedor antes de solicitar su historial.');
+    if (!this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL AND reception_enabled=1 LIMIT 1').get(this.sessionId)) throw new Error('Activa al menos un proveedor antes de solicitar su historial.');
     this.historyRecovery.start();
   }
 
@@ -456,7 +457,7 @@ export class WhatsmeowConnector implements WhatsAppConnector {
   }
 
   private observeHistoryBatch(batch: HistoryBatch) {
-    const supplierGroups = new Set((this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
+    const supplierGroups = new Set((this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL AND reception_enabled=1').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
     const supplierMessages = batch.messages.filter((message) => typeof message.key.remoteJid === 'string' && !message.key.fromMe && supplierGroups.has(message.key.remoteJid));
     const schedule = readReceptionSchedule(this.db, this.sessionId);
     const nowMs = Date.now();
@@ -489,6 +490,7 @@ export class WhatsmeowConnector implements WhatsAppConnector {
   private async handleSupplierMessage(message: InboundMessage) {
     const { groupId, messageId, timestampMs } = message;
     if (!groupId.endsWith('@g.us') || message.fromMe || !messageId || !this.supplierIngestion?.isSupplierGroup(groupId, this.sessionId)) return;
+    if (!acceptsSupplierMessage(this.db, this.sessionId, groupId, timestampMs)) return;
     const groupName = (this.db.prepare('SELECT subject FROM whatsapp_groups WHERE session_id=? AND jid=?').get(this.sessionId, groupId) as { subject: string } | undefined)?.subject ?? groupId;
     const supplierName = (this.db.prepare('SELECT name FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL').get(this.sessionId, groupId) as { name: string } | undefined)?.name ?? groupName;
     const at = new Date().toISOString();
@@ -615,7 +617,7 @@ export class WhatsmeowConnector implements WhatsAppConnector {
   }
 
   private activeSupplierGroupIds() {
-    return (this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL ORDER BY source_group_id').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id);
+    return (this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL AND reception_enabled=1 ORDER BY source_group_id').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id);
   }
 
   private scheduleReconnect() {
@@ -658,7 +660,7 @@ export class WhatsmeowConnector implements WhatsAppConnector {
   }
 
   private hasSuppliers() {
-    return Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId));
+    return Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL AND reception_enabled=1 LIMIT 1').get(this.sessionId));
   }
 
   private acceptsMessage(type: 'notify' | 'append' | 'history', timestampMs: number) {

@@ -6,10 +6,20 @@ import type { AppDatabase } from './database.js';
 import { isInRecoveryWindow, readReceptionSchedule, recoveryStartTimestampMs } from './reception-schedule.js';
 import type { IncomingSupplierMessage, SupplierIngestionService } from './supplier-ingestion.js';
 import { writeApplicationLog } from './application-log.js';
+import { acceptsSupplierMessage } from './supplier-reception-policy.js';
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const EXTENSIONS: Record<string, string> = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
 const RECOVERY_WARNING = 'WhatsApp no confirma que haya entregado todo el historial; revisa los grupos proveedor por si faltan publicaciones.';
+
+export function discardPendingSupplierMessages(db: AppDatabase, dataDirectory: string, sessionId: string, groupId: string, reason: string, now = new Date().toISOString()) {
+  const rows = db.prepare(`SELECT image_file_name as imageFileName FROM supplier_inbox_messages
+    WHERE session_id=? AND group_jid=? AND status IN ('pending','failed')`)
+    .all(sessionId, groupId) as Array<{ imageFileName: string | null }>;
+  db.prepare(`UPDATE supplier_inbox_messages SET status='ignored',error=?,error_code=NULL,processed_at=?
+    WHERE session_id=? AND group_jid=? AND status IN ('pending','failed')`).run(reason, now, sessionId, groupId);
+  for (const row of rows) if (row.imageFileName) rmSync(join(dataDirectory, 'supplier-inbox', row.imageFileName), { force: true });
+}
 
 type InboxRow = {
   session_id: string;
@@ -101,6 +111,7 @@ export class SupplierReceptionService {
   async capture(message: IncomingSupplierMessage, deferUntilBatchEnd = false): Promise<'stored' | 'ignored' | 'duplicate' | 'pending' | 'failed' | 'outside_window'> {
     const sessionId = message.sessionId ?? 'main';
     if (!message.messageId || !this.ingestion.isSupplierGroup(message.groupId, sessionId)) return 'duplicate';
+    if (!acceptsSupplierMessage(this.db, sessionId, message.groupId, message.timestampMs)) return 'ignored';
     const mode = message.receptionMode ?? 'live';
     if (mode === 'recovery' && !isInRecoveryWindow(message.timestampMs, readReceptionSchedule(this.db, sessionId), this.now())) return 'outside_window';
     const existingInbox = this.db.prepare('SELECT status,image_file_name as imageFileName FROM supplier_inbox_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(sessionId, message.groupId, message.messageId) as { status: string; imageFileName: string | null } | undefined;
@@ -153,6 +164,7 @@ export class SupplierReceptionService {
   }
 
   recordUnsupported(sessionId: string, groupId: string, messageId: string, timestampMs: number, errorCode = 'unsupported') {
+    if (!acceptsSupplierMessage(this.db, sessionId, groupId, timestampMs)) return;
     const now = new Date(this.now()).toISOString();
     const error = errorCode === 'decrypt_pending' ? 'WhatsApp no pudo descifrar este mensaje. Se espera una nueva entrega antes de incorporarlo al catálogo.'
       : errorCode === 'media_download_failed' ? 'No se pudo descargar la publicación del proveedor.'
@@ -309,6 +321,14 @@ export class SupplierReceptionService {
         FROM supplier_inbox_messages i JOIN supplier_profiles p ON p.session_id=i.session_id AND p.source_group_id=i.group_jid AND p.archived_at IS NULL
         WHERE i.session_id=? AND i.status='pending' ORDER BY i.message_timestamp_ms ASC,i.received_at ASC,i.message_id ASC`).all(sessionId) as InboxRow[];
       for (const row of pending) {
+        // The preceding receive can yield while a supplier is disabled. Recheck
+        // every row before reading its image or taking the processing lease.
+        if (!acceptsSupplierMessage(this.db, sessionId, row.group_jid, row.message_timestamp_ms)) {
+          this.db.prepare("UPDATE supplier_inbox_messages SET status='ignored',error='Recepción del proveedor desactivada o anterior a su reactivación',error_code=NULL,processed_at=? WHERE session_id=? AND group_jid=? AND message_id=? AND status='pending'")
+            .run(new Date(this.now()).toISOString(), sessionId, row.group_jid, row.message_id);
+          if (row.image_file_name) rmSync(join(this.inboxDirectory, row.image_file_name), { force: true });
+          continue;
+        }
         if (row.reception_mode === 'recovery' && !isInRecoveryWindow(row.message_timestamp_ms, readReceptionSchedule(this.db, sessionId), this.now())) {
           this.db.prepare("UPDATE supplier_inbox_messages SET status='ignored',error='Fuera del rango de recuperación',error_code=NULL,processed_at=? WHERE session_id=? AND group_jid=? AND message_id=?")
             .run(new Date(this.now()).toISOString(), sessionId, row.group_jid, row.message_id);

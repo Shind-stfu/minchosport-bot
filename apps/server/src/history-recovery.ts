@@ -71,7 +71,7 @@ export class HistoryRecovery {
     }
     if (resetStatus) this.reception?.beginRecovery(this.sessionId);
     this.attemptStarted = true;
-    const suppliers = this.db.prepare('SELECT source_group_id as groupId FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL').all(this.sessionId) as Array<{ groupId: string }>;
+    const suppliers = this.db.prepare('SELECT source_group_id as groupId FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL AND reception_enabled=1').all(this.sessionId) as Array<{ groupId: string }>;
     for (const { groupId } of suppliers) {
       const state = this.groupRequest(this.anchor(groupId));
       this.groups.set(groupId, state);
@@ -259,7 +259,7 @@ export class HistoryRecovery {
     const state = this.groups.get(groupId);
     const cursor = state?.cursor;
     if (!state || !cursor || state.pending || state.awaitingAck || state.done) { void this.pump(); return; }
-    if (!this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL').get(this.sessionId, groupId)) {
+    if (!this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL AND reception_enabled=1').get(this.sessionId, groupId)) {
       state.done = true;
       void this.pump();
       return;

@@ -92,6 +92,12 @@ describe('WhatsmeowConnector', () => {
         .run(now, now);
       await connector.syncSupplierGroups();
       expect(calls.filter((call) => call.type === 'supplier-groups').at(-1)?.payload).toEqual({ supplierGroupIds: ['provider@g.us'] });
+      db.prepare("UPDATE supplier_profiles SET reception_enabled=0 WHERE id='provider'").run();
+      await connector.syncSupplierGroups();
+      expect(calls.filter((call) => call.type === 'supplier-groups').at(-1)?.payload).toEqual({ supplierGroupIds: [] });
+      await expect(connector.requestHistory()).rejects.toThrow('Activa al menos un proveedor');
+      db.prepare("UPDATE supplier_profiles SET reception_enabled=1 WHERE id='provider'").run();
+      await connector.syncSupplierGroups();
       const anchorMs = Date.now() - 60_000;
       db.prepare(`INSERT INTO whatsapp_history_anchors(session_id,group_jid,message_id,message_timestamp_ms,from_me,participant_jid)
         VALUES ('main','provider@g.us','history-anchor',?,0,'vendor@s.whatsapp.net')`).run(anchorMs);

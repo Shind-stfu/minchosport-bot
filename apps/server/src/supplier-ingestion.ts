@@ -5,6 +5,7 @@ import type { FastifyBaseLogger } from 'fastify';
 import { analyzePrices, extractShoeCode } from '@tenis/core';
 import type { AppDatabase } from './database.js';
 import { writeApplicationLog } from './application-log.js';
+import { acceptsSupplierMessage } from './supplier-reception-policy.js';
 
 const ASSEMBLY_IDLE_MS = 3_000;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -79,13 +80,13 @@ export class SupplierIngestionService {
   }
 
   isSupplierGroup(groupId: string, sessionId = 'main'): boolean {
-    return Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL').get(sessionId, groupId));
+    return Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL AND reception_enabled=1').get(sessionId, groupId));
   }
 
   async receive(message: IncomingSupplierMessage): Promise<'stored' | 'ignored'> {
     const sessionId = message.sessionId ?? 'main';
     const supplier = this.db.prepare('SELECT id,margin_cop,box_margin_cop,marker_text,default_position FROM supplier_profiles WHERE session_id=? AND source_group_id=? AND archived_at IS NULL').get(sessionId, message.groupId) as { id: string; margin_cop: number; box_margin_cop: number; marker_text: string; default_position: 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right' } | undefined;
-    if (!supplier || !message.messageId) return 'ignored';
+    if (!supplier || !message.messageId || !acceptsSupplierMessage(this.db, sessionId, message.groupId, message.timestampMs)) return 'ignored';
     if (this.db.prepare('SELECT 1 FROM whatsapp_source_messages WHERE session_id=? AND group_jid=? AND message_id=?').get(sessionId, message.groupId, message.messageId)) return 'ignored';
 
     const text = message.text.trim();
@@ -108,6 +109,8 @@ export class SupplierIngestionService {
       this.logger.info({ sessionId, groupId: message.groupId, messageId: message.messageId, reason: filterReason }, 'Publicación informativa o promocional omitida');
       return 'ignored';
     }
+    // OCR can yield while the user disables or reactivates this supplier.
+    if (!acceptsSupplierMessage(this.db, sessionId, message.groupId, message.timestampMs)) return 'ignored';
     const participant = message.participantId ?? `unknown:${message.messageId}`;
     const eventDate = new Date(message.timestampMs);
     const receivedAt = Number.isNaN(eventDate.valueOf()) ? new Date().toISOString() : eventDate.toISOString();

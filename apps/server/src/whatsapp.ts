@@ -1,3 +1,4 @@
+import { acceptsSupplierMessage } from './supplier-reception-policy.js';
 import makeWASocket, { DisconnectReason, downloadMediaMessage, normalizeMessageContent, proto } from '@whiskeysockets/baileys';
 import type { Chat, WAMessage } from '@whiskeysockets/baileys';
 import type { FastifyBaseLogger } from 'fastify';
@@ -79,7 +80,7 @@ export class BaileysConnector implements WhatsAppConnector {
       const auth = await EncryptedWhatsAppAuth.create(this.db, currentUserProtector(), this.sessionId);
       const { state, saveCreds } = await auth.state();
       const skippedHistoryTypes = new Set<number>();
-      const hasSuppliers = () => Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId));
+      const hasSuppliers = () => Boolean(this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL AND reception_enabled=1 LIMIT 1').get(this.sessionId));
       const socket = makeWASocket({ auth: state, logger: baileysLogger, printQRInTerminal: false, markOnlineOnConnect: false,
         // Ask for history at registration while keeping the compatible Web
         // browser profile. Advertising a native desktop currently closes with 428.
@@ -183,7 +184,7 @@ export class BaileysConnector implements WhatsAppConnector {
           this.historyRecovery?.observe(messages, onDemand, requestId);
           const ordered = [...messages].sort((a, b) => Number(a.messageTimestamp ?? 0) - Number(b.messageTimestamp ?? 0));
           if (this.supplierReception) {
-            const supplierGroupIds = new Set((this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
+            const supplierGroupIds = new Set((this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL AND reception_enabled=1').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
             const recoveryMessages = ordered.filter((message) => {
               const groupId = message.key.remoteJid;
               const timestampMs = Number(message.messageTimestamp ?? 0) * 1000;
@@ -220,7 +221,7 @@ export class BaileysConnector implements WhatsAppConnector {
       socket.ev.on('messaging-history.set', (event) => {
         // Mirror the download filter for directly emitted / replayed history events.
         if (event.syncType != null && !ACCEPTED_HISTORY_TYPES.has(event.syncType)) return;
-        const supplierGroups = new Set((this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
+        const supplierGroups = new Set((this.db.prepare('SELECT source_group_id FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL AND reception_enabled=1').all(this.sessionId) as Array<{ source_group_id: string }>).map((row) => row.source_group_id));
         const supplierMessages = event.messages.filter((message) => !message.key.fromMe && supplierGroups.has(message.key.remoteJid ?? ''));
         const schedule = readReceptionSchedule(this.db, this.sessionId);
         const nowMs = Date.now();
@@ -279,7 +280,7 @@ export class BaileysConnector implements WhatsAppConnector {
 
   async requestHistory() {
     if (!this.enabled || this.currentStatus !== 'connected' || !this.historyRecovery) throw new Error('Conecta WhatsApp antes de solicitar la recuperación del historial.');
-    if (!this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL LIMIT 1').get(this.sessionId)) throw new Error('Agrega un proveedor antes de solicitar su historial.');
+    if (!this.db.prepare('SELECT 1 FROM supplier_profiles WHERE session_id=? AND archived_at IS NULL AND reception_enabled=1 LIMIT 1').get(this.sessionId)) throw new Error('Activa al menos un proveedor antes de solicitar su historial.');
     this.historyRecovery.start();
   }
 
@@ -311,6 +312,7 @@ export class BaileysConnector implements WhatsAppConnector {
     this.reception = { ...this.reception, lastGroupMessageAt: at, lastGroupName: groupName, lastSupplierMessageAt: at, lastSupplierName: supplierName, lastSupplierResult: 'processing' };
     const rawTimestamp = Number(message.messageTimestamp ?? (upsertType === 'notify' ? Date.now() / 1000 : Number.NaN));
     const messageTimestampMs = Number.isFinite(rawTimestamp) && rawTimestamp > 0 ? rawTimestamp * 1000 : Number.NaN;
+    if (!acceptsSupplierMessage(this.db, this.sessionId, groupId, messageTimestampMs)) return;
     if (!this.acceptsMessage(upsertType, messageTimestampMs)) {
       if (Number.isFinite(messageTimestampMs) && Date.now() - messageTimestampMs <= MAX_APPENDED_SUPPLIER_MESSAGE_AGE_MS && messageTimestampMs <= Date.now()) {
         this.reception = { ...this.reception, lastSupplierResult: 'outside_recovery_window' };

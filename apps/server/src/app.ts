@@ -22,7 +22,7 @@ import { brandSourcePredictions, evaluateBrandSuggestions } from './brand-evalua
 import { markOptions, readMarkDecision, type MarkMode } from './image-marking-decision.js';
 import { writeApplicationLog } from './application-log.js';
 import { removeProductImages, removeProducts } from './product-cleanup.js';
-import type { SupplierReceptionService } from './supplier-reception.js';
+import { discardPendingSupplierMessages, type SupplierReceptionService } from './supplier-reception.js';
 import QRCode from 'qrcode';
 import { readReceptionSchedule, recoveryStartTimestampMs } from './reception-schedule.js';
 import { applyConfirmedBrandToApprovedDescription } from './approved-brand-description.js';
@@ -90,6 +90,8 @@ function audit(db: AppDatabase, action: string, type: string, id: string, detail
     'whatsapp.groups.selected': 'Se guardó la selección de grupos',
     'supplier.created': 'Se agregó un proveedor', 'supplier.updated': 'Se actualizaron las reglas del proveedor',
     'supplier.archived': 'Se archivó un proveedor', 'supplier.restored': 'Se reactivó un proveedor archivado',
+    'supplier.reception.enabled': 'Se activó la recepción de un proveedor',
+    'supplier.reception.disabled': 'Se desactivó la recepción de un proveedor',
     'distribution.started': 'Se inició la distribución', 'distribution.paused': 'Se pausó la distribución',
     'distribution.stopped': 'Se detuvo la distribución', 'settings.updated': 'Se actualizó la configuración',
     'distribution.send_interval.updated': 'Se actualizó la pausa entre envíos',
@@ -198,7 +200,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     if (origin) {
       try {
         const parsed = new URL(origin);
-        const allowedOrigins = [...allowedHosts, '127.0.0.1:5173', 'localhost:5173'];
+        const allowedOrigins = [...allowedHosts, '127.0.0.1:5173', 'localhost:5173', '127.0.0.1:5174', 'localhost:5174'];
         if (!allowedOrigins.includes(parsed.host.toLowerCase())) {
           return reply.code(403).send({ error: 'Origen no autorizado.' });
         }
@@ -237,7 +239,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     const startMs = recoveryStartTimestampMs(schedule);
     const references = (db.prepare(`SELECT p.name,a.message_timestamp_ms as timestampMs FROM supplier_profiles p
       LEFT JOIN whatsapp_history_anchors a ON a.session_id=p.session_id AND a.group_jid=p.source_group_id
-      WHERE p.session_id=? AND p.archived_at IS NULL ORDER BY p.name`).all(sessionId) as Array<{ name: string; timestampMs: number | null }>);
+      WHERE p.session_id=? AND p.archived_at IS NULL AND p.reception_enabled=1 ORDER BY p.name`).all(sessionId) as Array<{ name: string; timestampMs: number | null }>);
     const eligibleGroups = references.filter((row) => row.timestampMs !== null && row.timestampMs >= startMs && row.timestampMs <= Date.now() + 300_000).length;
     const missingReferences = references.length - eligibleGroups;
     const status = startMs > Date.now() ? 'scheduled' : eligibleGroups ? 'requesting' : 'waiting_reference';
@@ -432,8 +434,9 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
   app.get<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/providers', async (request, reply) => {
     const account = sessionRow(request.params.sessionId);
     if (!account) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
-    return db.prepare(`SELECT p.id,p.session_id as sessionId,p.source_group_id as sourceGroupId,p.name,p.margin_cop as priceMarginCop,p.box_margin_cop as boxMarginCop,p.marker_text as markerText,p.default_position as defaultPosition,g.subject as sourceGroupName
-      FROM supplier_profiles p LEFT JOIN whatsapp_groups g ON g.session_id=p.session_id AND g.jid=p.source_group_id WHERE p.session_id=? AND p.archived_at IS NULL ORDER BY p.name COLLATE NOCASE`).all(account.id);
+    const providers = db.prepare(`SELECT p.id,p.session_id as sessionId,p.source_group_id as sourceGroupId,p.name,p.margin_cop as priceMarginCop,p.box_margin_cop as boxMarginCop,p.marker_text as markerText,p.default_position as defaultPosition,g.subject as sourceGroupName,p.reception_enabled as receptionEnabled
+      FROM supplier_profiles p LEFT JOIN whatsapp_groups g ON g.session_id=p.session_id AND g.jid=p.source_group_id WHERE p.session_id=? AND p.archived_at IS NULL ORDER BY p.name COLLATE NOCASE`).all(account.id) as Array<Record<string, unknown> & { receptionEnabled: number }>;
+    return providers.map((provider) => ({ ...provider, receptionEnabled: Boolean(provider.receptionEnabled) }));
   });
 
   app.post<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/providers', async (request, reply) => {
@@ -449,7 +452,7 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     const id = existing?.id ?? randomUUID(); const now = new Date().toISOString();
     db.transaction(() => {
       if (existing) {
-        db.prepare('UPDATE supplier_profiles SET name=?,margin_cop=?,box_margin_cop=?,marker_text=?,default_position=?,archived_at=NULL,updated_at=? WHERE id=?')
+        db.prepare('UPDATE supplier_profiles SET name=?,margin_cop=?,box_margin_cop=?,marker_text=?,default_position=?,archived_at=NULL,reception_enabled=1,updated_at=? WHERE id=?')
           .run(input.data.name, input.data.priceMarginCop, input.data.boxMarginCop, input.data.markerText, input.data.defaultPosition, now, id);
       } else {
         db.prepare('INSERT INTO supplier_profiles(id,session_id,source_group_id,name,margin_cop,box_margin_cop,marker_text,default_position,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
@@ -458,11 +461,11 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       audit(db, existing ? 'supplier.restored' : 'supplier.created', 'supplier', id, input.data);
     })();
     await connectorFor(account.id)?.syncSupplierGroups?.();
-    return reply.code(201).send({ id, sessionId: account.id, ...input.data, restored: Boolean(existing) });
+    return reply.code(201).send({ id, sessionId: account.id, ...input.data, receptionEnabled: true, restored: Boolean(existing) });
   });
 
   app.put<{ Params: { supplierId: string } }>('/api/providers/:supplierId', async (request, reply) => {
-    const provider = db.prepare('SELECT id,session_id,source_group_id FROM supplier_profiles WHERE id=? AND archived_at IS NULL').get(request.params.supplierId) as { id: string; session_id: string; source_group_id: string } | undefined;
+    const provider = db.prepare('SELECT id,session_id,source_group_id,reception_enabled FROM supplier_profiles WHERE id=? AND archived_at IS NULL').get(request.params.supplierId) as { id: string; session_id: string; source_group_id: string; reception_enabled: number } | undefined;
     const input = SupplierProfileSchema.safeParse(request.body);
     if (!provider) return reply.code(404).send({ error: 'Proveedor no encontrado.' });
     if (!input.success) return reply.code(400).send({ error: 'Proveedor inválido.', details: input.error.flatten() });
@@ -481,7 +484,27 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
       audit(db, 'supplier.updated', 'supplier', provider.id, input.data);
     })();
     await connectorFor(provider.session_id)?.syncSupplierGroups?.();
-    return { ok: true, id: provider.id, ...input.data };
+    return { ok: true, id: provider.id, ...input.data, receptionEnabled: Boolean(provider.reception_enabled) };
+  });
+
+  app.patch<{ Params: { supplierId: string } }>('/api/providers/:supplierId/reception', async (request, reply) => {
+    const provider = db.prepare(`SELECT id,session_id as sessionId,source_group_id as groupId,reception_enabled as enabled
+      FROM supplier_profiles WHERE id=? AND archived_at IS NULL`).get(request.params.supplierId) as { id: string; sessionId: string; groupId: string; enabled: number } | undefined;
+    if (!provider) return reply.code(404).send({ error: 'Proveedor no encontrado.' });
+    const input = z.object({ enabled: z.boolean() }).strict().safeParse(request.body);
+    if (!input.success) return reply.code(400).send({ error: 'Indica si la recepción del proveedor está activada o desactivada.' });
+    if (Boolean(provider.enabled) === input.data.enabled) return { ok: true, receptionEnabled: input.data.enabled };
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+    db.transaction(() => {
+      db.prepare(`UPDATE supplier_profiles SET reception_enabled=?,reception_resumed_at_ms=CASE WHEN ?=1 THEN ? ELSE reception_resumed_at_ms END,updated_at=? WHERE id=?`)
+        .run(Number(input.data.enabled), Number(input.data.enabled), nowMs, now, provider.id);
+      if (!input.data.enabled) db.prepare("UPDATE whatsapp_product_assemblies SET status='closed' WHERE session_id=? AND group_jid=? AND status='open'").run(provider.sessionId, provider.groupId);
+      audit(db, input.data.enabled ? 'supplier.reception.enabled' : 'supplier.reception.disabled', 'supplier', provider.id, { enabled: input.data.enabled });
+    })();
+    if (!input.data.enabled) discardPendingSupplierMessages(db, dataDirectory, provider.sessionId, provider.groupId, 'Recepción del proveedor desactivada', now);
+    await connectorFor(provider.sessionId)?.syncSupplierGroups?.();
+    return { ok: true, receptionEnabled: input.data.enabled };
   });
 
   app.delete<{ Params: { supplierId: string } }>('/api/providers/:supplierId', async (request, reply) => {

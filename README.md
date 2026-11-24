@@ -35,7 +35,7 @@ Copy-Item .env.example .env
 pnpm dev
 ```
 
-Abre `http://127.0.0.1:5173`. El servicio guarda su base y las imágenes en una carpeta local de datos de la aplicación, fuera del repositorio. La configuración predeterminada es simulación y enlaza el servidor en loopback.
+Abre `http://127.0.0.1:5174`. La interfaz usa ese puerto fijo; si está ocupado, el arranque avisa en lugar de cambiarlo automáticamente. El servicio guarda su base y las imágenes en una carpeta local de datos de la aplicación, fuera del repositorio. La configuración predeterminada es simulación y enlaza el servidor en loopback.
 
 Para validar la compilación de producción:
 
@@ -90,6 +90,8 @@ pnpm --filter @tenis/server benchmark:images --output /tmp/image-engine-report.j
 ```
 
 En Windows utiliza una ruta de salida válida para ese equipo. `--cache-dir RUTA` permite reutilizar los idiomas OCR ya descargados; la primera ejecución necesita internet para descargarlos. La prueba cubre código/mundo en cuatro esquinas, compresión JPEG, código solo, mundo solo, foto idéntica repetida y un código que no corresponde al producto. Informa tiempos, decisión esperada/obtenida y uso de caché; termina con error si una decisión no coincide. Estos casos comprueban regresiones concretas y no miden la precisión del catálogo real. El arranque en frío y las fotos nuevas tienen costes diferentes de reutilizar un resultado: esta mejora no promete que toda foto nueva se analice más rápido.
+
+Cada proveedor tiene un botón **Desactivar / Activar** en **Reglas por proveedor**. Al desactivarlo, permanece en la lista con sus márgenes, grupo y productos recibidos; se omiten sus mensajes nuevos, la recuperación de historial y las entradas aún pendientes de la bandeja. Al activarlo vuelve a recibir desde la hora de reactivación, sin importar mensajes enviados durante la pausa. El estado se guarda entre reinicios y solo afecta a ese proveedor de esa cuenta. Los productos que ya estaban en el catálogo conservan su estado y su flujo de envío. **Archivar** sigue siendo una acción independiente.
 
 ## Datos y seguridad
 

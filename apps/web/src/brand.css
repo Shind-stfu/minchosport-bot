@@ -349,3 +349,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .settings-card { padding: 18px; }
   .footer { padding-bottom: 20px; }
 }
+
+.supplier-row .supplier-reception-status { font-weight: 600; }
+.supplier-row .supplier-reception-status.active { color: #257044; }
+.supplier-row .supplier-reception-status.inactive { color: #916824; }
+.supplier-inactive { border-left: 3px solid #dacbad; padding-left: 12px; }
+.supplier-actions { flex-wrap: wrap; justify-content: flex-end; }
+.supplier-actions .supplier-reception-toggle[aria-pressed="false"] { color: #257044; border-color: #99bca4; }

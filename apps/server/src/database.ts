@@ -509,6 +509,8 @@ export const MIGRATIONS = [
   CREATE TABLE brand_rag_calibration (
     device TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, policy_json TEXT NOT NULL
   );`,
+  `ALTER TABLE supplier_profiles ADD COLUMN reception_enabled INTEGER NOT NULL DEFAULT 1 CHECK(reception_enabled IN (0,1));
+  ALTER TABLE supplier_profiles ADD COLUMN reception_resumed_at_ms INTEGER;`,
 ];
 
 export type AppDatabase = InstanceType<typeof Database>;
