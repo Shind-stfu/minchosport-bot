@@ -546,9 +546,9 @@ describe('local simulation API', () => {
     expect(targets.statusCode).toBe(200);
     expect(db.prepare('SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?').get(secondaryId)).toEqual({ target_group_ids: '["buyers-2@g.us"]' });
 
-    const provider = await app.inject({ method: 'POST', url: '/api/sessions/main/providers', headers: { host: '127.0.0.1:3210', 'content-type': 'application/json' }, payload: { name: 'Bodega A', sourceGroupId: 'supplier@g.us', marginCop: 0, markerText: '🌎⭐', defaultPosition: 'top_left' } });
+    const provider = await app.inject({ method: 'POST', url: '/api/sessions/main/providers', headers: { host: '127.0.0.1:3210', 'content-type': 'application/json' }, payload: { name: 'Bodega A', sourceGroupId: 'supplier@g.us', marginCop: 0, markerText: '🌎💸', defaultPosition: 'top_left' } });
     expect(provider.statusCode, provider.body).toBe(201);
-    expect(provider.json()).toMatchObject({ sessionId: 'main', priceMarginCop: 0, boxMarginCop: 5000, markerText: '🌎⭐', defaultPosition: 'top_left' });
+    expect(provider.json()).toMatchObject({ sessionId: 'main', priceMarginCop: 0, boxMarginCop: 5000, markerText: '🌎💸', defaultPosition: 'top_left' });
     expect(db.prepare('SELECT session_id,margin_cop,box_margin_cop FROM supplier_profiles WHERE id=?').get(provider.json().id)).toEqual({ session_id: 'main', margin_cop: 0, box_margin_cop: 5000 });
     await app.close();
   });

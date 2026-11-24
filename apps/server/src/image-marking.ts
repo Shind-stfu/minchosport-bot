@@ -4,7 +4,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 import type { OverlayOptions } from 'sharp';
-import type { OverlayPosition } from '@tenis/core';
+import { isValidMarkerText, type OverlayPosition } from '@tenis/core';
+import { createRequire } from 'node:module';
 
 const ASSET_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'assets');
 const EMOJI_FILES: Record<string, string> = {
@@ -12,7 +13,8 @@ const EMOJI_FILES: Record<string, string> = {
 };
 const PIXEL_LIMIT = 40_000_000;
 const OUTPUT_LIMIT = 20 * 1024 * 1024;
-const RENDER_VERSION = 'native-emoji-gender-aliases-20261024';
+const RENDER_VERSION = 'native-emoji-extended-20261124';
+const TWEMOJI_ROOT = dirname(createRequire(import.meta.url).resolve('@twemoji/svg/package.json'));
 const APPLE_TEXT_FONT = '/System/Library/Fonts/SFNS.ttf';
 const APPLE_EMOJI_FONT = '/System/Library/Fonts/Apple Color Emoji.ttc';
 const WINDOWS_TEXT_FONT = 'C:/Windows/Fonts/segoeuib.ttf';
@@ -27,15 +29,25 @@ const positions: Record<OverlayPosition, { horizontal: 'left' | 'right'; vertica
 function markerParts(marker: string): Array<{ text: string } | { emoji: string }> {
   const result: Array<{ text: string } | { emoji: string }> = [];
   let text = '';
-  for (const character of marker) {
-    if (character === '\uFE0F') continue;
-    if (EMOJI_FILES[character]) {
+  for (const { segment: character } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(marker)) {
+    if (!/^[ .-]+$/u.test(character)) {
       if (text) result.push({ text }), text = '';
       result.push({ emoji: character });
     } else text += character;
   }
   if (text) result.push({ text });
   return result;
+}
+
+function bundledEmojiPath(emoji: string) {
+  const base = emoji.includes('\u200d') ? emoji : emoji.replace(/\uFE0F/gu, '');
+  const name = [...base].map((character) => character.codePointAt(0)!.toString(16)).join('-');
+  return join(TWEMOJI_ROOT, `${name}.svg`);
+}
+
+export function unsupportedMarkerEmoji(marker: string) {
+  return markerParts(marker).find((part) => 'emoji' in part && !EMOJI_FILES[part.emoji]
+    && !existsSync(bundledEmojiPath(part.emoji))) as { emoji: string } | undefined;
 }
 
 async function textTile(text: string, fontSize: number) {
@@ -71,8 +83,7 @@ export function genderIndicatorFromDescription(description: string): 'H' | 'D' |
 
 export async function renderEmojiGraphic(emoji: string, size: number, style: 'native' | 'twemoji' = 'native'): Promise<Buffer> {
   const fileName = EMOJI_FILES[emoji];
-  if (!fileName) throw new Error(`No hay un gráfico incluido para ${emoji}.`);
-  if (style === 'native') {
+  if (style === 'native' && fileName) {
     const native = process.platform === 'darwin' && existsSync(APPLE_EMOJI_FONT)
       ? { font: `Apple Color Emoji ${size}px`, fontfile: APPLE_EMOJI_FONT }
       : process.platform === 'win32' && existsSync(WINDOWS_EMOJI_FONT)
@@ -85,7 +96,10 @@ export async function renderEmojiGraphic(emoji: string, size: number, style: 'na
       } catch { /* use the bundled emoji artwork on systems where native color fonts cannot render */ }
     }
   }
-  return sharp(join(ASSET_ROOT, 'emoji', fileName)).resize(size, size, { fit: 'contain' }).png().toBuffer();
+  if (fileName) return sharp(join(ASSET_ROOT, 'emoji', fileName)).resize(size, size, { fit: 'contain' }).png().toBuffer();
+  const path = bundledEmojiPath(emoji);
+  if (!existsSync(path)) throw new Error(`El emoji ${emoji} aún no está disponible para marcar fotos. Prueba otro emoji.`);
+  return sharp(path).resize(size, size, { fit: 'contain' }).png().toBuffer();
 }
 
 async function emojiTile(emoji: string, size: number) {
@@ -95,8 +109,8 @@ async function emojiTile(emoji: string, size: number) {
 }
 
 export async function renderMarkedImage(source: Buffer, options: { code: string | null; marker: string; position: OverlayPosition; genderIndicator?: 'H' | 'D' | null; sourceCode?: string | null; sourceHasWorld?: boolean }): Promise<{ bytes: Buffer; mimeType: string }> {
-  if (!/^[\s.\-🌎🌍🌏🌐⭐\uFE0F]+$/u.test(options.marker) || !/[🌎🌍🌏🌐]/u.test(options.marker)) {
-    throw new Error('La marca debe contener un emoji de mundo, con punto, guion o estrella opcionales.');
+  if (!isValidMarkerText(options.marker)) {
+    throw new Error('La marca debe incluir un emoji de mundo y puede contener otros emojis, espacios, punto o guion.');
   }
   const requestedCode = options.code?.trim() ?? '';
   const sourceCode = options.sourceCode?.trim() ?? '';

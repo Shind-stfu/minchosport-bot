@@ -1,11 +1,32 @@
 import { describe, expect, it } from 'vitest';
 import sharp from 'sharp';
-import { genderIndicatorFromDescription, renderMarkedImage } from './image-marking.js';
+import { genderIndicatorFromDescription, renderEmojiGraphic, renderMarkedImage } from './image-marking.js';
+import { SupplierProfileSchema } from '@tenis/core';
 import type { OverlayPosition } from '@tenis/core';
 
 async function plainImage(width = 640, height = 480) {
   return sharp({ create: { width, height, channels: 3, background: { r: 32, g: 44, b: 36 } } }).png().toBuffer();
 }
+
+describe('emojis personalizados de proveedor', () => {
+  it.each(['🌎💸', '🌎👟', '🌍❤️', '🌎👍🏽', '🌎👩‍💻'])('guarda y dibuja %s con recursos locales', async (marker) => {
+    const parsed = SupplierProfileSchema.safeParse({ name: 'ZCY', sourceGroupId: 'zcy@g.us', markerText: marker, defaultPosition: 'bottom_right' });
+    expect(parsed.success).toBe(true);
+    const source = await plainImage();
+    const result = await renderMarkedImage(source, { code: '168', marker, position: 'bottom_right' });
+    expect(result.bytes.equals(source)).toBe(false);
+    const emoji = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(marker)][1]!.segment;
+    const graphic = await renderEmojiGraphic(emoji, 40, 'twemoji');
+    const image = await sharp(graphic).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect(image.data.some((value, index) => index % 4 === 3 && value > 0)).toBe(true);
+  });
+
+  it('rechaza texto y marcas sin mundo', () => {
+    const base = { name: 'ZCY', sourceGroupId: 'zcy@g.us', defaultPosition: 'bottom_right' };
+    expect(SupplierProfileSchema.safeParse({ ...base, markerText: '🌎texto' }).success).toBe(false);
+    expect(SupplierProfileSchema.safeParse({ ...base, markerText: '👟' }).success).toBe(false);
+  });
+});
 
 async function changedBounds(original: Buffer, result: Buffer) {
   const before = await sharp(original).removeAlpha().raw().toBuffer({ resolveWithObject: true });

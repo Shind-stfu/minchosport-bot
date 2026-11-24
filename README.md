@@ -106,7 +106,7 @@ El catálogo y el historial de publicaciones quedan guardados en SQLite entre re
 
 Las fotos y los datos comerciales del prototipo no están cifrados; protege tu usuario y activa el cifrado de disco del equipo. La protección de autenticación usa el almacén seguro del sistema operativo; la primera conexión de WhatsApp aún requiere una prueba manual en el equipo donde la usarás.
 
-El marcado usa [Sharp](https://sharp.pixelplumbing.com/api-constructor/) y gráficos [Twemoji](https://github.com/jdecked/twemoji) como recursos incluidos o de respaldo; consulta sus licencias y atribución en [`apps/server/assets/THIRD-PARTY-NOTICES.md`](./apps/server/assets/THIRD-PARTY-NOTICES.md). No se descargan fuentes ni emojis al procesar cada foto.
+El marcado usa [Sharp](https://sharp.pixelplumbing.com/api-constructor/) y gráficos [Twemoji](https://github.com/jdecked/twemoji) como recursos incluidos o de respaldo; consulta sus licencias y atribución en [`apps/server/assets/THIRD-PARTY-NOTICES.md`](./apps/server/assets/THIRD-PARTY-NOTICES.md). La marca debe incluir un mundo y puede acompañarse de otros emojis compatibles, espacios, punto o guion. Los emojis adicionales utilizan los gráficos locales de Twemoji; si un emoji aún no está incluido, se informa al guardar. No se descargan fuentes ni emojis al procesar cada foto.
 
 ## Desarrollo
 

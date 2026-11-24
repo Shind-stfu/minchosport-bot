@@ -12,7 +12,7 @@ import { ApprovalSchema, ProductImageOptionsSchema, ProductUploadSchema, Setting
 import type { AppDatabase } from './database.js';
 import type { WhatsAppConnector } from './whatsapp.js';
 import type { OutboundDistributionRegistry, OutboundDistributionService } from './outbound-distribution.js';
-import { genderIndicatorFromDescription, saveMarkedImage } from './image-marking.js';
+import { genderIndicatorFromDescription, saveMarkedImage, unsupportedMarkerEmoji } from './image-marking.js';
 import { LocalImageInspector, type ImageInspection } from './image-inspection.js';
 import { ImageInspectionCoordinator } from './image-inspection-coordinator.js';
 import { ImageInspectorPool } from './image-inspector-pool.js';
@@ -442,7 +442,9 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
   app.post<{ Params: { sessionId: string } }>('/api/sessions/:sessionId/providers', async (request, reply) => {
     const account = sessionRow(request.params.sessionId); const input = SupplierProfileSchema.safeParse(request.body);
     if (!account) return reply.code(404).send({ error: 'Cuenta no encontrada.' });
-    if (!input.success) return reply.code(400).send({ error: 'Proveedor inválido.', details: input.error.flatten() });
+    if (!input.success) return reply.code(400).send({ error: input.error.issues[0]?.message ?? 'Proveedor inválido.', details: input.error.flatten() });
+    const unsupportedEmoji = unsupportedMarkerEmoji(input.data.markerText);
+    if (unsupportedEmoji) return reply.code(400).send({ error: `El emoji ${unsupportedEmoji.emoji} aún no está disponible para marcar fotos. Prueba otro emoji.` });
     const group = db.prepare('SELECT 1 FROM whatsapp_groups WHERE session_id=? AND jid=?').get(account.id, input.data.sourceGroupId);
     if (!group) return reply.code(400).send({ error: 'Actualiza los grupos y selecciona el grupo proveedor de esta cuenta.' });
     if ((JSON.parse((db.prepare('SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?').get(account.id) as { target_group_ids: string }).target_group_ids) as string[]).includes(input.data.sourceGroupId)) return reply.code(400).send({ error: 'Quita el grupo proveedor de los destinos de esta cuenta.' });
@@ -468,7 +470,9 @@ export function createApp(options: { db: AppDatabase; dataDirectory: string; log
     const provider = db.prepare('SELECT id,session_id,source_group_id,reception_enabled FROM supplier_profiles WHERE id=? AND archived_at IS NULL').get(request.params.supplierId) as { id: string; session_id: string; source_group_id: string; reception_enabled: number } | undefined;
     const input = SupplierProfileSchema.safeParse(request.body);
     if (!provider) return reply.code(404).send({ error: 'Proveedor no encontrado.' });
-    if (!input.success) return reply.code(400).send({ error: 'Proveedor inválido.', details: input.error.flatten() });
+    if (!input.success) return reply.code(400).send({ error: input.error.issues[0]?.message ?? 'Proveedor inválido.', details: input.error.flatten() });
+    const unsupportedEmoji = unsupportedMarkerEmoji(input.data.markerText);
+    if (unsupportedEmoji) return reply.code(400).send({ error: `El emoji ${unsupportedEmoji.emoji} aún no está disponible para marcar fotos. Prueba otro emoji.` });
     if (!db.prepare('SELECT 1 FROM whatsapp_groups WHERE session_id=? AND jid=?').get(provider.session_id, input.data.sourceGroupId)) return reply.code(400).send({ error: 'El grupo proveedor no pertenece a esta cuenta.' });
     const targets = JSON.parse((db.prepare('SELECT target_group_ids FROM whatsapp_session_settings WHERE session_id=?').get(provider.session_id) as { target_group_ids: string }).target_group_ids) as string[];
     if (targets.includes(input.data.sourceGroupId)) return reply.code(400).send({ error: 'Quita el grupo proveedor de los destinos de esta cuenta.' });

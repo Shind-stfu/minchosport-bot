@@ -9,6 +9,14 @@ export const WhatsAppSessionSchema = z.object({
   name: z.string().trim().min(1).max(80),
 });
 
+export function isValidMarkerText(value: string) {
+  const text = value.trim();
+  if (!text || text.length > 32 || !/[🌎🌍🌏🌐]/u.test(text)) return false;
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  return [...segmenter.segment(text)].every(({ segment }) => /^[ .-]+$/u.test(segment)
+    || /^(?=.*[\p{Extended_Pictographic}\p{Regional_Indicator}\u20e3])[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Emoji_Modifier}\uFE0F\u200D\u20e3\p{Emoji_Component}]+$/u.test(segment));
+}
+
 export const SupplierProfileSchema = z.object({
   name: z.string().trim().min(1).max(100),
   sourceGroupId: z.string().min(1).max(128),
@@ -18,7 +26,7 @@ export const SupplierProfileSchema = z.object({
   marginCop: MarginSchema.optional(),
   markerText: z.string().trim().min(1).max(32)
     .refine((value) => /[🌎🌍🌏🌐]/u.test(value), 'La marca debe incluir un emoji de mundo.')
-    .refine((value) => /^[\s.\-🌎🌍🌏🌐⭐\uFE0F]+$/u.test(value), 'Usa un mundo, una estrella, espacios, punto o guion.'),
+    .refine(isValidMarkerText, 'Usa emojis, espacios, punto o guion e incluye un mundo.'),
   defaultPosition: OverlayPositionSchema,
 }).transform(({ marginCop, priceMarginCop, boxMarginCop, ...profile }) => ({
   ...profile,

@@ -59,6 +59,9 @@ importers:
       '@tenis/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@twemoji/svg':
+        specifier: 15.0.0
+        version: 15.0.0
       better-sqlite3:
         specifier: ^12.4.1
         version: 12.11.1
@@ -890,6 +893,9 @@ packages:
 
   '@tokenizer/token@0.3.0':
     resolution: {integrity: sha512-OvjF+z51L3ov0OyAU0duzsYuvO01PH7x4t6DJx+guahgTnBHkhJdG7soQeTSFLWN3efnHyibZ4Z8l2EuWwJN3A==}
+
+  '@twemoji/svg@15.0.0':
+    resolution: {integrity: sha512-ZSPef2B6nBaYnfgdTbAy4jgW95o7pi2xPGwGCU+WMTxo7J6B1lMPTWwSq/wTuiMq+N0khQ90CcvYp1wFoQpo/w==}
 
   '@types/babel__core@7.20.5':
     resolution: {integrity: sha512-qoQprZvz5wQFJwMDqeseRXWv3rqMvhgpbXFfVyWhbx9X47POIA6i/+dXefEmZKoAgOaTdaIgNSMqMIU61yRyzA==}
@@ -2671,6 +2677,8 @@ snapshots:
       - supports-color
 
   '@tokenizer/token@0.3.0': {}
+
+  '@twemoji/svg@15.0.0': {}
 
   '@types/babel__core@7.20.5':
     dependencies:

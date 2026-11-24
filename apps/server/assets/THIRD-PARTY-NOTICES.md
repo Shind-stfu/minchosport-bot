@@ -2,6 +2,7 @@
 
 - **Noto Sans**: Google Fonts, licencia SIL Open Font License 1.1. La licencia está en `fonts/OFL.txt`.
 - **Twemoji**: arte de 🌎, 🌍, 🌏, 🌐 y ⭐ de jdecked/Twemoji, licencia CC BY 4.0. Ver `emoji/LICENSE-GRAPHICS` y https://github.com/jdecked/twemoji.
+- **@twemoji/svg**: gráficos SVG adicionales de Twemoji para emojis personalizados; gráficos bajo CC BY 4.0, código del paquete bajo MIT. https://github.com/jdecked/twemoji
 
 Los recursos se distribuyen localmente para que el marcado de fotos no dependa de Internet.
 
